@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["intensity", "threats", "opportunities", "insufficient_data"],
+  "properties": {
+    "intensity": {"type": "number"},
+    "threats": {"type": "array", "items": {"type": "string"}},
+    "opportunities": {"type": "array", "items": {"type": "string"}},
+    "insufficient_data": {"type": "boolean"},
+    "notes": {"type": ["string", "null"]}
+  }
+}
