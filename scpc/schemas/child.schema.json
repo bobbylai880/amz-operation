@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["items", "insufficient_data"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["asin", "type", "gmroi_net_ads", "ppad", "actions"],
+        "properties": {
+          "asin": {"type": "string"},
+          "type": {"type": "string"},
+          "gmroi_net_ads": {"type": ["number", "null"]},
+          "ppad": {"type": ["number", "null"]},
+          "actions": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        }
+      }
+    },
+    "insufficient_data": {"type": "boolean"},
+    "notes": {"type": ["string", "null"]}
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["status", "drivers", "insufficient_data"],
+  "properties": {
+    "status": {"type": "string"},
+    "drivers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["keyword", "delta"],
+        "properties": {
+          "keyword": {"type": "string"},
+          "delta": {"type": "number"}
+        }
+      }
+    },
+    "insufficient_data": {"type": "boolean"},
+    "notes": {"type": ["string", "null"]}
+  }
+}

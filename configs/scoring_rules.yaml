@@ -1,0 +1,10 @@
+parent_expected_baseline:
+  beta:
+    scene: 0.60
+    comp: 0.30
+    budget: 0.25
+child_profit:
+  target_gmroi: 1.5
+  floor_gmroi: 1.1
+  target_ppad: 1.2
+  floor_ppad: 0.9
