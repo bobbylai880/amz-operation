@@ -15,6 +15,9 @@ from sqlalchemy.sql.sqltypes import NullType
 logger = logging.getLogger(__name__)
 
 
+logger = logging.getLogger(__name__)
+
+
 def fetch_dataframe(engine: Engine, sql: str, params: Mapping[str, object] | None = None) -> pd.DataFrame:
     """Execute ``sql`` and return the result as a DataFrame."""
 
@@ -57,62 +60,49 @@ def _chunks(seq: Sequence[Mapping[str, object]], size: int) -> Iterable[list[Map
 
 
 def replace_into(engine: Engine, table: str, df: pd.DataFrame, *, chunk_size: int = 500) -> int:
-    """Execute an UPSERT against ``table`` using Doris/MySQL compatible semantics."""
+    """Execute an UPSERT using Doris preferred semantics with MySQL compatibility."""
 
     if df.empty:
         return 0
 
     records = _normalise_records(df.to_dict(orient="records"))
-    metadata = MetaData()
-    table_obj = _reflect_table(engine, metadata, table, df)
+    columns = list(df.columns)
+    col_list = ", ".join(f"`{col}`" for col in columns)
+    placeholders = ", ".join(f"%({col})s" for col in columns)
 
-    if _is_doris_engine(engine):
-        return _execute_doris_upsert(engine, table_obj, df, records, chunk_size)
-    return _execute_mysql_upsert(engine, table_obj, records, chunk_size)
+    update_columns = [col for col in columns if col not in {"create_time"}]
+    if not update_columns:
+        update_columns = columns
+    update_clause = ", ".join(f"`{col}`=VALUES(`{col}`)" for col in update_columns)
 
-
-def _reflect_table(engine: Engine, metadata: MetaData, table: str, df: pd.DataFrame) -> Table:
-    try:
-        return Table(table, metadata, autoload_with=engine)
-    except Exception as exc:  # pragma: no cover - only triggered when reflection fails
-        logger.warning(
-            "replace_into falling back to DataFrame column metadata for %s due to reflection error: %s",
-            table,
-            exc,
+    insert_sql = (
+        "INSERT INTO {table} ({cols}) VALUES ({values}) ON DUPLICATE KEY UPDATE {updates}".format(
+            table=table,
+            cols=col_list,
+            values=placeholders,
+            updates=update_clause,
         )
-        columns = [Column(name, NullType()) for name in df.columns]
-        return Table(table, metadata, *columns)
-
-
-def _execute_mysql_upsert(
-    engine: Engine,
-    table_obj: Table,
-    records: Sequence[Mapping[str, object]],
-    chunk_size: int,
-) -> int:
-    insert_stmt = mysql_insert(table_obj)
-    update_targets = {
-        column.name: getattr(insert_stmt.inserted, column.name)
-        for column in table_obj.columns
-        if not column.primary_key
-    }
-    if not update_targets:
-        update_targets = {
-            column.name: getattr(insert_stmt.inserted, column.name)
-            for column in table_obj.columns
-        }
-
-    upsert_stmt = insert_stmt.on_duplicate_key_update(**update_targets)
-    logger.info(
-        "replace_into using MySQL ON DUPLICATE KEY UPDATE for %s",
-        table_obj.fullname,
     )
 
     affected = 0
     with engine.begin() as conn:
         for chunk in _chunks(records, chunk_size):
-            conn.execute(upsert_stmt, chunk)
-            affected += len(chunk)
+            try:
+                conn.exec_driver_sql(insert_sql, chunk)
+                affected += len(chunk)
+            except Exception as exc:
+                message = str(exc)
+                if "Encountered: ON" in message or "Expected: COMMA" in message:
+                    replace_sql = f"REPLACE INTO {table} ({col_list}) VALUES ({placeholders})"
+                    logger.info(
+                        "replace_into falling back to Doris REPLACE INTO for %s due to %s",
+                        table,
+                        message,
+                    )
+                    conn.exec_driver_sql(replace_sql, chunk)
+                    affected += len(chunk)
+                else:
+                    raise
     return affected
 
 

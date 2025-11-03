@@ -21,9 +21,14 @@ class _MockResult:
         return self._scalar_value
 
 
-def _build_mock_engine(url: str, collector: list[str]):
+def _build_mock_engine(url: str, collector: list[str], *, side_effect=None):
     def executor(sql, *multiparams, **params):  # type: ignore[override]
-        collector.append(str(sql))
+        statement = str(sql)
+        collector.append(statement)
+        if side_effect is not None:
+            result = side_effect(statement)
+            if isinstance(result, Exception):
+                raise result
         return _MockResult()
 
     return create_engine(url, strategy="mock", executor=executor)
@@ -41,29 +46,26 @@ def test_replace_into_mysql_uses_on_duplicate() -> None:
     assert any("ON DUPLICATE KEY UPDATE" in stmt for stmt in statements)
 
 
-def test_replace_into_doris_replaces_when_no_version(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_replace_into_doris_falls_back_to_replace() -> None:
     statements: list[str] = []
-    engine = _build_mock_engine("mysql+pymysql://user:pass@doris-host/test", statements)
+    triggered = {"raised": False}
 
-    monkeypatch.setattr("scpc.db.io._get_doris_version", lambda conn: None)
+    def side_effect(statement: str):
+        if "ON DUPLICATE KEY UPDATE" in statement and not triggered["raised"]:
+            triggered["raised"] = True
+            return RuntimeError("Encountered: ON DUPLICATE KEY UPDATE Expected: COMMA")
+        return None
+
+    engine = _build_mock_engine(
+        "mysql+pymysql://user:pass@doris-host/test",
+        statements,
+        side_effect=side_effect,
+    )
 
     df = pd.DataFrame([{"scene": "A", "metric": 1}])
 
     inserted = replace_into(engine, "bi_table", df)
 
     assert inserted == 1
+    assert any(stmt.startswith("INSERT INTO") for stmt in statements)
     assert any(stmt.startswith("REPLACE INTO") for stmt in statements)
-
-
-def test_replace_into_doris_uses_upsert_for_v2(monkeypatch: pytest.MonkeyPatch) -> None:
-    statements: list[str] = []
-    engine = _build_mock_engine("mysql+pymysql://user:pass@doris-cluster/test", statements)
-
-    monkeypatch.setattr("scpc.db.io._get_doris_version", lambda conn: "2.0.1")
-
-    df = pd.DataFrame([{"scene": "B", "metric": 5}])
-
-    inserted = replace_into(engine, "bi_table", df)
-
-    assert inserted == 1
-    assert any(stmt.startswith("UPSERT INTO") for stmt in statements)
