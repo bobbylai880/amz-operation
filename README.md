@@ -55,7 +55,7 @@ python -m scpc.etl.scene_pipeline \
   --emit-md \
   --outputs-dir storage/outputs/scene
 ```
-默认只在 `--write` 传入时写库；不传 `--write` 将返回清洗/特征/驱动 DataFrame 的行数摘要，便于本地调试。运行前请通过环境变量或仓库根目录的 `.env` 提供 Doris 2.x 配置（`DORIS_HOST/PORT/USER/PASSWORD/DATABASE`），`scpc.db.engine` 会自动拼接连接串；如需自定义可直接设置 `DB_URI` 覆盖。`SCENE_TOPN` 环境变量可控制驱动词 TopN。
+默认只在 `--write` 传入时写库；不传 `--write` 将返回清洗/特征/驱动 DataFrame 的行数摘要，便于本地调试。运行前请通过环境变量或仓库根目录的 `.env` 提供 Doris 2.x 配置（`DORIS_HOST/PORT/USER/PASSWORD/DATABASE`），`scpc.db.engine` 会自动拼接连接串；如需自定义可直接设置 `DB_URI` 覆盖。`SCENE_TOPN` 环境变量可控制驱动词 TopN。运行过程中会在 `SCPC_LOG_DIR`（默认 `storage/logs`）下生成以场景和站点命名的日志文件，所有 `ERROR` 级别记录都会标注触发失败的具体函数调用，便于排查。
 
 ### 模块测试
 安装依赖：`pip install -r requirements-dev.txt`
@@ -93,6 +93,8 @@ DORIS_PORT=9030
 DORIS_USER=scpc_user
 DORIS_PASSWORD=change-me
 DORIS_DATABASE=bi_amz
+# 可选：指定 CLI 运行日志输出目录（默认 storage/logs）
+SCPC_LOG_DIR=storage/logs
 ```
 可以复制 `.env.example` 并替换为真实值；`.env` 已加入 `.gitignore`，避免凭证泄露。`scpc.db.engine` 会在运行时查找 `.env` 并根据以上字段拼接连接串，也支持直接使用环境变量提供完整 `DB_URI` 覆盖。
 

@@ -5,9 +5,10 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Mapping, Sequence
@@ -15,6 +16,7 @@ from typing import Any, Mapping, Sequence
 import pandas as pd
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 
 from scpc.db.engine import create_doris_engine
 from scpc.db.io import replace_into
@@ -102,6 +104,17 @@ def _ensure_output_directory(base: Path, scene: str, marketplace_id: str, yearwe
     return target
 
 
+def _sanitise_component(value: str, fallback: str) -> str:
+    cleaned = value.strip() if value else ""
+    if not cleaned:
+        cleaned = fallback
+    cleaned = cleaned.replace(os.sep, "_").replace("/", "_")
+    cleaned = re.sub(r"[\\?%*:|\"<>]", "_", cleaned)
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = cleaned.strip("_")
+    return cleaned or fallback
+
+
 def _write_json_output(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     LOGGER.info("scene_pipeline_write_json path=%s", path, extra={"path": str(path)})
@@ -182,14 +195,16 @@ def _prepare_drivers_output(drivers: pd.DataFrame) -> pd.DataFrame:
 
 
 @contextmanager
-def _stage_timer(stage: str, scene: str, marketplace_id: str):
+def _stage_timer(stage: str, scene: str, marketplace_id: str, *, call: str | None = None):
     start = perf_counter()
+    call_desc = call or stage
     LOGGER.info(
-        "scene_pipeline_stage_start scene=%s mk=%s stage=%s",
+        "scene_pipeline_stage_start scene=%s mk=%s stage=%s call=%s",
         scene,
         marketplace_id,
         stage,
-        extra={"scene": scene, "mk": marketplace_id, "stage": stage},
+        call_desc,
+        extra={"scene": scene, "mk": marketplace_id, "stage": stage, "call": call_desc},
     )
     metrics: dict[str, object] = {}
 
@@ -198,28 +213,42 @@ def _stage_timer(stage: str, scene: str, marketplace_id: str):
 
     try:
         yield _record
-    except Exception:
-        LOGGER.exception(
-            "scene_pipeline_stage_error scene=%s mk=%s stage=%s",
+    except OperationalError:
+        LOGGER.error(
+            "scene_pipeline_stage_error scene=%s mk=%s stage=%s call=%s",
             scene,
             marketplace_id,
             stage,
-            extra={"scene": scene, "mk": marketplace_id, "stage": stage},
+            call_desc,
+            extra={"scene": scene, "mk": marketplace_id, "stage": stage, "call": call_desc},
+            exc_info=False,
+        )
+        raise
+    except Exception:
+        LOGGER.exception(
+            "scene_pipeline_stage_error scene=%s mk=%s stage=%s call=%s",
+            scene,
+            marketplace_id,
+            stage,
+            call_desc,
+            extra={"scene": scene, "mk": marketplace_id, "stage": stage, "call": call_desc},
         )
         raise
     else:
         duration_ms = round((perf_counter() - start) * 1000, 2)
         LOGGER.info(
-            "scene_pipeline_stage_complete scene=%s mk=%s stage=%s duration_ms=%s %s",
+            "scene_pipeline_stage_complete scene=%s mk=%s stage=%s call=%s duration_ms=%s %s",
             scene,
             marketplace_id,
             stage,
+            call_desc,
             duration_ms,
             " ".join(f"{key}={value}" for key, value in metrics.items()),
             extra={
                 "scene": scene,
                 "mk": marketplace_id,
                 "stage": stage,
+                "call": call_desc,
                 "duration_ms": duration_ms,
                 **metrics,
             },
@@ -250,7 +279,12 @@ def run_scene_pipeline(
             extra={"scene": scene, "mk": marketplace_id, "min_yrwk": min_yrwk},
         )
 
-        with _stage_timer("load_keywords", scene, marketplace_id) as record:
+        with _stage_timer(
+            "load_keywords",
+            scene,
+            marketplace_id,
+            call="pd.read_sql_query(bi_amz_vw_scene_keyword)",
+        ) as record:
             with engine.connect() as conn:
                 keywords_df = pd.read_sql_query(text(KEYWORD_SQL), conn, params={"scene": scene, "mk": marketplace_id})
             record(keyword_count=len(keywords_df))
@@ -273,27 +307,52 @@ def run_scene_pipeline(
             )
             return {"clean": pd.DataFrame(), "features": pd.DataFrame(), "drivers": pd.DataFrame()}
 
-        with _stage_timer("load_facts", scene, marketplace_id) as record:
+        with _stage_timer(
+            "load_facts",
+            scene,
+            marketplace_id,
+            call="pd.read_sql_query(bi_amz_vw_kw_week)",
+        ) as record:
             with engine.connect() as conn:
                 facts_df = pd.read_sql_query(
                     FACT_SQL,
                     conn,
                     params={"mk": marketplace_id, "kw_list": kw_list, "min_yrwk": min_yrwk},
                 )
+            record(fact_rows=len(facts_df))
+
+        coverage_df = pd.DataFrame()
+        with _stage_timer(
+            "load_coverage",
+            scene,
+            marketplace_id,
+            call="pd.read_sql_query(bi_amz_mv_scene_week)",
+        ) as record:
+            with engine.connect() as conn:
                 coverage_df = pd.read_sql_query(
                     text(COVERAGE_SQL),
                     conn,
                     params={"scene": scene, "mk": marketplace_id, "min_yrwk": min_yrwk},
                 )
-            record(fact_rows=len(facts_df), coverage_rows=len(coverage_df))
+            record(coverage_rows=len(coverage_df))
 
-        with _stage_timer("prepare_clean_data", scene, marketplace_id) as record:
+        with _stage_timer(
+            "prepare_clean_data",
+            scene,
+            marketplace_id,
+            call="clean_keyword_panel",
+        ) as record:
             week_index = _collect_week_index(facts_df, coverage_df)
             clean_result = clean_keyword_panel(facts_df, week_index=week_index)
             clean_df = _prepare_clean_output(clean_result, scene, marketplace_id)
             record(clean_weeks=len(week_index), clean_rows=len(clean_df))
 
-        with _stage_timer("compute_features", scene, marketplace_id) as record:
+        with _stage_timer(
+            "compute_features",
+            scene,
+            marketplace_id,
+            call="compute_scene_features",
+        ) as record:
             features_result = compute_scene_features(
                 clean_result.data,
                 keywords_df,
@@ -304,7 +363,12 @@ def run_scene_pipeline(
             features_df = _prepare_features_output(features_result.data)
             record(feature_rows=len(features_df))
 
-        with _stage_timer("compute_drivers", scene, marketplace_id) as record:
+        with _stage_timer(
+            "compute_drivers",
+            scene,
+            marketplace_id,
+            call="compute_scene_drivers",
+        ) as record:
             drivers_result = compute_scene_drivers(
                 clean_result.data,
                 facts_df,
@@ -318,7 +382,12 @@ def run_scene_pipeline(
             record(driver_rows=len(drivers_df))
 
         if write:
-            with _stage_timer("persist_results", scene, marketplace_id) as record:
+            with _stage_timer(
+                "persist_results",
+                scene,
+                marketplace_id,
+                call="replace_into(bi_amz_scene_kw_week_clean|features|drivers)",
+            ) as record:
                 clean_rows = replace_into(engine, "bi_amz_scene_kw_week_clean", clean_df) if not clean_df.empty else 0
                 feature_rows = replace_into(engine, "bi_amz_scene_features", features_df) if not features_df.empty else 0
                 driver_rows = replace_into(engine, "bi_amz_scene_drivers", drivers_df) if not drivers_df.empty else 0
@@ -347,11 +416,27 @@ def run_scene_pipeline(
             engine.dispose()
 
 
-def _configure_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+def _configure_logging(level: str, log_file: Path | None = None) -> None:
+    root = logging.getLogger()
+    desired_level = getattr(logging, level.upper(), logging.INFO)
+    root.setLevel(desired_level)
+
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(desired_level)
+    console_handler.setFormatter(formatter)
+    root.addHandler(console_handler)
+
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(desired_level)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
 
 
 def _normalise_argv(argv: Sequence[str]) -> list[str]:
@@ -396,7 +481,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     log_level = os.getenv("LOG_LEVEL", "INFO")
-    _configure_logging(log_level)
+    log_dir = Path(os.getenv("SCPC_LOG_DIR", "storage/logs"))
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    log_scene = _sanitise_component(args.scene, "scene")
+    log_mk = _sanitise_component(args.mk, "mk")
+    log_file = log_dir / f"scene_pipeline_{log_scene}_{log_mk}_{timestamp}.log"
+    _configure_logging(log_level, log_file=log_file)
+    LOGGER.info("scene_pipeline_log_file path=%s", log_file, extra={"path": str(log_file)})
     env_topn = os.getenv("SCENE_TOPN", "10")
     try:
         default_topn = int(env_topn)
@@ -406,14 +497,40 @@ def main(argv: Sequence[str] | None = None) -> None:
     topn = args.scene_topn if args.scene_topn is not None else default_topn
     engine = create_doris_engine()
     try:
-        outputs = run_scene_pipeline(
-            args.scene,
-            args.mk,
-            args.weeks_back,
-            engine=engine,
-            write=args.write,
-            topn=topn,
-        )
+        try:
+            outputs = run_scene_pipeline(
+                args.scene,
+                args.mk,
+                args.weeks_back,
+                engine=engine,
+                write=args.write,
+                topn=topn,
+            )
+        except OperationalError as exc:
+            LOGGER.error(
+                "scene_pipeline_connection_failed scene=%s mk=%s call=%s",
+                args.scene,
+                args.mk,
+                "run_scene_pipeline",
+                extra={"scene": args.scene, "mk": args.mk, "call": "run_scene_pipeline"},
+                exc_info=False,
+            )
+            host = os.getenv("DORIS_HOST", "<unknown>")
+            port = os.getenv("DORIS_PORT", "<unknown>")
+            details = getattr(exc.orig, "args", ())
+            if isinstance(details, tuple) and details:
+                hint = " ".join(str(item) for item in details)
+            elif details:
+                hint = str(details)
+            else:
+                hint = str(exc)
+            message = (
+                f"Failed to connect to Doris at {host}:{port}. "
+                "Please verify network connectivity, VPN access, and credentials. "
+                f"Original error: {hint}"
+            )
+            raise SystemExit(message)
+
         if not args.write:
             summary = {name: len(df) for name, df in outputs.items()}
             print(json.dumps(summary, default=str))
@@ -432,10 +549,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             else:
                 try:
                     LOGGER.info(
-                        "scene_pipeline_llm_start scene=%s mk=%s",
+                        "scene_pipeline_llm_start scene=%s mk=%s call=%s",
                         args.scene,
                         args.mk,
-                        extra={"scene": args.scene, "mk": args.mk},
+                        "summarize_scene",
+                        extra={"scene": args.scene, "mk": args.mk, "call": "summarize_scene"},
                     )
                     summary_payload = summarize_scene(
                         engine=engine,
@@ -444,27 +562,34 @@ def main(argv: Sequence[str] | None = None) -> None:
                         topn=topn,
                     )
                     LOGGER.info(
-                        "scene_pipeline_llm_complete scene=%s mk=%s",
+                        "scene_pipeline_llm_complete scene=%s mk=%s call=%s",
                         args.scene,
                         args.mk,
-                        extra={"scene": args.scene, "mk": args.mk},
+                        "summarize_scene",
+                        extra={"scene": args.scene, "mk": args.mk, "call": "summarize_scene"},
                     )
                 except SceneSummarizationError as exc:
                     summary_error = exc
                     LOGGER.error(
-                        "scene_pipeline_llm_failed scene=%s mk=%s error=%s",
+                        "scene_pipeline_llm_failed scene=%s mk=%s call=%s error=%s",
                         args.scene,
                         args.mk,
                         exc,
-                        extra={"scene": args.scene, "mk": args.mk, "error": str(exc)},
+                        extra={
+                            "scene": args.scene,
+                            "mk": args.mk,
+                            "call": "summarize_scene",
+                            "error": str(exc),
+                        },
                     )
                 except Exception as exc:  # pragma: no cover - defensive guard
                     summary_error = SceneSummarizationError(str(exc))
                     LOGGER.exception(
-                        "scene_pipeline_llm_failed scene=%s mk=%s unexpected",
+                        "scene_pipeline_llm_failed scene=%s mk=%s call=%s unexpected",
                         args.scene,
                         args.mk,
-                        extra={"scene": args.scene, "mk": args.mk},
+                        "summarize_scene",
+                        extra={"scene": args.scene, "mk": args.mk, "call": "summarize_scene"},
                     )
 
         if args.with_llm and (args.emit_json or args.emit_md):
@@ -496,10 +621,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                         _write_text_output(outdir / "scene_report.md", markdown)
                     except Exception:  # pragma: no cover - defensive guard
                         LOGGER.warning(
-                            "scene_pipeline_markdown_failed scene=%s mk=%s",
+                            "scene_pipeline_markdown_failed scene=%s mk=%s call=%s",
                             args.scene,
                             args.mk,
-                            extra={"scene": args.scene, "mk": args.mk},
+                            "build_scene_markdown",
+                            extra={"scene": args.scene, "mk": args.mk, "call": "build_scene_markdown"},
                             exc_info=True,
                         )
         elif args.emit_json or args.emit_md:

@@ -2,3 +2,4 @@ numpy>=2.3,<3
 pandas>=2.3,<3
 pytest>=8.4,<9
 sqlalchemy>=2.0,<3
+pymysql>=1.1,<2
