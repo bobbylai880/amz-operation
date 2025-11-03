@@ -51,7 +51,7 @@ python -m scpc.etl.scene_pipeline \
   --weeks-back 60 \
   --write
 ```
-默认只在 `--write` 传入时写库；不传 `--write` 将返回清洗/特征/驱动 DataFrame 的行数摘要，便于本地调试。`SCENE_TOPN` 环境变量可控制驱动词 TopN。
+默认只在 `--write` 传入时写库；不传 `--write` 将返回清洗/特征/驱动 DataFrame 的行数摘要，便于本地调试。运行前请通过环境变量或仓库根目录的 `.env` 提供 Doris/MySQL 配置（`DORIS_HOST/PORT/USER/PASSWORD/DATABASE`），`scpc.db.engine` 会自动拼接连接串；如需自定义可直接设置 `DB_URI` 覆盖。`SCENE_TOPN` 环境变量可控制驱动词 TopN。
 
 ### 模块测试
 安装依赖：`pip install -r requirements-dev.txt`
@@ -77,19 +77,20 @@ scpc/
 ```
 
 ## 环境变量与 .env
-项目默认通过环境变量配置 DeepSeek 与 MySQL 凭证，可在仓库根目录创建 `.env`：
+项目默认通过环境变量配置 DeepSeek 与 Doris/MySQL 凭证，可在仓库根目录创建 `.env`：
 ```
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-chat
 DEEPSEEK_API_KEY=your-deepseek-key
 DEEPSEEK_TIMEOUT=30
-MYSQL_HOST=127.0.0.1
-MYSQL_PORT=3306
-MYSQL_DATABASE=scpc
-MYSQL_USER=scpc_user
-MYSQL_PASSWORD=change-me
+# Doris / MySQL 连接配置（会自动拼接连接串）
+DORIS_HOST=127.0.0.1
+DORIS_PORT=9030
+DORIS_USER=scpc_user
+DORIS_PASSWORD=change-me
+DORIS_DATABASE=bi_amz
 ```
-可以复制 `.env.example` 并替换为真实值；`.env` 已加入 `.gitignore`，避免凭证泄露。代码通过 `scpc.settings` 自动加载 `.env`，并在任务启动时校验缺失项。
+可以复制 `.env.example` 并替换为真实值；`.env` 已加入 `.gitignore`，避免凭证泄露。`scpc.db.engine` 会在运行时查找 `.env` 并根据以上字段拼接连接串，也支持直接使用环境变量提供完整 `DB_URI` 覆盖。
 
 ## 配置文件
 - `configs/prod.yaml`：定义时区、Cron 调度、特征参数（如 `theta_days`、`alpha_effective_woc`）、预算闸门以及本地 `storage/` 输出目录前缀；
