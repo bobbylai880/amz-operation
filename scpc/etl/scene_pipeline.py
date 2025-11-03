@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 from datetime import date, timedelta
 from typing import Sequence
 
@@ -215,6 +216,15 @@ def _configure_logging(level: str) -> None:
     logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO))
 
 
+def _normalise_argv(argv: Sequence[str]) -> list[str]:
+    normalised: list[str] = []
+    for arg in argv:
+        cleaned = arg.strip()
+        if cleaned:
+            normalised.append(cleaned)
+    return normalised
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scene AI pipeline runner")
     parser.add_argument("--scene", required=True, help="Scene name")
@@ -222,7 +232,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--weeks-back", type=int, default=60, help="Number of weeks to backfill")
     parser.add_argument("--write", action="store_true", help="Persist results to Doris")
     parser.add_argument("--topn", type=int, default=int(os.getenv("SCENE_TOPN", "10")), help="Driver TopN override")
-    return parser.parse_args(argv)
+
+    if argv is None:
+        argv_list = sys.argv[1:]
+    else:
+        argv_list = list(argv)
+
+    return parser.parse_args(_normalise_argv(argv_list))
 
 
 def main(argv: Sequence[str] | None = None) -> None:
