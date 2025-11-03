@@ -19,7 +19,7 @@ SCPC（Scene-Competition-Parent-Child）面向亚马逊跨境运营团队，按�
   - `bi_amz_vw_scene_keyword`：获取场景关键词集合与 weight。
   - `bi_amz_vw_kw_week`：拉取关键词×周度事实（vol/rank/clickShare/conversionShare 及 ASIN 证据）。
   - `bi_amz_mv_scene_week`：覆盖率与周起始日（周日）。当 MV 不可用时会退化为事实聚合。
-- **写入对象**（全部 `REPLACE INTO` 幂等）：
+- **写入对象**（全部 `UPSERT INTO` 幂等）：
   - `bi_amz_scene_kw_week_clean`
   - `bi_amz_scene_features`
   - `bi_amz_scene_drivers`
@@ -51,7 +51,7 @@ python -m scpc.etl.scene_pipeline \
   --weeks-back 60 \
   --write
 ```
-默认只在 `--write` 传入时写库；不传 `--write` 将返回清洗/特征/驱动 DataFrame 的行数摘要，便于本地调试。运行前请通过环境变量或仓库根目录的 `.env` 提供 Doris/MySQL 配置（`DORIS_HOST/PORT/USER/PASSWORD/DATABASE`），`scpc.db.engine` 会自动拼接连接串；如需自定义可直接设置 `DB_URI` 覆盖。`SCENE_TOPN` 环境变量可控制驱动词 TopN。
+默认只在 `--write` 传入时写库；不传 `--write` 将返回清洗/特征/驱动 DataFrame 的行数摘要，便于本地调试。运行前请通过环境变量或仓库根目录的 `.env` 提供 Doris 2.x 配置（`DORIS_HOST/PORT/USER/PASSWORD/DATABASE`），`scpc.db.engine` 会自动拼接连接串；如需自定义可直接设置 `DB_URI` 覆盖。`SCENE_TOPN` 环境变量可控制驱动词 TopN。
 
 ### 模块测试
 安装依赖：`pip install -r requirements-dev.txt`
@@ -64,7 +64,7 @@ python -m scpc.etl.scene_pipeline \
 ## 目录结构
 ```
 configs/                 # YAML 配置（调度、阈值等）
-schema.sql               # MySQL 建表示例，覆盖 RAW/特征/结果层
+schema.sql               # Doris (MySQL 协议) 建表示例，覆盖 RAW/特征/结果层
 scpc/
   etl/                   # SQLAlchemy 数据读取（全部参数化）
   features/              # S/C/P/C 特征计算函数
@@ -77,13 +77,13 @@ scpc/
 ```
 
 ## 环境变量与 .env
-项目默认通过环境变量配置 DeepSeek 与 Doris/MySQL 凭证，可在仓库根目录创建 `.env`：
+项目默认通过环境变量配置 DeepSeek 与 Doris 凭证，可在仓库根目录创建 `.env`：
 ```
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-chat
 DEEPSEEK_API_KEY=your-deepseek-key
 DEEPSEEK_TIMEOUT=30
-# Doris / MySQL 连接配置（会自动拼接连接串）
+# Doris 2.x 连接配置（会自动拼接连接串）
 DORIS_HOST=127.0.0.1
 DORIS_PORT=9030
 DORIS_USER=scpc_user
@@ -102,7 +102,7 @@ DORIS_DATABASE=bi_amz
 - 多渠道库存与广告投放；
 - 预估毛利、特征层（parent/child_features）与 JSON 结果层；
 - job_runs 与 change_log 可扩展用于审计。
-部署前请在 MySQL 8 实例执行建表脚本，或在现有库上通过 `ALTER TABLE` 兼容更新。
+部署前请在 Doris 2.x 集群执行建表脚本（兼容 MySQL 方言），或在现有库上通过 `ALTER TABLE` 兼容更新。
 
 ## 任务入口
 - 场景大盘：`python -m scpc.etl.scene_pipeline --scene <SCENE> --mk <MK> --weeks-back 60 --write`

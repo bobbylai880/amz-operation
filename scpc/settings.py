@@ -65,8 +65,8 @@ def get_deepseek_settings(*, env_paths: Iterable[str | os.PathLike[str]] = (".en
 
 
 @dataclass(slots=True)
-class DatabaseSettings:
-    """Settings used to establish SQLAlchemy connections to MySQL."""
+class DorisSettings:
+    """Settings used to establish SQLAlchemy connections to Doris."""
 
     host: str
     port: int
@@ -80,23 +80,22 @@ class DatabaseSettings:
         return f"{driver}://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
 
 
-def get_database_settings(*, env_paths: Iterable[str | os.PathLike[str]] = (".env",)) -> DatabaseSettings:
-    """Return database connection information from environment variables."""
+def get_doris_settings(*, env_paths: Iterable[str | os.PathLike[str]] = (".env",)) -> DorisSettings:
+    """Return Doris connection information from environment variables."""
 
     for candidate in env_paths:
         load_dotenv(candidate)
-    host = os.getenv("MYSQL_HOST")
-    port_raw = os.getenv("MYSQL_PORT", "3306")
-    database = os.getenv("MYSQL_DATABASE")
-    user = os.getenv("MYSQL_USER")
-    password = os.getenv("MYSQL_PASSWORD")
+    host = os.getenv("DORIS_HOST")
+    port_raw = os.getenv("DORIS_PORT", "9030")
+    database = os.getenv("DORIS_DATABASE")
+    user = os.getenv("DORIS_USER")
+    password = os.getenv("DORIS_PASSWORD", "")
     missing = [
         name
         for name, value in (
-            ("MYSQL_HOST", host),
-            ("MYSQL_DATABASE", database),
-            ("MYSQL_USER", user),
-            ("MYSQL_PASSWORD", password),
+            ("DORIS_HOST", host),
+            ("DORIS_DATABASE", database),
+            ("DORIS_USER", user),
         )
         if not value
     ]
@@ -105,14 +104,14 @@ def get_database_settings(*, env_paths: Iterable[str | os.PathLike[str]] = (".en
     try:
         port = int(port_raw)
     except ValueError as exc:  # pragma: no cover - defensive branch
-        raise RuntimeError("MYSQL_PORT must be an integer") from exc
-    return DatabaseSettings(host=host, port=port, database=database, user=user, password=password)
+        raise RuntimeError("DORIS_PORT must be an integer") from exc
+    return DorisSettings(host=host, port=port, database=database, user=user, password=password)
 
 
 __all__ = [
     "DeepSeekSettings",
-    "DatabaseSettings",
+    "DorisSettings",
     "get_deepseek_settings",
-    "get_database_settings",
+    "get_doris_settings",
     "load_dotenv",
 ]
