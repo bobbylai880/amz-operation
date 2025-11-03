@@ -54,7 +54,7 @@ def _load_env_file() -> None:
 
 
 def _build_db_uri_from_components() -> tuple[str | None, list[str]]:
-    """Attempt to construct a Doris/MySQL URI from split environment variables."""
+    """Attempt to construct a Doris connection URI from split environment variables."""
 
     required_keys: Iterable[str] = ("DORIS_HOST", "DORIS_USER", "DORIS_DATABASE")
     resolved = {key: os.getenv(key, "").strip() for key in required_keys}

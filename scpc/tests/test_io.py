@@ -29,31 +29,19 @@ def _build_mock_engine(url: str, collector: list[str], *, side_effect=None):
             result = side_effect(statement)
             if isinstance(result, Exception):
                 raise result
+            if isinstance(result, _MockResult):
+                return result
         return _MockResult()
 
     return create_engine(url, strategy="mock", executor=executor)
 
 
-def test_replace_into_mysql_uses_on_duplicate() -> None:
+def test_replace_into_uses_force_replace_mode_without_version_probe() -> None:
     statements: list[str] = []
-    engine = _build_mock_engine("mysql+pymysql://user:pass@localhost/test", statements)
-
-    df = pd.DataFrame([{"id": 1, "value": 10}, {"id": 2, "value": 20}])
-
-    inserted = replace_into(engine, "sample_table", df, chunk_size=100)
-
-    assert inserted == 2
-    assert any("ON DUPLICATE KEY UPDATE" in stmt for stmt in statements)
-
-
-def test_replace_into_doris_falls_back_to_replace() -> None:
-    statements: list[str] = []
-    triggered = {"raised": False}
 
     def side_effect(statement: str):
-        if "ON DUPLICATE KEY UPDATE" in statement and not triggered["raised"]:
-            triggered["raised"] = True
-            return RuntimeError("Encountered: ON DUPLICATE KEY UPDATE Expected: COMMA")
+        if "version" in statement.lower():
+            raise AssertionError("replace_into should not query Doris version")
         return None
 
     engine = _build_mock_engine(
@@ -62,10 +50,32 @@ def test_replace_into_doris_falls_back_to_replace() -> None:
         side_effect=side_effect,
     )
 
-    df = pd.DataFrame([{"scene": "A", "metric": 1}])
+    df = pd.DataFrame([{"scene": "A", "metric": 1}, {"scene": "B", "metric": 2}])
 
-    inserted = replace_into(engine, "bi_table", df)
+    inserted = replace_into(engine, "bi_table", df, chunk_size=2)
 
-    assert inserted == 1
-    assert any(stmt.startswith("INSERT INTO") for stmt in statements)
-    assert any(stmt.startswith("REPLACE INTO") for stmt in statements)
+    assert inserted == 2
+    assert any("REPLACE INTO" in stmt for stmt in statements)
+    assert not any("SELECT version" in stmt for stmt in statements)
+
+
+def test_replace_into_batches_rows_using_replace_into() -> None:
+    statements: list[str] = []
+
+    engine = _build_mock_engine(
+        "mysql+pymysql://user:pass@doris-host/test",
+        statements,
+    )
+
+    df = pd.DataFrame(
+        [
+            {"scene": "A", "metric": 1},
+            {"scene": "B", "metric": 2},
+            {"scene": "C", "metric": 3},
+        ]
+    )
+
+    inserted = replace_into(engine, "bi_table", df, chunk_size=2)
+
+    assert inserted == 3
+    assert sum(1 for stmt in statements if "REPLACE INTO" in stmt) == 2
