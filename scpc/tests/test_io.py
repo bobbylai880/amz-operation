@@ -155,7 +155,6 @@ def test_replace_into_uses_replace_when_version_unknown() -> None:
     engine = _build_mock_engine(
         "mysql+pymysql://user:pass@doris-host/test",
         statements,
-        side_effect=side_effect,
     )
 
     df = pd.DataFrame([{"scene": "A", "metric": 1}, {"scene": "B", "metric": 2}])

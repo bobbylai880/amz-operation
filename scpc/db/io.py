@@ -119,7 +119,6 @@ def _execute_doris_upsert(
             "replace_into using Doris %s for %s (version=%s)",
             "UPSERT" if supports_upsert else "REPLACE",
             table_obj.fullname,
-            version or "unknown",
         )
         affected = 0
         for chunk in _chunks(records, chunk_size):
@@ -152,7 +151,22 @@ def _format_identifier(preparer, identifier: str) -> str:
         return preparer.quote(identifier)
     except AttributeError:  # pragma: no cover - compatibility shim
         return preparer.quote_identifier(identifier)
+def _get_doris_version(conn: Connection) -> str | None:
+    """Return Doris version, tolerant of MySQL-compatible layers."""
 
+    try:
+        comment_result = conn.execute(text("SELECT version_comment()"))
+    except Exception:  # pragma: no cover - permissions or compatibility issues
+        comment_result = None
+    else:
+        try:
+            comment = comment_result.scalar()
+        except Exception:  # pragma: no cover - scalar not supported
+            comment = None
+        if isinstance(comment, str):
+            cleaned = comment.strip()
+            if cleaned and "doris" in cleaned.lower():
+                return cleaned
 
 def _supports_doris_upsert(version: str | None) -> bool:
     if not version:
