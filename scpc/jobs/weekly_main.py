@@ -12,7 +12,7 @@ from scpc.cache import (
     GLOBAL_CACHE,
     SceneCacheKey,
 )
-from scpc.settings import get_database_settings, get_deepseek_settings
+from scpc.settings import get_deepseek_settings, get_doris_settings
 
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ def run(
     weeks = iso_weeks or tuple()
     logger.info("weekly_main.start", extra={"scene_id": scene_id, "parent_id": parent_id})
     try:
-        db_settings = get_database_settings()
+        db_settings = get_doris_settings()
         llm_settings = get_deepseek_settings()
     except RuntimeError as exc:
         logger.error(
@@ -65,9 +65,9 @@ def run(
         extra={
             "scene_id": scene_id,
             "parent_id": parent_id,
-            "db_host": db_settings.host,
-            "db_port": db_settings.port,
-            "db_name": db_settings.database,
+            "doris_host": db_settings.host,
+            "doris_port": db_settings.port,
+            "doris_db": db_settings.database,
             "deepseek_base": llm_settings.base_url,
             "deepseek_model": llm_settings.model,
         },
