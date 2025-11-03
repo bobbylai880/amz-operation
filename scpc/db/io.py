@@ -1,21 +1,30 @@
-"""Read/write helpers for Doris/MySQL using SQLAlchemy."""
+"""Read/write helpers for Doris using SQLAlchemy."""
 from __future__ import annotations
 
 import logging
+import re
+import warnings
 from itertools import islice
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
 from sqlalchemy import Column, MetaData, Table, text
-from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import SAWarning
 from sqlalchemy.sql.sqltypes import NullType
 
 
 logger = logging.getLogger(__name__)
 
-
-logger = logging.getLogger(__name__)
+# Filter out Doris-specific schema reflection warnings emitted by SQLAlchemy's
+# MySQL dialect when encountering Doris extensions such as DISTRIBUTED BY or
+# PROPERTIES clauses. These warnings are expected and do not impact runtime
+# behaviour, so we silence them globally to keep logs clean.
+warnings.filterwarnings(
+    "ignore",
+    message="Unknown schema content",
+    category=SAWarning,
+)
 
 
 def fetch_dataframe(engine: Engine, sql: str, params: Mapping[str, object] | None = None) -> pd.DataFrame:
@@ -60,50 +69,27 @@ def _chunks(seq: Sequence[Mapping[str, object]], size: int) -> Iterable[list[Map
 
 
 def replace_into(engine: Engine, table: str, df: pd.DataFrame, *, chunk_size: int = 500) -> int:
-    """Execute an UPSERT using Doris preferred semantics with MySQL compatibility."""
+    """Execute a Doris ``REPLACE INTO`` using the provided ``DataFrame``."""
 
     if df.empty:
         return 0
 
     records = _normalise_records(df.to_dict(orient="records"))
-    columns = list(df.columns)
-    col_list = ", ".join(f"`{col}`" for col in columns)
-    placeholders = ", ".join(f"%({col})s" for col in columns)
 
-    update_columns = [col for col in columns if col not in {"create_time"}]
-    if not update_columns:
-        update_columns = columns
-    update_clause = ", ".join(f"`{col}`=VALUES(`{col}`)" for col in update_columns)
-
-    insert_sql = (
-        "INSERT INTO {table} ({cols}) VALUES ({values}) ON DUPLICATE KEY UPDATE {updates}".format(
-            table=table,
-            cols=col_list,
-            values=placeholders,
-            updates=update_clause,
+    metadata = MetaData()
+    try:
+        table_obj = Table(table, metadata, autoload_with=engine)
+    except Exception as exc:  # pragma: no cover - reflection fallback
+        logger.debug(
+            "replace_into falling back to synthetic metadata for %s due to %s",
+            table,
+            exc,
         )
-    )
+        metadata = MetaData()
+        columns = [Column(name, NullType()) for name in df.columns]
+        table_obj = Table(table, metadata, *columns)
 
-    affected = 0
-    with engine.begin() as conn:
-        for chunk in _chunks(records, chunk_size):
-            try:
-                conn.exec_driver_sql(insert_sql, chunk)
-                affected += len(chunk)
-            except Exception as exc:
-                message = str(exc)
-                if "Encountered: ON" in message or "Expected: COMMA" in message:
-                    replace_sql = f"REPLACE INTO {table} ({col_list}) VALUES ({placeholders})"
-                    logger.info(
-                        "replace_into falling back to Doris REPLACE INTO for %s due to %s",
-                        table,
-                        message,
-                    )
-                    conn.exec_driver_sql(replace_sql, chunk)
-                    affected += len(chunk)
-                else:
-                    raise
-    return affected
+    return _execute_doris_upsert(engine, table_obj, df, records, chunk_size)
 
 
 def _execute_doris_upsert(
@@ -119,19 +105,37 @@ def _execute_doris_upsert(
 
     with engine.begin() as conn:
         version = _get_doris_version(conn)
-        verb = "UPSERT INTO" if version and version.startswith("2.") else "REPLACE INTO"
+        supports_upsert = _supports_doris_upsert(version)
+        table_name = _format_table(preparer, table_obj)
+        upsert_sql = text(
+            f"UPSERT INTO {table_name} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
+        )
+        replace_sql = text(
+            f"REPLACE INTO {table_name} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
+        )
+
+        statement = upsert_sql if supports_upsert else replace_sql
         logger.info(
             "replace_into using Doris %s for %s (version=%s)",
-            "UPSERT" if verb.startswith("UPSERT") else "REPLACE",
+            "UPSERT" if supports_upsert else "REPLACE",
             table_obj.fullname,
             version or "unknown",
         )
-        statement = text(
-            f"{verb} {_format_table(preparer, table_obj)} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
-        )
         affected = 0
         for chunk in _chunks(records, chunk_size):
-            conn.execute(statement, chunk)
+            try:
+                conn.execute(statement, chunk)
+            except Exception as exc:
+                if statement is upsert_sql and _should_fallback_to_replace(exc):
+                    logger.warning(
+                        "replace_into falling back to Doris REPLACE INTO for %s due to %s",
+                        table_obj.fullname,
+                        exc,
+                    )
+                    statement = replace_sql
+                    conn.execute(statement, chunk)
+                else:
+                    raise
             affected += len(chunk)
     return affected
 
@@ -150,31 +154,69 @@ def _format_identifier(preparer, identifier: str) -> str:
         return preparer.quote_identifier(identifier)
 
 
-def _is_doris_engine(engine: Engine) -> bool:
-    url = engine.url
-    candidates = [
-        getattr(url, "host", None),
-        getattr(url, "database", None),
-        getattr(url, "drivername", None),
-    ]
-    for candidate in candidates:
-        if candidate and "doris" in candidate.lower():
+def _supports_doris_upsert(version: str | None) -> bool:
+    if not version:
+        return False
+    lowered = version.lower()
+
+    if "mysql" in lowered or "mariadb" in lowered:
+        return False
+
+    if "doris" in lowered:
+        if "2.x" in lowered:
             return True
-    return False
+        match = re.search(r"(\d+)\.(\d+)", lowered)
+        if not match:
+            return False
+        major = int(match.group(1))
+        return major >= 2
+
+    match = re.search(r"^(\d+)\.", lowered)
+    if not match:
+        return False
+    return match.group(1) == "2"
 
 
+def _should_fallback_to_replace(exc: Exception) -> bool:
+    message = str(exc).lower()
+    fallback_markers = (
+        "merge-on-write",
+        "can not change unique key",
+        "not support upsert",
+        "unknown statement type: upsert",
+    )
+    return any(marker in message for marker in fallback_markers)
 def _get_doris_version(conn: Connection) -> str | None:
+    """Return Doris version, tolerant of MySQL-compatible layers."""
+
     try:
-        result = conn.execute(text("SELECT version()"))
+        comment_result = conn.execute(text("SELECT version_comment()"))
+    except Exception:  # pragma: no cover - permissions or compatibility issues
+        comment_result = None
+    else:
+        try:
+            comment = comment_result.scalar()
+        except Exception:  # pragma: no cover - scalar not supported
+            comment = None
+        if isinstance(comment, str):
+            cleaned = comment.strip()
+            if cleaned and "doris" in cleaned.lower():
+                return cleaned
+
+    try:
+        version_result = conn.execute(text("SELECT version()"))
     except Exception as exc:  # pragma: no cover - network failures or permissions
         logger.warning("replace_into could not determine Doris version: %s", exc)
         return None
     try:
-        version = result.scalar()
+        version = version_result.scalar()
     except Exception:  # pragma: no cover - scalar not supported
         return None
     if isinstance(version, str):
-        return version.strip()
+        cleaned = version.strip()
+        if cleaned.startswith("5.7.99"):
+            return "Doris 2.x (mysql-compatible)"
+        return cleaned
     return None
 
 
