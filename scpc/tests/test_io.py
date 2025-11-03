@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
 
 import pytest
@@ -9,7 +10,7 @@ pytest.importorskip("sqlalchemy")
 pytest.importorskip("pandas")
 import pandas as pd
 
-from scpc.db.io import replace_into
+from scpc.db.io import _get_doris_version, replace_into
 
 
 class _MockResult:
@@ -81,67 +82,7 @@ def _build_mock_engine(
     return _EngineWrapper()
 
 
-def test_replace_into_prefers_upsert_for_doris_two_x() -> None:
-    statements: list[str] = []
-
-    def side_effect(statement: str):
-        lowered = statement.lower()
-        if "version_comment" in lowered:
-            return _MockResult("Doris version 2.0.4")
-        if "version()" in lowered:
-            return _MockResult("5.7.99")
-        return None
-
-    engine = _build_mock_engine(
-        "mysql+pymysql://user:pass@doris-host/test",
-        statements,
-        side_effect=side_effect,
-    )
-
-    df = pd.DataFrame([{"scene": "A", "metric": 1}, {"scene": "B", "metric": 2}])
-
-    inserted = replace_into(engine, "bi_table", df, chunk_size=2)
-
-    assert inserted == 2
-    assert any("UPSERT INTO" in stmt for stmt in statements)
-    assert sum(1 for stmt in statements if "REPLACE INTO" in stmt) == 0
-
-
-def test_replace_into_falls_back_to_replace_when_upsert_rejected() -> None:
-    statements: list[str] = []
-    call_count = {"upsert": 0}
-
-    def side_effect(statement: str):
-        lowered = statement.lower()
-        if "version_comment" in lowered:
-            return _MockResult("Doris version 2.0.4")
-        if "version()" in lowered:
-            return _MockResult("5.7.99")
-        if "upsert into" in lowered:
-            if call_count["upsert"] == 0:
-                call_count["upsert"] += 1
-                return RuntimeError("Can not change UNIQUE KEY to Merge-On-Write mode")
-        return None
-
-    engine = _build_mock_engine(
-        "mysql+pymysql://user:pass@doris-host/test",
-        statements,
-        side_effect=side_effect,
-    )
-
-    df = pd.DataFrame([{"scene": "A", "metric": 1}, {"scene": "B", "metric": 2}])
-
-    inserted = replace_into(engine, "bi_table", df, chunk_size=2)
-
-    assert inserted == 2
-    assert any("UPSERT INTO" in stmt for stmt in statements)
-    assert any("REPLACE INTO" in stmt for stmt in statements)
-    assert statements.index(next(stmt for stmt in statements if "REPLACE INTO" in stmt)) > statements.index(
-        next(stmt for stmt in statements if "UPSERT INTO" in stmt)
-    )
-
-
-def test_replace_into_uses_replace_when_version_unknown() -> None:
+def test_replace_into_uses_insert_upsert_and_logs(caplog: pytest.LogCaptureFixture) -> None:
     statements: list[str] = []
 
     def side_effect(statement: str):
@@ -149,18 +90,99 @@ def test_replace_into_uses_replace_when_version_unknown() -> None:
         if "version_comment" in lowered:
             return RuntimeError("function not found")
         if "version()" in lowered:
-            return _MockResult("5.6.0")
+            return _MockResult("5.7.99-doris")
         return None
 
     engine = _build_mock_engine(
         "mysql+pymysql://user:pass@doris-host/test",
         statements,
+        side_effect=side_effect,
     )
 
     df = pd.DataFrame([{"scene": "A", "metric": 1}, {"scene": "B", "metric": 2}])
 
+    caplog.set_level(logging.INFO)
     inserted = replace_into(engine, "bi_table", df, chunk_size=2)
 
     assert inserted == 2
-    assert any("REPLACE INTO" in stmt for stmt in statements)
-    assert not any("UPSERT INTO" in stmt for stmt in statements)
+    inserts = [stmt for stmt in statements if stmt.upper().startswith("INSERT INTO")]
+    assert len(inserts) == 1
+    assert not any("UPSERT INTO" in stmt.upper() for stmt in statements)
+    assert not any("REPLACE INTO" in stmt.upper() for stmt in statements)
+    assert "Doris 2.x (mysql-compatible)" in caplog.text
+    assert "rows=2" in caplog.text
+
+
+def test_replace_into_chunks_execution_counts() -> None:
+    statements: list[str] = []
+    insert_calls = 0
+
+    def side_effect(statement: str):
+        nonlocal insert_calls
+        lowered = statement.lower()
+        if "version_comment" in lowered:
+            return RuntimeError("function not found")
+        if "version()" in lowered:
+            return _MockResult("5.7.99-doris")
+        if "insert into" in lowered:
+            insert_calls += 1
+        return None
+
+    engine = _build_mock_engine(
+        "mysql+pymysql://user:pass@doris-host/test",
+        statements,
+        side_effect=side_effect,
+    )
+
+    df = pd.DataFrame([
+        {"scene": f"scene-{i}", "metric": i}
+        for i in range(116)
+    ])
+
+    inserted = replace_into(engine, "bi_table", df, chunk_size=50)
+
+    assert inserted == 116
+    assert insert_calls == 3
+    assert sum(1 for stmt in statements if stmt.upper().startswith("INSERT INTO")) == 3
+
+
+def test_replace_into_reflection_fallback_logs(caplog: pytest.LogCaptureFixture) -> None:
+    statements: list[str] = []
+
+    def side_effect(statement: str):
+        lowered = statement.lower()
+        if "version_comment" in lowered:
+            return RuntimeError("not supported")
+        if "version()" in lowered:
+            return _MockResult("5.7.99")
+        return None
+
+    engine = _build_mock_engine(
+        "mysql+pymysql://user:pass@doris-host/test",
+        statements,
+        side_effect=side_effect,
+    )
+
+    df = pd.DataFrame([{"scene": "A", "metric": 1}])
+
+    caplog.set_level(logging.DEBUG)
+    inserted = replace_into(engine, "bi_table", df, chunk_size=1)
+
+    assert inserted == 1
+    assert "falling back to synthetic metadata" in caplog.text
+    assert any(stmt.upper().startswith("INSERT INTO") for stmt in statements)
+
+
+def test_version_detection_5799_maps_to_doris_mysql_layer() -> None:
+    class _Conn:
+        def execute(self, sql, params=None):
+            statement = str(sql).lower()
+            if "version_comment" in statement:
+                raise RuntimeError("not supported")
+            if "version()" in statement:
+                return _MockResult("5.7.99-abcdef")
+            raise AssertionError(f"unexpected statement: {sql}")
+
+    version = _get_doris_version(_Conn())
+
+    assert version == "Doris 2.x (mysql-compatible)"

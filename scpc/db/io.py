@@ -69,7 +69,7 @@ def _chunks(seq: Sequence[Mapping[str, object]], size: int) -> Iterable[list[Map
 
 
 def replace_into(engine: Engine, table: str, df: pd.DataFrame, *, chunk_size: int = 500) -> int:
-    """Execute a Doris ``REPLACE INTO`` using the provided ``DataFrame``."""
+    """Insert records into a Doris UNIQUE KEY table with upsert semantics."""
 
     if df.empty:
         return 0
@@ -102,39 +102,24 @@ def _execute_doris_upsert(
     preparer = engine.dialect.identifier_preparer
     column_tokens = [_format_identifier(preparer, name) for name in df.columns]
     value_tokens = [f":{name}" for name in df.columns]
+    table_name = _format_table(preparer, table_obj)
+    statement = text(
+        f"INSERT INTO {table_name} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
+    )
 
     with engine.begin() as conn:
         version = _get_doris_version(conn)
-        supports_upsert = _supports_doris_upsert(version)
-        table_name = _format_table(preparer, table_obj)
-        upsert_sql = text(
-            f"UPSERT INTO {table_name} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
-        )
-        replace_sql = text(
-            f"REPLACE INTO {table_name} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
-        )
-
-        statement = upsert_sql if supports_upsert else replace_sql
         logger.info(
-            "replace_into using Doris %s for %s (version=%s)",
-            "UPSERT" if supports_upsert else "REPLACE",
+            "replace_into using Doris INSERT (upsert on UNIQUE KEY) for %s (version=%s, rows=%d, cols=%d, chunk=%d)",
             table_obj.fullname,
+            version or "unknown",
+            len(records),
+            len(df.columns),
+            chunk_size,
         )
         affected = 0
         for chunk in _chunks(records, chunk_size):
-            try:
-                conn.execute(statement, chunk)
-            except Exception as exc:
-                if statement is upsert_sql and _should_fallback_to_replace(exc):
-                    logger.warning(
-                        "replace_into falling back to Doris REPLACE INTO for %s due to %s",
-                        table_obj.fullname,
-                        exc,
-                    )
-                    statement = replace_sql
-                    conn.execute(statement, chunk)
-                else:
-                    raise
+            conn.execute(statement, chunk)
             affected += len(chunk)
     return affected
 
@@ -151,22 +136,7 @@ def _format_identifier(preparer, identifier: str) -> str:
         return preparer.quote(identifier)
     except AttributeError:  # pragma: no cover - compatibility shim
         return preparer.quote_identifier(identifier)
-def _get_doris_version(conn: Connection) -> str | None:
-    """Return Doris version, tolerant of MySQL-compatible layers."""
 
-    try:
-        comment_result = conn.execute(text("SELECT version_comment()"))
-    except Exception:  # pragma: no cover - permissions or compatibility issues
-        comment_result = None
-    else:
-        try:
-            comment = comment_result.scalar()
-        except Exception:  # pragma: no cover - scalar not supported
-            comment = None
-        if isinstance(comment, str):
-            cleaned = comment.strip()
-            if cleaned and "doris" in cleaned.lower():
-                return cleaned
 
 def _supports_doris_upsert(version: str | None) -> bool:
     if not version:
@@ -191,15 +161,6 @@ def _supports_doris_upsert(version: str | None) -> bool:
     return match.group(1) == "2"
 
 
-def _should_fallback_to_replace(exc: Exception) -> bool:
-    message = str(exc).lower()
-    fallback_markers = (
-        "merge-on-write",
-        "can not change unique key",
-        "not support upsert",
-        "unknown statement type: upsert",
-    )
-    return any(marker in message for marker in fallback_markers)
 def _get_doris_version(conn: Connection) -> str | None:
     """Return Doris version, tolerant of MySQL-compatible layers."""
 
