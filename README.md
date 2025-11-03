@@ -49,7 +49,11 @@ python -m scpc.etl.scene_pipeline \
   --scene "Storage Rack" \
   --mk US \
   --weeks-back 60 \
-  --write
+  --write \
+  --with-llm \
+  --emit-json \
+  --emit-md \
+  --outputs-dir storage/outputs/scene
 ```
 默认只在 `--write` 传入时写库；不传 `--write` 将返回清洗/特征/驱动 DataFrame 的行数摘要，便于本地调试。运行前请通过环境变量或仓库根目录的 `.env` 提供 Doris 2.x 配置（`DORIS_HOST/PORT/USER/PASSWORD/DATABASE`），`scpc.db.engine` 会自动拼接连接串；如需自定义可直接设置 `DB_URI` 覆盖。`SCENE_TOPN` 环境变量可控制驱动词 TopN。
 
