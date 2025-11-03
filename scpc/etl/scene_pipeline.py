@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from datetime import date, timedelta
+from time import perf_counter
 from typing import Sequence
 
 import pandas as pd
@@ -146,74 +148,162 @@ def _prepare_drivers_output(drivers: pd.DataFrame) -> pd.DataFrame:
     return output
 
 
+@contextmanager
+def _stage_timer(stage: str, scene: str, marketplace_id: str):
+    start = perf_counter()
+    LOGGER.info(
+        "scene_pipeline_stage_start scene=%s mk=%s stage=%s",
+        scene,
+        marketplace_id,
+        stage,
+        extra={"scene": scene, "mk": marketplace_id, "stage": stage},
+    )
+    metrics: dict[str, object] = {}
+
+    def _record(**kwargs: object) -> None:
+        metrics.update(kwargs)
+
+    try:
+        yield _record
+    except Exception:
+        LOGGER.exception(
+            "scene_pipeline_stage_error scene=%s mk=%s stage=%s",
+            scene,
+            marketplace_id,
+            stage,
+            extra={"scene": scene, "mk": marketplace_id, "stage": stage},
+        )
+        raise
+    else:
+        duration_ms = round((perf_counter() - start) * 1000, 2)
+        LOGGER.info(
+            "scene_pipeline_stage_complete scene=%s mk=%s stage=%s duration_ms=%s %s",
+            scene,
+            marketplace_id,
+            stage,
+            duration_ms,
+            " ".join(f"{key}={value}" for key, value in metrics.items()),
+            extra={
+                "scene": scene,
+                "mk": marketplace_id,
+                "stage": stage,
+                "duration_ms": duration_ms,
+                **metrics,
+            },
+        )
+
+
 def run_scene_pipeline(scene: str, marketplace_id: str, weeks_back: int, *, write: bool, topn: int) -> dict[str, pd.DataFrame]:
     engine = create_doris_engine()
     min_yrwk = _compute_min_yrwk(weeks_back)
-    LOGGER.info("scene_pipeline_start", extra={"scene": scene, "mk": marketplace_id, "min_yrwk": min_yrwk})
+    total_start = perf_counter()
+    LOGGER.info(
+        "scene_pipeline_start scene=%s mk=%s min_yrwk=%s",
+        scene,
+        marketplace_id,
+        min_yrwk,
+        extra={"scene": scene, "mk": marketplace_id, "min_yrwk": min_yrwk},
+    )
 
-    with engine.connect() as conn:
-        keywords_df = pd.read_sql_query(text(KEYWORD_SQL), conn, params={"scene": scene, "mk": marketplace_id})
+    with _stage_timer("load_keywords", scene, marketplace_id) as record:
+        with engine.connect() as conn:
+            keywords_df = pd.read_sql_query(text(KEYWORD_SQL), conn, params={"scene": scene, "mk": marketplace_id})
+        record(keyword_count=len(keywords_df))
     if keywords_df.empty:
-        LOGGER.warning("no_keywords", extra={"scene": scene, "mk": marketplace_id})
+        LOGGER.warning(
+            "no_keywords scene=%s mk=%s stage=load_keywords",
+            scene,
+            marketplace_id,
+            extra={"scene": scene, "mk": marketplace_id, "stage": "load_keywords"},
+        )
         return {"clean": pd.DataFrame(), "features": pd.DataFrame(), "drivers": pd.DataFrame()}
 
     kw_list = keywords_df["keyword_norm"].unique().tolist()
     if not kw_list:
-        LOGGER.warning("no_keywords_active", extra={"scene": scene, "mk": marketplace_id})
+        LOGGER.warning(
+            "no_keywords_active scene=%s mk=%s stage=load_keywords",
+            scene,
+            marketplace_id,
+            extra={"scene": scene, "mk": marketplace_id, "stage": "load_keywords"},
+        )
         return {"clean": pd.DataFrame(), "features": pd.DataFrame(), "drivers": pd.DataFrame()}
 
-    with engine.connect() as conn:
-        facts_df = pd.read_sql_query(FACT_SQL, conn, params={"mk": marketplace_id, "kw_list": kw_list, "min_yrwk": min_yrwk})
-        coverage_df = pd.read_sql_query(text(COVERAGE_SQL), conn, params={"scene": scene, "mk": marketplace_id, "min_yrwk": min_yrwk})
+    with _stage_timer("load_facts", scene, marketplace_id) as record:
+        with engine.connect() as conn:
+            facts_df = pd.read_sql_query(
+                FACT_SQL,
+                conn,
+                params={"mk": marketplace_id, "kw_list": kw_list, "min_yrwk": min_yrwk},
+            )
+            coverage_df = pd.read_sql_query(
+                text(COVERAGE_SQL),
+                conn,
+                params={"scene": scene, "mk": marketplace_id, "min_yrwk": min_yrwk},
+            )
+        record(fact_rows=len(facts_df), coverage_rows=len(coverage_df))
 
-    week_index = _collect_week_index(facts_df, coverage_df)
-    clean_result = clean_keyword_panel(facts_df, week_index=week_index)
-    clean_df = _prepare_clean_output(clean_result, scene, marketplace_id)
+    with _stage_timer("prepare_clean_data", scene, marketplace_id) as record:
+        week_index = _collect_week_index(facts_df, coverage_df)
+        clean_result = clean_keyword_panel(facts_df, week_index=week_index)
+        clean_df = _prepare_clean_output(clean_result, scene, marketplace_id)
+        record(clean_weeks=len(week_index), clean_rows=len(clean_df))
 
-    features_result = compute_scene_features(
-        clean_result.data,
-        keywords_df,
-        coverage_df,
-        scene=scene,
-        marketplace_id=marketplace_id,
-    )
-    features_df = _prepare_features_output(features_result.data)
+    with _stage_timer("compute_features", scene, marketplace_id) as record:
+        features_result = compute_scene_features(
+            clean_result.data,
+            keywords_df,
+            coverage_df,
+            scene=scene,
+            marketplace_id=marketplace_id,
+        )
+        features_df = _prepare_features_output(features_result.data)
+        record(feature_rows=len(features_df))
 
-    drivers_result = compute_scene_drivers(
-        clean_result.data,
-        facts_df,
-        features_df,
-        keywords_df,
-        scene=scene,
-        marketplace_id=marketplace_id,
-        topn=topn,
-    )
-    drivers_df = _prepare_drivers_output(drivers_result.data)
+    with _stage_timer("compute_drivers", scene, marketplace_id) as record:
+        drivers_result = compute_scene_drivers(
+            clean_result.data,
+            facts_df,
+            features_df,
+            keywords_df,
+            scene=scene,
+            marketplace_id=marketplace_id,
+            topn=topn,
+        )
+        drivers_df = _prepare_drivers_output(drivers_result.data)
+        record(driver_rows=len(drivers_df))
 
     if write:
-        clean_rows = replace_into(engine, "bi_amz_scene_kw_week_clean", clean_df) if not clean_df.empty else 0
-        feature_rows = replace_into(engine, "bi_amz_scene_features", features_df) if not features_df.empty else 0
-        driver_rows = replace_into(engine, "bi_amz_scene_drivers", drivers_df) if not drivers_df.empty else 0
-        LOGGER.info(
-            "scene_pipeline_write",
-            extra={"scene": scene, "mk": marketplace_id, "clean_rows": clean_rows, "feature_rows": feature_rows, "driver_rows": driver_rows},
-        )
+        with _stage_timer("persist_results", scene, marketplace_id) as record:
+            clean_rows = replace_into(engine, "bi_amz_scene_kw_week_clean", clean_df) if not clean_df.empty else 0
+            feature_rows = replace_into(engine, "bi_amz_scene_features", features_df) if not features_df.empty else 0
+            driver_rows = replace_into(engine, "bi_amz_scene_drivers", drivers_df) if not drivers_df.empty else 0
+            record(clean_rows=clean_rows, feature_rows=feature_rows, driver_rows=driver_rows)
 
     LOGGER.info(
-        "scene_pipeline_complete",
+        "scene_pipeline_complete scene=%s mk=%s clean_weeks=%s feature_rows=%s driver_rows=%s duration_ms=%s",
+        scene,
+        marketplace_id,
+        len(clean_result.week_index),
+        len(features_df),
+        len(drivers_df),
+        round((perf_counter() - total_start) * 1000, 2),
         extra={
             "scene": scene,
             "mk": marketplace_id,
             "clean_weeks": len(clean_result.week_index),
             "feature_rows": len(features_df),
             "driver_rows": len(drivers_df),
+            "duration_ms": round((perf_counter() - total_start) * 1000, 2),
         },
     )
     return {"clean": clean_df, "features": features_df, "drivers": drivers_df}
 
 
 def _configure_logging(level: str) -> None:
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO))
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
 
 def _normalise_argv(argv: Sequence[str]) -> list[str]:
