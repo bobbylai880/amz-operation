@@ -6,8 +6,13 @@ from itertools import islice
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
-from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy import Column, MetaData, Table, text
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.sql.sqltypes import NullType
+
+
+logger = logging.getLogger(__name__)
 
 
 logger = logging.getLogger(__name__)
@@ -99,6 +104,78 @@ def replace_into(engine: Engine, table: str, df: pd.DataFrame, *, chunk_size: in
                 else:
                     raise
     return affected
+
+
+def _execute_doris_upsert(
+    engine: Engine,
+    table_obj: Table,
+    df: pd.DataFrame,
+    records: Sequence[Mapping[str, object]],
+    chunk_size: int,
+) -> int:
+    preparer = engine.dialect.identifier_preparer
+    column_tokens = [_format_identifier(preparer, name) for name in df.columns]
+    value_tokens = [f":{name}" for name in df.columns]
+
+    with engine.begin() as conn:
+        version = _get_doris_version(conn)
+        verb = "UPSERT INTO" if version and version.startswith("2.") else "REPLACE INTO"
+        logger.info(
+            "replace_into using Doris %s for %s (version=%s)",
+            "UPSERT" if verb.startswith("UPSERT") else "REPLACE",
+            table_obj.fullname,
+            version or "unknown",
+        )
+        statement = text(
+            f"{verb} {_format_table(preparer, table_obj)} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
+        )
+        affected = 0
+        for chunk in _chunks(records, chunk_size):
+            conn.execute(statement, chunk)
+            affected += len(chunk)
+    return affected
+
+
+def _format_table(preparer, table_obj: Table) -> str:
+    try:
+        return preparer.format_table(table_obj)
+    except Exception:  # pragma: no cover - fallback for custom dialects
+        return table_obj.fullname
+
+
+def _format_identifier(preparer, identifier: str) -> str:
+    try:
+        return preparer.quote(identifier)
+    except AttributeError:  # pragma: no cover - compatibility shim
+        return preparer.quote_identifier(identifier)
+
+
+def _is_doris_engine(engine: Engine) -> bool:
+    url = engine.url
+    candidates = [
+        getattr(url, "host", None),
+        getattr(url, "database", None),
+        getattr(url, "drivername", None),
+    ]
+    for candidate in candidates:
+        if candidate and "doris" in candidate.lower():
+            return True
+    return False
+
+
+def _get_doris_version(conn: Connection) -> str | None:
+    try:
+        result = conn.execute(text("SELECT version()"))
+    except Exception as exc:  # pragma: no cover - network failures or permissions
+        logger.warning("replace_into could not determine Doris version: %s", exc)
+        return None
+    try:
+        version = result.scalar()
+    except Exception:  # pragma: no cover - scalar not supported
+        return None
+    if isinstance(version, str):
+        return version.strip()
+    return None
 
 
 __all__ = ["fetch_dataframe", "replace_into"]
