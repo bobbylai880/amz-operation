@@ -92,7 +92,7 @@ MYSQL_PASSWORD=change-me
 可以复制 `.env.example` 并替换为真实值；`.env` 已加入 `.gitignore`，避免凭证泄露。代码通过 `scpc.settings` 自动加载 `.env`，并在任务启动时校验缺失项。
 
 ## 配置文件
-- `configs/prod.yaml`：定义时区、Cron 调度、特征参数（如 `theta_days`、`alpha_effective_woc`）、预算闸门以及输出目录前缀；
+- `configs/prod.yaml`：定义时区、Cron 调度、特征参数（如 `theta_days`、`alpha_effective_woc`）、预算闸门以及本地 `storage/` 输出目录前缀；
 - `configs/scoring_rules.yaml`：给出父体/子体的基准阈值（例如 GMROI、PPAD）供收益优先策略使用。
 
 ## 数据模型
