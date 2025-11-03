@@ -1,176 +1,207 @@
--- Core schema for the S-C-P-C system.
--- The definitions follow the contracts outlined in PRD v4.1.
+-- create_views_mvs.sql
+-- Target: StarRocks/Doris OLAP
+-- Purpose: Create canonical views, materialized view, and result tables for Scene: AI 分析大盘
+-- Prerequisites: Base tables exist -> bi_amz_scene_keyword, bi_amz_aba_kw_week_board
 
-CREATE TABLE IF NOT EXISTS scene_keywords(
-  scene_id VARCHAR(64) NOT NULL,
-  keyword  VARCHAR(256) NOT NULL,
-  PRIMARY KEY(scene_id, keyword)
+/* =========================
+   1) SAFE DROPS
+   ========================= */
+DROP VIEW IF EXISTS bi_amz_vw_scene_keyword;
+DROP VIEW IF EXISTS bi_amz_vw_kw_week;
+DROP MATERIALIZED VIEW IF EXISTS bi_amz_mv_scene_week;
+
+DROP TABLE IF EXISTS bi_amz_scene_kw_week_clean;
+DROP TABLE IF EXISTS bi_amz_scene_features;
+DROP TABLE IF EXISTS bi_amz_scene_drivers;
+
+/* =========================
+   2) VIEWS
+   ========================= */
+
+-- 2.1 关键词规范化视图（直接使用 scene 字段）
+CREATE VIEW bi_amz_vw_scene_keyword AS
+SELECT
+  scene,
+  LOWER(TRIM(keyword))                   AS keyword_norm,
+  marketplace_id,
+  1.0                                    AS weight,    -- 默认 1，可后续外联权重表
+  1                                      AS is_active, -- 默认启用
+  MAX(update_time)                       AS last_update_time
+FROM bi_amz_scene_keyword
+GROUP BY scene, LOWER(TRIM(keyword)), marketplace_id;
+
+-- 2.2 周度事实去重视图（同键取最新快照）
+CREATE VIEW bi_amz_vw_kw_week AS
+SELECT * FROM (
+  SELECT
+    marketplace_id,
+    LOWER(TRIM(keyword))                   AS keyword_norm,
+    year,
+    week_num,
+    startDate,
+    endDate,
+    estSearchesNum                         AS vol,
+    rank,
+    clickShare,
+    conversionShare,
+    asin1, asin1_clickShare, asin1_conversionShare,
+    asin2, asin2_clickShare, asin2_conversionShare,
+    asin3, asin3_clickShare, asin3_conversionShare,
+    update_time,
+    ROW_NUMBER() OVER (
+      PARTITION BY marketplace_id, LOWER(TRIM(keyword)), year, week_num
+      ORDER BY update_time DESC
+    ) AS rn
+  FROM bi_amz_aba_kw_week_board
+) t
+WHERE t.rn = 1;
+
+ /* =========================
+    3) MATERIALIZED VIEW
+    ========================= */
+
+-- 3.1 场景 × 周聚合物化视图
+CREATE MATERIALIZED VIEW bi_amz_mv_scene_week
+DISTRIBUTED BY HASH(scene, marketplace_id) BUCKETS 16
+PROPERTIES (
+  "replication_allocation" = "tag.location.default: 3"
+)
+AS
+SELECT
+  k.scene,
+  k.marketplace_id,
+  w.year,
+  w.week_num,
+  MIN(w.startDate)                                                 AS start_date,     -- 周起始（日）
+  SUM(w.vol)                                                       AS vol_raw_sum,
+  SUM(CASE WHEN w.vol IS NOT NULL THEN 1 ELSE 0 END)               AS kw_with_data,
+  COUNT(*)                                                         AS kw_total,
+  (SUM(CASE WHEN w.vol IS NOT NULL THEN 1 ELSE 0 END) * 1.0) 
+    / NULLIF(COUNT(*), 0)                                          AS coverage
+FROM (SELECT
+  scene,
+  LOWER(TRIM(keyword))                   AS keyword_norm,
+  marketplace_id,
+  1.0                                    AS weight,    -- 默认 1，可后续外联权重表
+  1                                      AS is_active, -- 默认启用
+  MAX(update_time)                       AS last_update_time
+FROM bi_amz_scene_keyword
+GROUP BY scene, LOWER(TRIM(keyword)), marketplace_id) k
+JOIN (SELECT * FROM (
+  SELECT
+    marketplace_id,
+    LOWER(TRIM(keyword))                   AS keyword_norm,
+    year,
+    week_num,
+    startDate,
+    endDate,
+    estSearchesNum                         AS vol,
+    rank,
+    clickShare,
+    conversionShare,
+    asin1, asin1_clickShare, asin1_conversionShare,
+    asin2, asin2_clickShare, asin2_conversionShare,
+    asin3, asin3_clickShare, asin3_conversionShare,
+    update_time,
+    ROW_NUMBER() OVER (
+      PARTITION BY marketplace_id, LOWER(TRIM(keyword)), year, week_num
+      ORDER BY update_time DESC
+    ) AS rn
+  FROM bi_amz_aba_kw_week_board
+) t
+WHERE t.rn = 1) w
+  ON k.keyword_norm   = w.keyword_norm
+ AND k.marketplace_id = w.marketplace_id
+WHERE k.is_active = 1
+GROUP BY k.scene, k.marketplace_id, w.year, w.week_num;
+
+ /* =========================
+    4) RESULT TABLES (for ETL outputs)
+    ========================= */
+
+-- 4.1 关键词×周（清洗/插补/平滑后）
+CREATE TABLE bi_amz_scene_kw_week_clean (
+  scene                VARCHAR(512) NOT NULL COMMENT "场景",
+  marketplace_id       VARCHAR(8)   NOT NULL COMMENT "站点",
+  keyword_norm         VARCHAR(512) NOT NULL COMMENT "标准化关键字",
+  year                 INT          NOT NULL COMMENT "年度",
+  week_num             INT          NOT NULL COMMENT "ISO周",
+  start_date           DATE         NOT NULL COMMENT "周起始日（周日）",
+  vol_s                DOUBLE                COMMENT "平滑后体量",
+  gap_flag             TINYINT               COMMENT "是否存在>2周缺口 1/0",
+  winsor_low           DOUBLE                COMMENT "P1边界",
+  winsor_high          DOUBLE                COMMENT "P99边界",
+  z                    DOUBLE                COMMENT "稳健z分数（基于MAD）",
+  last_update_time     DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT "更新时间"
+) ENGINE=OLAP
+UNIQUE KEY(scene, marketplace_id, keyword_norm, year, week_num)
+DISTRIBUTED BY HASH(scene, marketplace_id) BUCKETS 16
+PROPERTIES (
+  "replication_allocation" = "tag.location.default: 3",
+  "enable_unique_key_merge_on_write" = "true"
 );
 
-CREATE TABLE IF NOT EXISTS keyword_weekly_metrics(
-  keyword   VARCHAR(256) NOT NULL,
-  iso_week  CHAR(8) NOT NULL,
-  search_volume BIGINT NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(keyword, iso_week)
+-- 4.2 场景×周特征表（供 API/LLM 消费）
+CREATE TABLE bi_amz_scene_features (
+  scene                VARCHAR(512) NOT NULL COMMENT "场景",
+  marketplace_id       VARCHAR(8)   NOT NULL COMMENT "站点",
+  year                 INT          NOT NULL COMMENT "年度",
+  week_num             INT          NOT NULL COMMENT "ISO周",
+  start_date           DATE         NOT NULL COMMENT "周起始日（周日）",
+  VOL                  BIGINT                COMMENT "聚合体量",
+  wow                  DOUBLE                COMMENT "环比",
+  yoy                  DOUBLE                COMMENT "同比",
+  season               DOUBLE                COMMENT "季节因子(均值=1)",
+  wow_sa               DOUBLE                COMMENT "去季节环比",
+  slope8               DOUBLE                COMMENT "8周动量斜率（归一）",
+  breadth_wow_pos      DOUBLE                COMMENT "上涨广度（WoW）",
+  breadth_yoy_pos      DOUBLE                COMMENT "上涨广度（YoY）",
+  HHI_kw               DOUBLE                COMMENT "关键词集中度HHI",
+  volatility_8w        DOUBLE                COMMENT "8周波动率",
+  coverage             DOUBLE                COMMENT "覆盖率",
+  new_kw_share         DOUBLE                COMMENT "新词量占比",
+  strength_bucket      VARCHAR(2)            COMMENT "强弱档位 S1..S5",
+  forecast_p10         DOUBLE                COMMENT "未来4周相对增幅p10",
+  forecast_p50         DOUBLE                COMMENT "未来4周相对增幅p50",
+  forecast_p90         DOUBLE                COMMENT "未来4周相对增幅p90",
+  confidence           DOUBLE                COMMENT "置信度(0..1)",
+  update_time          DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT "更新时间"
+) ENGINE=OLAP
+UNIQUE KEY(scene, marketplace_id, year, week_num)
+DISTRIBUTED BY HASH(scene, marketplace_id) BUCKETS 16
+PROPERTIES (
+  "replication_allocation" = "tag.location.default: 3",
+  "enable_unique_key_merge_on_write" = "true"
 );
 
-CREATE TABLE IF NOT EXISTS child_pairs(
-  our_parent  VARCHAR(32) NOT NULL,
-  our_child   VARCHAR(32) NOT NULL,
-  comp_parent VARCHAR(32) NOT NULL,
-  comp_child  VARCHAR(32) NOT NULL,
-  active TINYINT DEFAULT 1,
-  PRIMARY KEY(our_child, comp_child)
+-- 4.3 场景×周驱动词明细（TopN 展开到行）
+CREATE TABLE bi_amz_scene_drivers (
+  scene                   VARCHAR(512) NOT NULL COMMENT "场景",
+  marketplace_id          VARCHAR(8)   NOT NULL COMMENT "站点",
+  year                    INT          NOT NULL COMMENT "年度",
+  week_num                INT          NOT NULL COMMENT "ISO周",
+  start_date              DATE         NOT NULL COMMENT "周起始日（周日）",
+  horizon                 VARCHAR(8)   NOT NULL COMMENT "WoW/YoY",
+  direction               VARCHAR(4)   NOT NULL COMMENT "pos/neg",
+  keyword                 VARCHAR(512) NOT NULL COMMENT "驱动关键词",
+  contrib                 DOUBLE                COMMENT "贡献度（相对场景增幅）",
+  vol_delta               BIGINT                COMMENT "量变（绝对）",
+  rank_delta              INT                   COMMENT "排名变化(负=改善)",
+  clickShare_delta        DOUBLE                COMMENT "点击份额变化",
+  conversionShare_delta   DOUBLE                COMMENT "转化份额变化",
+  is_new_kw               TINYINT               COMMENT "是否新词 1/0",
+  update_time             DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT "更新时间"
+) ENGINE=OLAP
+UNIQUE KEY(scene, marketplace_id, `year`, week_num, start_date, horizon, direction, keyword)
+DISTRIBUTED BY HASH(scene, marketplace_id) BUCKETS 16
+PROPERTIES (
+  "replication_allocation" = "tag.location.default: 3",
+  "enable_unique_key_merge_on_write" = "true"
 );
 
-CREATE TABLE IF NOT EXISTS frontend_snapshots(
-  child_asin VARCHAR(32) NOT NULL,
-  iso_week   CHAR(8) NOT NULL,
-  list_price DECIMAL(10,2), sale_price DECIMAL(10,2),
-  coupon_flag TINYINT, coupon_amount DECIMAL(10,2),
-  rank_main INT, rank_sub INT,
-  rating DECIMAL(3,2), review_count INT,
-  image_count INT, video_count INT,
-  badges_json JSON, product_url TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(child_asin, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS parent_funnel_weekly(
-  parent_id VARCHAR(32) NOT NULL,
-  iso_week  CHAR(8) NOT NULL,
-  impr_ads BIGINT, clicks BIGINT, sessions BIGINT,
-  orders BIGINT, revenue DECIMAL(12,2),
-  buybox_pct DECIMAL(5,4), bsr_main INT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(parent_id, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS child_funnel_weekly(
-  child_asin VARCHAR(32) NOT NULL,
-  iso_week   CHAR(8) NOT NULL,
-  impr_ads BIGINT, clicks BIGINT, orders BIGINT, revenue DECIMAL(12,2),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(child_asin, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS lead_sku_tags(
-  parent_id VARCHAR(32) NOT NULL,
-  child_asin VARCHAR(32) NOT NULL,
-  is_traffic_driver TINYINT NOT NULL,
-  PRIMARY KEY(parent_id, child_asin)
-);
-
-CREATE TABLE IF NOT EXISTS inventory_woc(
-  child_asin VARCHAR(32) NOT NULL,
-  iso_week   CHAR(8) NOT NULL,
-  woc_fba DECIMAL(6,2), woc_local DECIMAL(6,2), woc_overseas DECIMAL(6,2),
-  sla_local_days INT, transfer_leadtime_days INT,
-  inbound_fba_woc_7d DECIMAL(6,2), inbound_fba_woc_14d DECIMAL(6,2),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(child_asin, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS ads_weekly(
-  child_asin VARCHAR(32) NOT NULL,
-  iso_week   CHAR(8) NOT NULL,
-  channel ENUM('sp','sb','sd') NOT NULL,
-  spend DECIMAL(10,2), clicks BIGINT, impressions BIGINT,
-  cpc DECIMAL(6,3), acos DECIMAL(6,3), roas DECIMAL(6,3),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(child_asin, iso_week, channel)
-);
-
-CREATE TABLE IF NOT EXISTS profit_estimates(
-  child_asin VARCHAR(32) NOT NULL,
-  iso_week   CHAR(8) NOT NULL,
-  est_gross_profit_unit DECIMAL(8,2),
-  gross_profit_total DECIMAL(12,2),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(child_asin, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS parent_features(
-  parent_id VARCHAR(32) NOT NULL,
-  iso_week  CHAR(8) NOT NULL,
-  c_impr DECIMAL(8,4), c_ctr DECIMAL(8,4), c_cvr DECIMAL(8,4),
-  contrib_json JSON,
-  lead_stock_ok DECIMAL(5,2),
-  lead_stock_risk_json JSON, evidence_json JSON,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(parent_id, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS child_features(
-  child_asin VARCHAR(32) NOT NULL,
-  iso_week   CHAR(8) NOT NULL,
-  effective_woc DECIMAL(6,2), risk_level ENUM('NONE','LOW','HIGH'),
-  gmroi_gross DECIMAL(8,3), gmroi_net_ads DECIMAL(8,3), ppad DECIMAL(8,3),
-  evidence_json JSON,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(child_asin, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS scene_json(
-  scene_id VARCHAR(64) NOT NULL,
-  iso_week CHAR(8) NOT NULL,
-  payload JSON,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(scene_id, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS competition_json(
-  parent_id VARCHAR(32) NOT NULL,
-  iso_week CHAR(8) NOT NULL,
-  payload JSON,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(parent_id, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS parent_json(
-  parent_id VARCHAR(32) NOT NULL,
-  iso_week CHAR(8) NOT NULL,
-  payload JSON,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(parent_id, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS child_json(
-  parent_id VARCHAR(32) NOT NULL,
-  iso_week CHAR(8) NOT NULL,
-  payload JSON,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(parent_id, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS budget_plan(
-  parent_id VARCHAR(32) NOT NULL,
-  iso_week CHAR(8) NOT NULL,
-  payload JSON,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(parent_id, iso_week)
-);
-
-CREATE TABLE IF NOT EXISTS weekly_report(
-  parent_id VARCHAR(32) NOT NULL,
-  iso_week CHAR(8) NOT NULL,
-  markdown MEDIUMTEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY(parent_id, iso_week)
-);
+/* =========================
+   5) NOTES
+   - 若 StarRocks 版本不支持本语法的 MVs，可切换为定时 INSERT INTO 结果表替代。
+   - 覆盖率 coverage 依赖视图聚合；如需更精细分区，可在 MV 上加 PARTITION BY（视版本支持情况）。
+   - BUCKETS 与副本数可按集群规模调整。
+   ========================= */
