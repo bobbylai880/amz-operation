@@ -199,17 +199,28 @@ class AgentResult:
 ---
 
 ### 6.7 `GatekeeperAgent`
-**目的**：对超阈值变更（预算±20%、上新/下架/大券）进行人工审批。  
-**输入**：`budget_plan.json` 或策略变更清单。  
-**输出**：审批状态与审计落库（`change_log`）。  
+**目的**：对超阈值变更（预算±20%、上新/下架/大券）进行人工审批。
+**输入**：`budget_plan.json` 或策略变更清单。
+**输出**：审批状态与审计落库（`change_log`）。
 **失败路径**：超时未批 → `pending_review`，不执行到生产。
+
+---
+
+### 6.8 Doris/MySQL UPSERT 规范（全局）
+- 数据库写入统一调用 `scpc.db.io.replace_into`，严禁直接拼接 SQL。
+- 函数内部必须根据连接信息自动区分 **MySQL** 与 **Doris**：
+  - MySQL 走 `INSERT ... ON DUPLICATE KEY UPDATE`；
+  - Doris 1.x 走 `REPLACE INTO`；
+  - Doris ≥2.x 走 `UPSERT INTO`，版本检测失败时回退 `REPLACE INTO`。
+- 所有新增/修改测试需覆盖 MySQL 与 Doris 两类分支，可使用 SQLAlchemy Mock Engine 模拟。
+- 如需扩展表结构，务必保持 DataFrame 列名与目标表列名对齐，防止 UPSERT 失败。
 
 ---
 
 ## 7. LLM 约束与提示文件
 
-- 统一入口：`scpc/llm/deepseek_client.py`  
-- 参数：`temperature=0.1`、`top_p=0.9`、`response_format="json_object"`、`timeout_sec` 可配  
+- 统一入口：`scpc/llm/deepseek_client.py`
+- 参数：`temperature=0.1`、`top_p=0.9`、`response_format="json_object"`、`timeout_sec` 可配
 - **禁止**：让 LLM 计算比率、做回归/分解；不得生成新数字超出 Facts  
 - **提示文件**位于 `prompts/`：`scene.md`/`competition.md`/`parent.md`/`child.md`  
 - **更新流程**：提交 **更新理由与兼容性评估**（不破坏 Schema），经评审后合入
