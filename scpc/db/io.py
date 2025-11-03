@@ -51,16 +51,23 @@ def _chunks(seq: Sequence[Mapping[str, object]], size: int) -> Iterable[list[Map
 
 
 def replace_into(engine: Engine, table: str, df: pd.DataFrame, *, chunk_size: int = 500) -> int:
-    """Execute ``REPLACE INTO`` using the provided DataFrame."""
+    """Execute an UPSERT using ``INSERT ... ON DUPLICATE KEY UPDATE`` semantics."""
 
     if df.empty:
         return 0
+
     data = df.to_dict(orient="records")
     records = _normalise_records(data)
     columns = list(df.columns)
     col_clause = ", ".join(columns)
     values_clause = ", ".join(f":{col}" for col in columns)
-    stmt = text(f"REPLACE INTO {table} ({col_clause}) VALUES ({values_clause})")
+    update_clause = ", ".join(f"{col} = VALUES({col})" for col in columns)
+    sql = (
+        f"INSERT INTO {table} ({col_clause}) VALUES ({values_clause})"
+        + (f" ON DUPLICATE KEY UPDATE {update_clause}" if update_clause else "")
+    )
+    stmt = text(sql)
+
     affected = 0
     with engine.begin() as conn:
         for chunk in _chunks(records, chunk_size):
