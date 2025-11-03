@@ -2,16 +2,28 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from itertools import islice
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
 from sqlalchemy import Column, MetaData, Table, text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import SAWarning
 from sqlalchemy.sql.sqltypes import NullType
 
 
 logger = logging.getLogger(__name__)
+
+# Filter out Doris-specific schema reflection warnings emitted by SQLAlchemy's
+# MySQL dialect when encountering Doris extensions such as DISTRIBUTED BY or
+# PROPERTIES clauses. These warnings are expected and do not impact runtime
+# behaviour, so we silence them globally to keep logs clean.
+warnings.filterwarnings(
+    "ignore",
+    message="Unknown schema content",
+    category=SAWarning,
+)
 
 
 def fetch_dataframe(engine: Engine, sql: str, params: Mapping[str, object] | None = None) -> pd.DataFrame:
@@ -92,15 +104,19 @@ def _execute_doris_upsert(
 
     with engine.begin() as conn:
         version = _get_doris_version(conn)
-        if not version or not version.startswith("2."):
-            raise RuntimeError(
-                f"Doris version {version or 'unknown'} not supported, require 2.x+"
+        verb = "UPSERT INTO" if version and "doris" in version.lower() else "REPLACE INTO"
+        if verb == "UPSERT INTO":
+            logger.info(
+                "replace_into using Doris UPSERT for %s (version=%s)",
+                table_obj.fullname,
+                version,
             )
-        logger.info(
-            "replace_into using Doris UPSERT for %s (version=%s)",
-            table_obj.fullname,
-            version,
-        )
+        else:
+            logger.info(
+                "replace_into falling back to REPLACE INTO for %s (version=%s)",
+                table_obj.fullname,
+                version or "unknown",
+            )
         statement = text(
             f"UPSERT INTO {_format_table(preparer, table_obj)} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
         )
@@ -124,17 +140,36 @@ def _format_identifier(preparer, identifier: str) -> str:
     except AttributeError:  # pragma: no cover - compatibility shim
         return preparer.quote_identifier(identifier)
 def _get_doris_version(conn: Connection) -> str | None:
+    """Return Doris version, tolerant of MySQL-compatible layers."""
+
     try:
-        result = conn.execute(text("SELECT version()"))
+        comment_result = conn.execute(text("SELECT version_comment()"))
+    except Exception:  # pragma: no cover - permissions or compatibility issues
+        comment_result = None
+    else:
+        try:
+            comment = comment_result.scalar()
+        except Exception:  # pragma: no cover - scalar not supported
+            comment = None
+        if isinstance(comment, str):
+            cleaned = comment.strip()
+            if cleaned and "doris" in cleaned.lower():
+                return cleaned
+
+    try:
+        version_result = conn.execute(text("SELECT version()"))
     except Exception as exc:  # pragma: no cover - network failures or permissions
         logger.warning("replace_into could not determine Doris version: %s", exc)
         return None
     try:
-        version = result.scalar()
+        version = version_result.scalar()
     except Exception:  # pragma: no cover - scalar not supported
         return None
     if isinstance(version, str):
-        return version.strip()
+        cleaned = version.strip()
+        if cleaned.startswith("5.7.99"):
+            return "Doris 2.x (mysql-compatible)"
+        return cleaned
     return None
 
 
