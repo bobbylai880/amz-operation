@@ -36,4 +36,30 @@ def build_report(
     return "\n".join(lines)
 
 
-__all__ = ["build_report"]
+def build_scene_markdown(summary: Mapping[str, object]) -> str:
+    """Render a concise Markdown section for a single scene summary."""
+
+    lines: list[str] = ["# 场景级总结", ""]
+    status = summary.get("status", "未知")
+    lines.append(f"状态：{status}\n")
+    drivers = summary.get("drivers", []) or []
+    if drivers:
+        lines.append("## 关键驱动词\n")
+        for driver in drivers:
+            keyword = driver.get("keyword") or driver.get("kw") or "?"
+            delta = driver.get("delta")
+            if delta is None:
+                delta = driver.get("contrib")
+            lines.append(f"- {keyword}: {delta}")
+        lines.append("")
+    if summary.get("insufficient_data"):
+        lines.append("> 数据覆盖不足，结论需谨慎对待。\n")
+    notes = summary.get("notes")
+    if notes:
+        lines.append("## 备注\n")
+        lines.append(str(notes))
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+__all__ = ["build_report", "build_scene_markdown"]

@@ -1,14 +1,43 @@
-"""Helpers to construct LLM prompts for the scene summary agent."""
+"""Helpers to construct and execute scene level LLM summaries."""
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
-from typing import Mapping
+from pathlib import Path
+from typing import Any, Mapping
 
 import pandas as pd
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+from scpc.llm.deepseek_client import DeepSeekError, create_client_from_env
+from scpc.settings import get_deepseek_settings
+
 
 SYSTEM_PROMPT = """你是一位资深亚马逊跨境电商总监，负责场景级大盘诊断。\n核心约束：\n1. 仅基于输入 JSON 判断，禁止自行加总或回归。\n2. 引用任意时间必须包含 year/week_num 与 start_date（周日）。\n3. 当 confidence < 0.6 或 coverage 偏低时，需要明确提示“谨慎判断/样本不足”。\n4. 输出需包含 3-5 条“下周动作清单”（含负责人/预算或资源/执行时间）。\n"""
+
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "scene.schema.json"
+
+FEATURES_SQL = text(
+    """
+    SELECT scene, marketplace_id, year, week_num, start_date, VOL, wow, yoy, wow_sa, slope8,
+           breadth_wow_pos, breadth_yoy_pos, HHI_kw, volatility_8w, coverage,
+           new_kw_share, strength_bucket, forecast_p10, forecast_p50, forecast_p90, confidence
+    FROM bi_amz_scene_features
+    WHERE scene = :scene AND marketplace_id = :mk
+    ORDER BY year, week_num
+    """
+)
+
+DRIVERS_SQL = text(
+    """
+    SELECT scene, marketplace_id, year, week_num, start_date, horizon, direction,
+           keyword, contrib, vol_delta, rank_delta, clickShare_delta,
+           conversionShare_delta, is_new_kw
+    FROM bi_amz_scene_drivers
+    WHERE scene = :scene AND marketplace_id = :mk AND (year * 100 + week_num) = :yearweek
+    """
+)
 
 
 @dataclass(slots=True)
@@ -19,11 +48,25 @@ class SceneSummaryPayload:
     raw: Mapping[str, object]
 
 
+class SceneSummarizationError(RuntimeError):
+    """Raised when the LLM summary could not be produced."""
+
+    def __init__(self, message: str, *, raw: str | None = None, details: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.raw = raw
+        self.details = details or []
+
+
 def _json_ready(value: object) -> object:
-    if isinstance(value, (pd.Timestamp, datetime)):
+    if isinstance(value, pd.Timestamp):
         return value.date().isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
+    if hasattr(value, "to_pydatetime"):
+        return value.to_pydatetime().date().isoformat()
+    if hasattr(value, "isoformat") and callable(value.isoformat):
+        try:
+            return value.isoformat()
+        except Exception:  # pragma: no cover - defensive fallback
+            pass
     if hasattr(value, "item"):
         try:
             return value.item()
@@ -45,32 +88,35 @@ def _prepare_features(features: pd.DataFrame, limit: int = 8) -> list[dict[str, 
     return payload
 
 
-def _prepare_drivers(drivers: pd.DataFrame) -> list[dict[str, object]]:
+def _prepare_drivers(drivers: pd.DataFrame, topn: int) -> list[dict[str, object]]:
     if drivers.empty:
         return []
     drivers = drivers.copy()
     drivers["start_date"] = pd.to_datetime(drivers["start_date"]).dt.date
-    latest = drivers["start_date"].max()
-    subset = drivers[drivers["start_date"] == latest].sort_values(["horizon", "direction", "contrib"], ascending=[True, True, False])
-    result: list[dict[str, object]] = []
-    for _, row in subset.iterrows():
-        result.append({key: _json_ready(row[key]) for key in row.index})
-    return result
+    result: list[pd.DataFrame] = []
+    for (horizon, direction), subset in drivers.groupby(["horizon", "direction"], sort=False):
+        ascending = direction == "neg"
+        ordered = subset.sort_values("contrib", ascending=ascending).head(topn)
+        result.append(ordered)
+    if not result:
+        return []
+    limited = pd.concat(result, ignore_index=True)
+    return [{key: _json_ready(row[key]) for key in limited.columns} for _, row in limited.iterrows()]
 
 
-def build_scene_summary_payload(
+def _build_scene_summary_payload(
     scene: str,
     marketplace_id: str,
     features: pd.DataFrame,
     drivers: pd.DataFrame,
+    *,
+    topn: int,
 ) -> SceneSummaryPayload:
-    """Return chat messages ready for ``DeepSeekClient.generate``."""
-
     facts = {
         "scene": scene,
         "marketplace_id": marketplace_id,
         "scene_features": _prepare_features(features),
-        "scene_drivers": _prepare_drivers(drivers),
+        "scene_drivers": _prepare_drivers(drivers, topn),
     }
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -79,4 +125,95 @@ def build_scene_summary_payload(
     return SceneSummaryPayload(messages=messages, raw=facts)
 
 
-__all__ = ["SceneSummaryPayload", "build_scene_summary_payload", "SYSTEM_PROMPT"]
+def _validate_schema(schema: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
+    required = schema.get("required", [])
+    for key in required:
+        if key not in payload:
+            raise ValueError(f"Missing required key: {key}")
+    properties: Mapping[str, Any] = schema.get("properties", {})
+    for key, value in payload.items():
+        expected = properties.get(key)
+        if not expected:
+            continue
+        expected_type = expected.get("type")
+        if expected_type is None:
+            continue
+        if isinstance(expected_type, list):
+            types = tuple(_python_types(name) for name in expected_type)
+            types = tuple(tp for group in types for tp in group)
+        else:
+            types = _python_types(expected_type)
+        if types and not isinstance(value, types):
+            raise ValueError(f"Field {key} expected {types}, got {type(value)!r}")
+
+
+def _python_types(name: str) -> tuple[type, ...]:
+    mapping: dict[str, tuple[type, ...]] = {
+        "object": (dict,),
+        "array": (list,),
+        "string": (str,),
+        "number": (int, float),
+        "boolean": (bool,),
+        "null": (type(None),),
+    }
+    return mapping.get(name, (object,))
+
+
+def _latest_yearweek(features: pd.DataFrame) -> int:
+    values = features["year"].astype(int) * 100 + features["week_num"].astype(int)
+    return int(values.max())
+
+
+def _load_schema() -> Mapping[str, Any]:
+    return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> Mapping[str, Any]:
+    """Fetch latest scene features/drivers and produce a schema-compliant summary."""
+
+    if topn <= 0:
+        topn = 10
+    with engine.connect() as conn:
+        features = pd.read_sql_query(FEATURES_SQL, conn, params={"scene": scene, "mk": mk})
+        if features.empty:
+            raise SceneSummarizationError("No scene_features rows available for summarisation")
+        features["start_date"] = pd.to_datetime(features["start_date"]).dt.date
+        yearweek = _latest_yearweek(features)
+        drivers = pd.read_sql_query(
+            DRIVERS_SQL,
+            conn,
+            params={"scene": scene, "mk": mk, "yearweek": yearweek},
+        )
+    payload = _build_scene_summary_payload(scene, mk, features, drivers, topn=topn)
+    schema = _load_schema()
+    settings = get_deepseek_settings()
+    client = create_client_from_env(settings=settings)
+    try:
+        response = client.generate(
+            prompt=SYSTEM_PROMPT,
+            facts=json.dumps(payload.raw, ensure_ascii=False),
+            model=settings.model,
+            temperature=0.1,
+            response_format="json_object",
+        )
+    except DeepSeekError as exc:
+        raise SceneSummarizationError("DeepSeek request failed", details=[str(exc)]) from exc
+    finally:
+        client.close()
+    raw_content = response.content
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError as exc:
+        raise SceneSummarizationError("LLM returned invalid JSON", raw=raw_content, details=[str(exc)]) from exc
+    try:
+        _validate_schema(schema, parsed)
+    except ValueError as exc:
+        raise SceneSummarizationError("Scene summary failed schema validation", raw=raw_content, details=[str(exc)]) from exc
+    return parsed
+
+
+__all__ = [
+    "SceneSummarizationError",
+    "SceneSummaryPayload",
+    "summarize_scene",
+]
