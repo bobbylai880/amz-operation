@@ -1,12 +1,16 @@
-"""Read/write helpers for Doris using SQLAlchemy."""
+"""Read/write helpers for Doris/MySQL using SQLAlchemy."""
 from __future__ import annotations
 
+import logging
 from itertools import islice
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+
+logger = logging.getLogger(__name__)
 
 
 def fetch_dataframe(engine: Engine, sql: str, params: Mapping[str, object] | None = None) -> pd.DataFrame:
@@ -51,21 +55,49 @@ def _chunks(seq: Sequence[Mapping[str, object]], size: int) -> Iterable[list[Map
 
 
 def replace_into(engine: Engine, table: str, df: pd.DataFrame, *, chunk_size: int = 500) -> int:
-    """Execute ``REPLACE INTO`` using the provided DataFrame."""
+    """Execute an UPSERT using Doris preferred semantics with MySQL compatibility."""
 
     if df.empty:
         return 0
-    data = df.to_dict(orient="records")
-    records = _normalise_records(data)
+
+    records = _normalise_records(df.to_dict(orient="records"))
     columns = list(df.columns)
-    col_clause = ", ".join(columns)
-    values_clause = ", ".join(f":{col}" for col in columns)
-    stmt = text(f"REPLACE INTO {table} ({col_clause}) VALUES ({values_clause})")
+    col_list = ", ".join(f"`{col}`" for col in columns)
+    placeholders = ", ".join(f"%({col})s" for col in columns)
+
+    update_columns = [col for col in columns if col not in {"create_time"}]
+    if not update_columns:
+        update_columns = columns
+    update_clause = ", ".join(f"`{col}`=VALUES(`{col}`)" for col in update_columns)
+
+    insert_sql = (
+        "INSERT INTO {table} ({cols}) VALUES ({values}) ON DUPLICATE KEY UPDATE {updates}".format(
+            table=table,
+            cols=col_list,
+            values=placeholders,
+            updates=update_clause,
+        )
+    )
+
     affected = 0
     with engine.begin() as conn:
         for chunk in _chunks(records, chunk_size):
-            conn.execute(stmt, chunk)
-            affected += len(chunk)
+            try:
+                conn.exec_driver_sql(insert_sql, chunk)
+                affected += len(chunk)
+            except Exception as exc:
+                message = str(exc)
+                if "Encountered: ON" in message or "Expected: COMMA" in message:
+                    replace_sql = f"REPLACE INTO {table} ({col_list}) VALUES ({placeholders})"
+                    logger.info(
+                        "replace_into falling back to Doris REPLACE INTO for %s due to %s",
+                        table,
+                        message,
+                    )
+                    conn.exec_driver_sql(replace_sql, chunk)
+                    affected += len(chunk)
+                else:
+                    raise
     return affected
 
 
