@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SceneDrivers",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": [
+      "scene",
+      "marketplace_id",
+      "year",
+      "week_num",
+      "start_date",
+      "horizon",
+      "direction",
+      "keyword",
+      "contrib",
+      "vol_delta",
+      "is_new_kw"
+    ],
+    "properties": {
+      "scene": {"type": "string"},
+      "marketplace_id": {"type": "string"},
+      "year": {"type": "integer"},
+      "week_num": {"type": "integer"},
+      "start_date": {"type": "string", "format": "date"},
+      "horizon": {"type": "string", "enum": ["WoW", "YoY"]},
+      "direction": {"type": "string", "enum": ["pos", "neg"]},
+      "keyword": {"type": "string"},
+      "contrib": {"type": "number"},
+      "vol_delta": {"type": "integer"},
+      "rank_delta": {"type": ["number", "null"]},
+      "clickShare_delta": {"type": ["number", "null"]},
+      "conversionShare_delta": {"type": ["number", "null"]},
+      "is_new_kw": {"type": "integer"}
+    },
+    "additionalProperties": false
+  }
+}
