@@ -5,8 +5,9 @@ from itertools import islice
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import MetaData, Table, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 
 def fetch_dataframe(engine: Engine, sql: str, params: Mapping[str, object] | None = None) -> pd.DataFrame:
@@ -51,20 +52,36 @@ def _chunks(seq: Sequence[Mapping[str, object]], size: int) -> Iterable[list[Map
 
 
 def replace_into(engine: Engine, table: str, df: pd.DataFrame, *, chunk_size: int = 500) -> int:
-    """Execute ``REPLACE INTO`` using the provided DataFrame."""
+    """Execute an UPSERT using MySQL ``ON DUPLICATE KEY UPDATE`` semantics."""
 
     if df.empty:
         return 0
-    data = df.to_dict(orient="records")
-    records = _normalise_records(data)
-    columns = list(df.columns)
-    col_clause = ", ".join(columns)
-    values_clause = ", ".join(f":{col}" for col in columns)
-    stmt = text(f"REPLACE INTO {table} ({col_clause}) VALUES ({values_clause})")
+
+    records = _normalise_records(df.to_dict(orient="records"))
+
+    metadata = MetaData()
+    table_obj = Table(table, metadata, autoload_with=engine)
+
+    insert_stmt = mysql_insert(table_obj)
+    update_targets = {
+        column.name: getattr(insert_stmt.inserted, column.name)
+        for column in table_obj.columns
+        if not column.primary_key
+    }
+    if not update_targets:
+        primary_columns = list(table_obj.primary_key.columns)
+        if not primary_columns:
+            raise ValueError(f"Table '{table}' has no primary key defined; cannot build UPSERT")
+        update_targets = {
+            column.name: getattr(insert_stmt.inserted, column.name) for column in primary_columns
+        }
+
+    upsert_stmt = insert_stmt.on_duplicate_key_update(**update_targets)
+
     affected = 0
     with engine.begin() as conn:
         for chunk in _chunks(records, chunk_size):
-            conn.execute(stmt, chunk)
+            conn.execute(upsert_stmt, chunk)
             affected += len(chunk)
     return affected
 
