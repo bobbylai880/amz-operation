@@ -250,7 +250,7 @@ llm:
   response_format: json_object
 gate:
   budget_change_pct: 0.20
-outputs_dir: s3://bucket/scpc_outputs/${ISO_WEEK}/
+outputs_dir: storage/scpc_outputs/${ISO_WEEK}/
 ```
 
 ---
