@@ -17,4 +17,4 @@ llm_parent:
 guardrails:
   budget_change_pct_gate: 0.20
 paths:
-  outputs_dir: s3://bucket/scpc_outputs/${ISO_WEEK}/
+  outputs_dir: storage/scpc_outputs/${ISO_WEEK}/
