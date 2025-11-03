@@ -102,7 +102,8 @@ def test_replace_into_falls_back_to_replace_for_non_doris() -> None:
 
     df = pd.DataFrame([{"scene": "A", "metric": 1}])
 
-    inserted = replace_into(engine, "bi_table", df)
+    with pytest.raises(RuntimeError, match=r"require 2.x\+"):
+        replace_into(engine, "bi_table", df)
 
     assert inserted == 1
     assert any(stmt.startswith("SELECT version()") for stmt in statements)

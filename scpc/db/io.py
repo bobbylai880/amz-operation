@@ -118,7 +118,7 @@ def _execute_doris_upsert(
                 version or "unknown",
             )
         statement = text(
-            f"{verb} {_format_table(preparer, table_obj)} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
+            f"UPSERT INTO {_format_table(preparer, table_obj)} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
         )
         affected = 0
         for chunk in _chunks(records, chunk_size):
