@@ -36,12 +36,12 @@ def _build_mock_engine(url: str, collector: list[str], *, side_effect=None):
     return create_engine(url, strategy="mock", executor=executor)
 
 
-def test_replace_into_uses_doris_upsert_with_version_comment() -> None:
+def test_replace_into_uses_force_replace_mode_without_version_probe() -> None:
     statements: list[str] = []
 
     def side_effect(statement: str):
-        if "SELECT version_comment()" in statement:
-            return _MockResult("Doris version 2.0.4 (build abc)")
+        if "version" in statement.lower():
+            raise AssertionError("replace_into should not query Doris version")
         return None
 
     engine = _build_mock_engine(
@@ -55,56 +55,27 @@ def test_replace_into_uses_doris_upsert_with_version_comment() -> None:
     inserted = replace_into(engine, "bi_table", df, chunk_size=2)
 
     assert inserted == 2
-    assert any(stmt.startswith("SELECT version_comment()") for stmt in statements)
-    assert any("UPSERT INTO" in stmt for stmt in statements)
-
-
-def test_replace_into_detects_mysql_compatible_version() -> None:
-    statements: list[str] = []
-
-    def side_effect(statement: str):
-        if "SELECT version_comment()" in statement:
-            return _MockResult(None)
-        if "SELECT version()" in statement:
-            return _MockResult("5.7.99")
-        return None
-
-    engine = _build_mock_engine(
-        "mysql+pymysql://user:pass@doris-host/test",
-        statements,
-        side_effect=side_effect,
-    )
-
-    df = pd.DataFrame([{"scene": "A", "metric": 1}])
-
-    inserted = replace_into(engine, "bi_table", df)
-
-    assert inserted == 1
-    assert any(stmt.startswith("SELECT version()") for stmt in statements)
-    assert any("UPSERT INTO" in stmt for stmt in statements)
-
-
-def test_replace_into_falls_back_to_replace_for_non_doris() -> None:
-    statements: list[str] = []
-
-    def side_effect(statement: str):
-        if "SELECT version_comment()" in statement:
-            return _MockResult(None)
-        if "SELECT version()" in statement:
-            return _MockResult("1.2.3")
-        return None
-
-    engine = _build_mock_engine(
-        "mysql+pymysql://user:pass@doris-host/test",
-        statements,
-        side_effect=side_effect,
-    )
-
-    df = pd.DataFrame([{"scene": "A", "metric": 1}])
-
-    with pytest.raises(RuntimeError, match=r"require 2.x\+"):
-        replace_into(engine, "bi_table", df)
-
-    assert inserted == 1
-    assert any(stmt.startswith("SELECT version()") for stmt in statements)
     assert any("REPLACE INTO" in stmt for stmt in statements)
+    assert not any("SELECT version" in stmt for stmt in statements)
+
+
+def test_replace_into_batches_rows_using_replace_into() -> None:
+    statements: list[str] = []
+
+    engine = _build_mock_engine(
+        "mysql+pymysql://user:pass@doris-host/test",
+        statements,
+    )
+
+    df = pd.DataFrame(
+        [
+            {"scene": "A", "metric": 1},
+            {"scene": "B", "metric": 2},
+            {"scene": "C", "metric": 3},
+        ]
+    )
+
+    inserted = replace_into(engine, "bi_table", df, chunk_size=2)
+
+    assert inserted == 3
+    assert sum(1 for stmt in statements if "REPLACE INTO" in stmt) == 2

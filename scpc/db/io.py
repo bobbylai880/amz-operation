@@ -68,7 +68,7 @@ def _chunks(seq: Sequence[Mapping[str, object]], size: int) -> Iterable[list[Map
 
 
 def replace_into(engine: Engine, table: str, df: pd.DataFrame, *, chunk_size: int = 500) -> int:
-    """Execute a Doris ``UPSERT INTO`` using the provided ``DataFrame``."""
+    """Execute a Doris ``REPLACE INTO`` using the provided ``DataFrame``."""
 
     if df.empty:
         return 0
@@ -103,20 +103,14 @@ def _execute_doris_upsert(
     value_tokens = [f":{name}" for name in df.columns]
 
     with engine.begin() as conn:
-        version = _get_doris_version(conn)
-        verb = "UPSERT INTO" if version and "doris" in version.lower() else "REPLACE INTO"
-        if verb == "UPSERT INTO":
-            logger.info(
-                "replace_into using Doris UPSERT for %s (version=%s)",
-                table_obj.fullname,
-                version,
-            )
-        else:
-            logger.info(
-                "replace_into falling back to REPLACE INTO for %s (version=%s)",
-                table_obj.fullname,
-                version or "unknown",
-            )
+        verb = "REPLACE INTO"
+        # Doris clusters that disable merge-on-write (the default for many 2.x
+        # deployments) reject UPSERT statements, so we enforce REPLACE to keep
+        # behaviour consistent across 1.x and 2.x installations.
+        logger.info(
+            "replace_into using Doris REPLACE INTO for %s (force mode)",
+            table_obj.fullname,
+        )
         statement = text(
             f"UPSERT INTO {_format_table(preparer, table_obj)} ({', '.join(column_tokens)}) VALUES ({', '.join(value_tokens)})"
         )
