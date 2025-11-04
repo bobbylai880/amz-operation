@@ -1,4 +1,5 @@
 import json
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -24,46 +25,92 @@ class DummyConnection:
 
 @pytest.fixture
 def sample_features():
-    return pd.DataFrame(
-        {
-            "scene": ["X"],
-            "marketplace_id": ["US"],
-            "year": [2025],
-            "week_num": [12],
-            "start_date": [pd.Timestamp("2025-03-23")],
-        }
-    )
+    base = date(2025, 3, 2)
+    current_weeks = [base + timedelta(weeks=offset) for offset in range(4)]
+    last_year_past = [dt - timedelta(days=364) for dt in current_weeks]
+    pivot = last_year_past[-1]
+    last_year_future = [pivot + timedelta(weeks=offset) for offset in range(1, 5)]
+    all_dates = sorted(set(current_weeks + last_year_past + last_year_future))
+
+    def _volume_for(dt: date) -> float:
+        if dt in current_weeks:
+            return 200 + current_weeks.index(dt) * 10
+        if dt in last_year_past:
+            return 120 + last_year_past.index(dt) * 5
+        return 150 + last_year_future.index(dt) * 4
+
+    rows = []
+    for dt in all_dates:
+        iso = dt.isocalendar()
+        rows.append(
+            {
+                "scene": "X",
+                "marketplace_id": "US",
+                "year": iso.year,
+                "week_num": iso.week,
+                "start_date": pd.Timestamp(dt),
+                "VOL": _volume_for(dt),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 @pytest.fixture
 def sample_drivers():
     return pd.DataFrame(
         {
-            "scene": ["X"],
-            "marketplace_id": ["US"],
-            "year": [2025],
-            "week_num": [12],
-            "start_date": [pd.Timestamp("2025-03-23")],
-            "horizon": ["w1"],
-            "direction": ["pos"],
-            "keyword": ["demo"],
-            "contrib": [0.3],
-            "vol_delta": [1.0],
-            "rank_delta": [0.0],
-            "clickShare_delta": [0.0],
-            "conversionShare_delta": [0.0],
-            "is_new_kw": [True],
+            "scene": ["X", "X", "X"],
+            "marketplace_id": ["US", "US", "US"],
+            "year": [2025, 2025, 2025],
+            "week_num": [12, 12, 12],
+            "start_date": [pd.Timestamp("2025-03-23")] * 3,
+            "horizon": ["w1", "w1", "w1"],
+            "direction": ["pos", "neg", "pos"],
+            "keyword": ["alpha", "beta", "gamma"],
+            "contrib": [0.25, -0.4, 0.18],
         }
     )
 
 
-def test_summarize_scene_retries_on_schema_error(monkeypatch, sample_features, sample_drivers):
+@pytest.fixture
+def sample_keyword_volumes():
+    base = date(2025, 3, 2)
+    current_weeks = [base + timedelta(weeks=offset) for offset in range(4)]
+    last_year_past = [dt - timedelta(days=364) for dt in current_weeks]
+    pivot = last_year_past[-1]
+    last_year_future = [pivot + timedelta(weeks=offset) for offset in range(1, 5)]
+    all_dates = sorted(set(current_weeks + last_year_past + last_year_future))
+    keywords = {"alpha": 300, "beta": 260, "gamma": 220}
+    rows = []
+    for keyword, base_vol in keywords.items():
+        for idx, dt in enumerate(all_dates):
+            iso = dt.isocalendar()
+            rows.append(
+                {
+                    "keyword_norm": keyword,
+                    "year": iso.year,
+                    "week_num": iso.week,
+                    "startDate": pd.Timestamp(dt),
+                    "vol": base_vol + idx * 8,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_summarize_scene_retries_on_schema_error(
+    monkeypatch, sample_features, sample_drivers, sample_keyword_volumes
+):
     calls = []
 
     def fake_read_sql(query, _conn, params):
-        if "scene_features" in str(query):
+        text_query = str(query)
+        if "bi_amz_scene_features" in text_query:
             return sample_features
-        return sample_drivers
+        if "bi_amz_scene_drivers" in text_query:
+            return sample_drivers
+        if "bi_amz_vw_kw_week" in text_query:
+            return sample_keyword_volumes
+        raise AssertionError(f"Unexpected query: {query}")
 
     class StubClient:
         def __init__(self):
@@ -73,12 +120,65 @@ def test_summarize_scene_retries_on_schema_error(monkeypatch, sample_features, s
             self.calls += 1
             calls.append(_kwargs["facts"])
             if self.calls == 1:
-                payload = {"drivers": [], "insufficient_data": False}
+                payload = {
+                    "scene_forecast": {"weeks": []},
+                    "top_keywords_forecast": [],
+                    "confidence": 0.7,
+                    "insufficient_data": False,
+                    "analysis_summary": "场景数据不足，无法输出有效趋势。",
+                }
             else:
                 payload = {
-                    "status": "stable",
-                    "drivers": [{"keyword": "demo", "delta": 0.3}],
+                    "scene_forecast": {
+                        "weeks": [
+                            {
+                                "year": 2025,
+                                "week_num": 13,
+                                "start_date": "2025-03-30",
+                                "direction": "up",
+                                "pct_change": 1.2,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 14,
+                                "start_date": "2025-04-06",
+                                "direction": "up",
+                                "pct_change": 1.5,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 15,
+                                "start_date": "2025-04-13",
+                                "direction": "flat",
+                                "pct_change": 0.4,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 16,
+                                "start_date": "2025-04-20",
+                                "direction": "down",
+                                "pct_change": -0.6,
+                            },
+                        ]
+                    },
+                    "top_keywords_forecast": [
+                        {
+                            "keyword": "beta",
+                            "weeks": [
+                                {
+                                    "year": 2025,
+                                    "week_num": 13,
+                                    "start_date": "2025-03-30",
+                                    "direction": "up",
+                                    "pct_change": 1.1,
+                                }
+                            ],
+                        }
+                    ],
+                    "confidence": 0.72,
                     "insufficient_data": False,
+                    "analysis_summary": "场景未来两周延续上行，关键词beta放量拉动，随后受库存调整回落。",
+                    "notes": None,
                 }
             return DeepSeekResponse(content=json.dumps(payload), usage={})
 
@@ -93,16 +193,27 @@ def test_summarize_scene_retries_on_schema_error(monkeypatch, sample_features, s
 
     result = summarize_scene(engine=DummyEngine(), scene="X", mk="US", topn=5)
 
-    assert result["status"] == "stable"
+    assert "scene_forecast" in result
+    assert len(result["scene_forecast"]["weeks"]) == 4
+    assert "analysis_summary" in result
     assert calls, "expected DeepSeek to be invoked"
-    assert "response_schema" in json.loads(calls[0])
+    parsed = json.loads(calls[0])
+    assert "scene_recent_4w" in parsed
+    assert "response_schema" in parsed
 
 
-def test_summarize_scene_raises_after_two_schema_errors(monkeypatch, sample_features, sample_drivers):
+def test_summarize_scene_raises_after_two_schema_errors(
+    monkeypatch, sample_features, sample_drivers, sample_keyword_volumes
+):
     def fake_read_sql(query, _conn, params):
-        if "scene_features" in str(query):
+        text_query = str(query)
+        if "bi_amz_scene_features" in text_query:
             return sample_features
-        return sample_drivers
+        if "bi_amz_scene_drivers" in text_query:
+            return sample_drivers
+        if "bi_amz_vw_kw_week" in text_query:
+            return sample_keyword_volumes
+        raise AssertionError(f"Unexpected query: {query}")
 
     class StubClient:
         def __init__(self):
@@ -110,7 +221,11 @@ def test_summarize_scene_raises_after_two_schema_errors(monkeypatch, sample_feat
 
         def generate(self, **_kwargs):
             self.calls += 1
-            payload = {"drivers": [], "insufficient_data": False}
+            payload = {
+                "scene_forecast": {"weeks": []},
+                "top_keywords_forecast": [],
+                "confidence": 0.5,
+            }
             return DeepSeekResponse(content=json.dumps(payload), usage={})
 
         def close(self):
