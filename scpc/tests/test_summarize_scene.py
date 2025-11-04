@@ -200,6 +200,14 @@ def test_summarize_scene_retries_on_schema_error(
     parsed = json.loads(calls[0])
     assert "scene_recent_4w" in parsed
     assert "response_schema" in parsed
+    forecast_guidance = parsed.get("forecast_guidance", {})
+    scene_guidance = forecast_guidance.get("scene", {}) if isinstance(forecast_guidance, dict) else {}
+    weeks = scene_guidance.get("forecast_weeks", []) if isinstance(scene_guidance, dict) else []
+    if weeks:
+        first_week = weeks[0]
+        assert isinstance(first_week.get("pct_change"), str)
+        assert first_week["pct_change"].endswith("%")
+        assert "pct_change_value" in first_week
 
 
 def test_summarize_scene_raises_after_two_schema_errors(

@@ -456,6 +456,18 @@ def _clean_float(value: float | None, *, digits: int | None = None) -> float | N
     return float(value)
 
 
+def _format_pct(value: float | None, *, digits: int = 2) -> str | None:
+    if value is None or not math.isfinite(value):
+        return None
+    scaled = float(value) * 100.0
+    if digits is not None:
+        scaled = round(scaled, digits)
+        if abs(scaled) < 0.5 * (10 ** -digits):
+            scaled = 0.0
+        return f"{scaled:.{digits}f}%"
+    return f"{scaled}%"
+
+
 def _apply_forecast_model(
     base_vol: float | None,
     future_calendar: Sequence[Mapping[str, object]],
@@ -498,27 +510,37 @@ def _apply_forecast_model(
         if base != 0:
             pct_change = (next_vol - base) / base
         direction = _classify_direction(pct_change, flat_band)
+        pct_change_value = _clean_float(pct_change, digits=4)
         forecasts.append(
             {
                 "week_index": idx + 1,
                 "target_week": week_meta,
                 "growth_rate": _clean_float(weight, digits=4),
                 "projected_vol": _clean_float(next_vol, digits=2),
-                "pct_change": _clean_float(pct_change, digits=4),
+                "pct_change": _format_pct(pct_change_value),
+                "pct_change_value": pct_change_value,
                 "direction": direction,
             }
         )
         last = next_vol
     guidance["forecast_weeks"] = forecasts
     if forecasts:
-        last_pct = forecasts[-1]["pct_change"]
-        guidance["fourth_week_pct_change"] = last_pct
+        last_pct_value = forecasts[-1]["pct_change_value"]
+        guidance["fourth_week_pct_change_value"] = last_pct_value
+        guidance["fourth_week_pct_change"] = _format_pct(last_pct_value)
         if bounds:
             p10 = _clean_float(_to_volume(bounds.get("p10")))
             p90 = _clean_float(_to_volume(bounds.get("p90")))
-            if last_pct is not None and p10 is not None and p90 is not None and p10 <= p90:
-                clamped = max(p10, min(p90, last_pct))
-                guidance["fourth_week_pct_change_clamped"] = _clean_float(clamped, digits=4)
+            if (
+                last_pct_value is not None
+                and p10 is not None
+                and p90 is not None
+                and p10 <= p90
+            ):
+                clamped = max(p10, min(p90, last_pct_value))
+                clamped_clean = _clean_float(clamped, digits=4)
+                guidance["fourth_week_pct_change_clamped_value"] = clamped_clean
+                guidance["fourth_week_pct_change_clamped"] = _format_pct(clamped_clean)
     return guidance
 
 
