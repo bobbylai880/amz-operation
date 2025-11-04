@@ -98,7 +98,7 @@ def sample_keyword_volumes():
 
 
 def test_summarize_scene_retries_on_schema_error(
-    monkeypatch, sample_features, sample_drivers, sample_keyword_volumes
+    monkeypatch, tmp_path, sample_features, sample_drivers, sample_keyword_volumes
 ):
     calls = []
 
@@ -228,6 +228,7 @@ def test_summarize_scene_retries_on_schema_error(
     monkeypatch.setattr("scpc.llm.summarize_scene.pd.read_sql_query", fake_read_sql)
     monkeypatch.setattr("scpc.llm.summarize_scene.create_client_from_env", lambda settings: StubClient())
     monkeypatch.setattr("scpc.llm.summarize_scene.get_deepseek_settings", lambda: settings)
+    monkeypatch.setenv("SCPC_PROMPT_LOG_DIR", str(tmp_path))
 
     result = summarize_scene(engine=DummyEngine(), scene="X", mk="US", topn=5)
 
@@ -257,9 +258,19 @@ def test_summarize_scene_retries_on_schema_error(
             assert isinstance(first_kw_week.get("pct_change"), str)
             assert first_kw_week["pct_change"].endswith("%")
 
+    artifacts = sorted(tmp_path.glob("*.json"))
+    assert len(artifacts) == 2
+    latest = artifacts[-1]
+    stored = json.loads(latest.read_text(encoding="utf-8"))
+    assert stored["system_prompt"] == summarize_scene.__globals__["SYSTEM_PROMPT"]
+    assert stored["scene"] == "X"
+    assert stored["marketplace_id"] == "US"
+    assert isinstance(stored["facts"], dict)
+    assert stored["facts"]["scene"] == "X"
+
 
 def test_summarize_scene_raises_after_two_schema_errors(
-    monkeypatch, sample_features, sample_drivers, sample_keyword_volumes
+    monkeypatch, tmp_path, sample_features, sample_drivers, sample_keyword_volumes
 ):
     def fake_read_sql(query, _conn, params):
         text_query = str(query)
@@ -292,6 +303,7 @@ def test_summarize_scene_raises_after_two_schema_errors(
     monkeypatch.setattr("scpc.llm.summarize_scene.pd.read_sql_query", fake_read_sql)
     monkeypatch.setattr("scpc.llm.summarize_scene.create_client_from_env", lambda settings: StubClient())
     monkeypatch.setattr("scpc.llm.summarize_scene.get_deepseek_settings", lambda: settings)
+    monkeypatch.setenv("SCPC_PROMPT_LOG_DIR", str(tmp_path))
 
     with pytest.raises(SceneSummarizationError) as excinfo:
         summarize_scene(engine=DummyEngine(), scene="X", mk="US", topn=5)
@@ -299,3 +311,5 @@ def test_summarize_scene_raises_after_two_schema_errors(
     error = excinfo.value
     assert any("Missing required key" in detail for detail in error.details)
     assert error.raw is not None
+    artifacts = sorted(tmp_path.glob("*.json"))
+    assert len(artifacts) == 2

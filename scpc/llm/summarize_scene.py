@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from statistics import StatisticsError, median
 from typing import Any, Mapping, Sequence
@@ -17,6 +18,9 @@ from sqlalchemy.engine import Engine
 
 from scpc.llm.deepseek_client import DeepSeekError, create_client_from_env
 from scpc.settings import get_deepseek_settings
+
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """你是一位资深亚马逊跨境电商总监，负责场景级预测。\n严格遵守：\n1. 仅基于输入 JSON，禁止引入额外数据或假设。\n2. 引用任意时间必须同时包含 year、week_num、start_date（周日）。\n3. 输出必须使用中文，并严格匹配 response_schema。\n4. 在 analysis_summary 中，用不超过400字的中文总结场景与主要关键词未来趋势及驱动原因，并引用至少两个具体指标数值作为依据（例如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）。\n5. 预测规则：\n   • 本年最近4周 WoW 中位数 = 短期趋势项 r。\n   • 去年“过去4周 + 未来4周”体量计算季节先验：s[h] = (LY_future_4w[h].vol / LY_pivot.vol) - 1。\n   • 组合增速：w[h] = α * r + (1-α) * s[h]，默认 α=0.6，可由 blend_weights 覆盖。\n   • 逐周滚动：pred[0] = 当前最后一周 vol；pred[h] = pred[h-1] * (1 + w[h])。\n   • 方向阈值：pct_change ≥ +1% → up；≤ −1% → down；其余 flat，pct_change 对“最后观测周”计算并保留1位小数。\n   • 关键词预测与场景同法、独立计算。\n6. 数据不足或缺行 → insufficient_data=true，并在 notes 说明原因。\n"""
@@ -109,6 +113,52 @@ def _norm_kw(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9]+", " ", s).strip()
     return re.sub(r"\s+", " ", s)
+
+
+def _sanitize_identifier(value: str) -> str:
+    if not value:
+        return "unknown"
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return sanitized or "unknown"
+
+
+def _persist_prompt_artifact(
+    scene: str,
+    marketplace_id: str,
+    attempt: int,
+    *,
+    system_prompt: str,
+    facts: str,
+) -> None:
+    base_dir = os.getenv("SCPC_PROMPT_LOG_DIR")
+    directory = Path(base_dir) if base_dir else Path("storage") / "prompt_logs"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Failed to create prompt log directory %s: %s", directory, exc)
+        return
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    filename = (
+        f"{_sanitize_identifier(scene)}__{_sanitize_identifier(marketplace_id)}"
+        f"__{timestamp}__attempt{attempt}.json"
+    )
+    path = directory / filename
+    try:
+        try:
+            facts_obj = json.loads(facts)
+        except json.JSONDecodeError:
+            facts_obj = facts
+        payload = {
+            "scene": scene,
+            "marketplace_id": marketplace_id,
+            "attempt": attempt,
+            "timestamp": timestamp,
+            "system_prompt": system_prompt,
+            "facts": facts_obj,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write prompt artifact %s: %s", path, exc)
 
 
 def _to_volume(value: object) -> float | None:
@@ -940,6 +990,13 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
                 schema,
                 validation_errors=repair_hints if repair_hints else None,
                 previous_response=previous_response,
+            )
+            _persist_prompt_artifact(
+                scene,
+                mk,
+                attempt,
+                system_prompt=SYSTEM_PROMPT,
+                facts=content,
             )
             try:
                 response = client.generate(
