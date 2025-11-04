@@ -24,8 +24,9 @@ SYSTEM_PROMPT = """你是一位资深亚马逊跨境电商总监，负责场景�
 OUTPUT_INSTRUCTIONS = [
     "仅返回一个 JSON 对象，UTF-8 编码，无额外解释或 Markdown。",
     "必须包含字段 scene_forecast、top_keywords_forecast、confidence、insufficient_data、analysis_summary；可选 notes（为空请输出 null）。",
-    "scene_forecast.weeks 与 top_keywords_forecast[*].weeks 均需列出未来4周的 direction 与 pct_change。",
-    "top_keywords_forecast 数量不超过 3。",
+    "scene_forecast.weeks 与 top_keywords_forecast[*].weeks 均需列出未来4周的 direction、projected_vol、pct_change（百分号字符串，保留两位小数）",
+    "scene_forecast.weeks[*].pct_change 同时需要提供 pct_change_value（小数形式，便于系统后续计算）。",
+    "top_keywords_forecast 数量不超过 3，且需覆盖输入 facts.top_keywords 中的全部关键词（若不足3个则全部输出）。",
     "analysis_summary 需以中文总结场景与主要关键词的趋势及主因，长度不超过400字。",
 ]
 
@@ -33,10 +34,10 @@ OUTPUT_INSTRUCTIONS.append(
     "若提供 bounds.p10/p90，则第4周累计相对变化需落在该区间，越界时取边界值。"
 )
 OUTPUT_INSTRUCTIONS.append(
-    "若 facts.forecast_guidance.scene.forecast_weeks 非空，则 scene_forecast 的 direction 与 pct_change 必须与之保持一致（允许按四舍五入保留一位小数）。"
+    "若 facts.forecast_guidance.scene.forecast_weeks 非空，则 scene_forecast 的 direction、projected_vol、pct_change_value 必须与之保持一致，pct_change 需为 pct_change_value×100 后按四舍五入保留两位小数并追加%符号。"
 )
 OUTPUT_INSTRUCTIONS.append(
-    "若 facts.forecast_guidance.keywords[*].forecast_weeks 非空，则对应 keyword 的 direction 与 pct_change 需与之保持一致（允许按四舍五入保留一位小数）。"
+    "若 facts.forecast_guidance.keywords[*].forecast_weeks 非空，则对应 keyword 的 direction、projected_vol、pct_change_value 需与之保持一致，pct_change 同样需输出百分号字符串。"
 )
 OUTPUT_INSTRUCTIONS.append(
     "analysis_summary 必须引用 facts.analysis_evidence 中至少两个具体指标值（如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）作为结论依据。"
@@ -258,8 +259,7 @@ def _select_top_keywords(drivers: pd.DataFrame, limit: int) -> list[dict[str, ob
     subset = drivers.copy()
     subset["keyword"] = subset["keyword"].astype(str)
     subset["contrib"] = pd.to_numeric(subset["contrib"], errors="coerce")
-    subset["abs_contrib"] = subset["contrib"].abs()
-    subset = subset[subset["abs_contrib"] >= 0.01]
+    subset["abs_contrib"] = subset["contrib"].abs().fillna(0)
     subset = subset.sort_values("abs_contrib", ascending=False)
     seen: set[str] = set()
     results: list[dict[str, object]] = []
