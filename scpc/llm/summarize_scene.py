@@ -26,6 +26,9 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+logger = logging.getLogger(__name__)
+
+
 SYSTEM_PROMPT = """你是一位资深亚马逊跨境电商总监，负责场景级预测。\n严格遵守：\n1. 仅基于输入 JSON，禁止引入额外数据或假设。\n2. 引用任意时间必须同时包含 year、week_num、start_date（周日）。\n3. 输出必须使用中文，并严格匹配 response_schema。\n4. 在 analysis_summary 中，用不超过400字的中文总结场景与主要关键词未来趋势及驱动原因，并引用至少两个具体指标数值作为依据（例如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）。\n5. 预测规则：\n   • 本年最近4周 WoW 中位数 = 短期趋势项 r。\n   • 去年“过去4周 + 未来4周”体量计算季节先验：s[h] = (LY_future_4w[h].vol / LY_pivot.vol) - 1。\n   • 组合增速：w[h] = α * r + (1-α) * s[h]，默认 α=0.6，可由 blend_weights 覆盖。\n   • 逐周滚动：pred[0] = 当前最后一周 vol；pred[h] = pred[h-1] * (1 + w[h])。\n   • 方向阈值：pct_change ≥ +1% → up；≤ −1% → down；其余 flat，pct_change 对“最后观测周”计算并保留1位小数。\n   • 关键词预测与场景同法、独立计算。\n6. 数据不足或缺行 → insufficient_data=true，并在 notes 说明原因。\n"""
 
 OUTPUT_INSTRUCTIONS = [
