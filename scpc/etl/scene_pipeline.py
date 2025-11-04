@@ -76,6 +76,12 @@ def _compute_min_yrwk(weeks_back: int) -> int:
     return iso[0] * 100 + iso[1]
 
 
+def _current_yearweek(today: date | None = None) -> int:
+    reference = today or date.today()
+    iso = reference.isocalendar()
+    return iso[0] * 100 + iso[1]
+
+
 def _collect_week_index(facts: pd.DataFrame, coverage: pd.DataFrame) -> list[date]:
     weeks: set[date] = set()
     if not facts.empty:
@@ -515,6 +521,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--llm-only cannot be combined with --write")
     if namespace.llm_only:
         namespace.with_llm = True
+        if not namespace.emit_json and not namespace.emit_md:
+            namespace.emit_json = True
     return namespace
 
 
@@ -644,13 +652,29 @@ def main(argv: Sequence[str] | None = None) -> None:
             if yearweek is None and args.llm_only:
                 yearweek = _fetch_latest_yearweek(engine, args.scene, args.mk)
             if yearweek is None:
-                LOGGER.warning(
-                    "scene_pipeline_outputs_skipped scene=%s mk=%s reason=no_yearweek",
-                    args.scene,
-                    args.mk,
-                    extra={"scene": args.scene, "mk": args.mk, "reason": "no_yearweek"},
-                )
-            else:
+                if summary_payload is not None or summary_error is not None:
+                    fallback_yearweek = _current_yearweek()
+                    LOGGER.warning(
+                        "scene_pipeline_outputs_fallback scene=%s mk=%s fallback=%s reason=no_yearweek",
+                        args.scene,
+                        args.mk,
+                        fallback_yearweek,
+                        extra={
+                            "scene": args.scene,
+                            "mk": args.mk,
+                            "fallback": fallback_yearweek,
+                            "reason": "no_yearweek",
+                        },
+                    )
+                    yearweek = fallback_yearweek
+                else:
+                    LOGGER.warning(
+                        "scene_pipeline_outputs_skipped scene=%s mk=%s reason=no_yearweek",
+                        args.scene,
+                        args.mk,
+                        extra={"scene": args.scene, "mk": args.mk, "reason": "no_yearweek"},
+                    )
+            if yearweek is not None:
                 outdir = _ensure_output_directory(Path(args.outputs_dir), args.scene, args.mk, yearweek)
                 if args.emit_json:
                     if summary_payload is not None:
