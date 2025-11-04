@@ -8,6 +8,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from statistics import StatisticsError, median
 from typing import Any, Mapping, Sequence
@@ -18,6 +19,11 @@ from sqlalchemy.engine import Engine
 
 from scpc.llm.deepseek_client import DeepSeekError, create_client_from_env
 from scpc.settings import get_deepseek_settings
+
+import yaml
+
+
+logger = logging.getLogger(__name__)
 
 
 logger = logging.getLogger(__name__)
@@ -47,7 +53,9 @@ OUTPUT_INSTRUCTIONS.append(
     "analysis_summary 必须引用 facts.analysis_evidence 中至少两个具体指标值（如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）作为结论依据。"
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "scene.schema.json"
+CONFIG_PATH = REPO_ROOT / "configs" / "scene_forecast_config.yaml"
 
 FEATURES_SQL = text(
     """
@@ -88,9 +96,75 @@ KEYWORD_VOLUMES_SQL_TEMPLATE = """
     FROM bi_amz_vw_kw_week
     WHERE marketplace_id = :mk
       AND keyword_norm IN ({keywords})
-      AND startDate BETWEEN :start_min AND :start_max
+    AND startDate BETWEEN :start_min AND :start_max
     ORDER BY keyword_norm, year, week_num
 """
+
+
+@lru_cache(maxsize=1)
+def _scene_forecast_config() -> dict[str, Any]:
+    try:
+        raw = CONFIG_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:  # pragma: no cover - configuration error
+        raise RuntimeError(
+            f"Scene forecast configuration file not found: {CONFIG_PATH}"
+        ) from exc
+    try:
+        data = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as exc:  # pragma: no cover - configuration error
+        raise RuntimeError(
+            f"Failed to parse scene forecast configuration: {CONFIG_PATH}"
+        ) from exc
+    if not isinstance(data, Mapping):
+        raise RuntimeError(
+            "scene_forecast_config.yaml must define a mapping at the root level"
+        )
+    section = data.get("scene_forecast")
+    if not isinstance(section, Mapping):
+        raise RuntimeError(
+            "scene_forecast_config.yaml must contain a 'scene_forecast' mapping"
+        )
+    return dict(section)
+
+
+def _config_section(name: str) -> dict[str, Any]:
+    section = _scene_forecast_config().get(name, {})
+    return dict(section) if isinstance(section, Mapping) else {}
+
+
+def _resolve_prompt_log_dir() -> Path:
+    env_override = os.getenv("SCPC_PROMPT_LOG_DIR")
+    if env_override:
+        return Path(env_override)
+    config_path = _scene_forecast_config().get("prompt_log_dir")
+    if isinstance(config_path, str) and config_path:
+        candidate = Path(config_path)
+        if not candidate.is_absolute():
+            return REPO_ROOT / candidate
+        return candidate
+    return REPO_ROOT / "storage" / "prompt_logs"
+
+
+
+def _as_int(value: object, default: int, *, minimum: int | None = None) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None and result < minimum:
+        return minimum
+    return result
+
+
+def _as_float(value: object, default: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(result):
+        return default
+    return result
+
 
 @dataclass(slots=True)
 class SceneSummaryPayload:
@@ -130,8 +204,7 @@ def _persist_prompt_artifact(
     system_prompt: str,
     facts: str,
 ) -> None:
-    base_dir = os.getenv("SCPC_PROMPT_LOG_DIR")
-    directory = Path(base_dir) if base_dir else Path("storage") / "prompt_logs"
+    directory = _resolve_prompt_log_dir()
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -264,22 +337,25 @@ class SceneWindows:
     last_observed: dict[str, object] | None
 
 
-def _derive_scene_windows(features: pd.DataFrame) -> SceneWindows:
+def _derive_scene_windows(features: pd.DataFrame, *, horizon: int) -> SceneWindows:
     ordered = features.sort_values("start_date")
-    recent_rows = ordered.tail(4)
+    horizon = max(1, int(horizon))
+    recent_rows = ordered.tail(horizon)
     recent_dates = [row.start_date for row in recent_rows.itertuples(index=False)]
     recent = [_row_to_scene_record(row) for _, row in recent_rows.iterrows()]
     last_year_past_dates = [dt - timedelta(days=364) for dt in recent_dates]
     last_year_future_dates: list[date] = []
     if last_year_past_dates:
         pivot = last_year_past_dates[-1]
-        last_year_future_dates = [pivot + timedelta(days=7 * offset) for offset in range(1, 5)]
+        last_year_future_dates = [
+            pivot + timedelta(days=7 * offset) for offset in range(1, horizon + 1)
+        ]
     last_year_past = _dates_to_scene_records(ordered, last_year_past_dates)
     last_year_future = _dates_to_scene_records(ordered, last_year_future_dates)
     future_calendar: list[dict[str, object]] = []
     if recent_dates:
         anchor = recent_dates[-1]
-        for offset in range(1, 5):
+        for offset in range(1, horizon + 1):
             target = anchor + timedelta(days=7 * offset)
             iso = target.isocalendar()
             future_calendar.append(
@@ -527,11 +603,15 @@ def _apply_forecast_model(
     seasonal_prior: Sequence[float | None],
     flat_band: float,
     bounds: Mapping[str, float] | None = None,
+    vol_digits: int = 2,
+    pct_digits: int = 2,
+    wow_digits: int = 4,
+    clamp_on_fourth_week: bool = True,
 ) -> Mapping[str, Any]:
     guidance: dict[str, Any] = {
-        "base_vol": _clean_float(base_vol, digits=2),
-        "recent_wow_median": _clean_float(recent_median, digits=4),
-        "seasonal_prior": [_clean_float(value, digits=4) for value in seasonal_prior],
+        "base_vol": _clean_float(base_vol, digits=vol_digits),
+        "recent_wow_median": _clean_float(recent_median, digits=wow_digits),
+        "seasonal_prior": [_clean_float(value, digits=wow_digits) for value in seasonal_prior],
         "forecast_weeks": [],
         "fourth_week_pct_change": None,
         "fourth_week_pct_change_clamped": None,
@@ -566,8 +646,8 @@ def _apply_forecast_model(
                 "week_index": idx + 1,
                 "target_week": week_meta,
                 "growth_rate": _clean_float(weight, digits=4),
-                "projected_vol": _clean_float(next_vol, digits=2),
-                "pct_change": _format_pct(pct_change_value),
+                "projected_vol": _clean_float(next_vol, digits=vol_digits),
+                "pct_change": _format_pct(pct_change_value, digits=pct_digits),
                 "pct_change_value": pct_change_value,
                 "direction": direction,
             }
@@ -577,8 +657,8 @@ def _apply_forecast_model(
     if forecasts:
         last_pct_value = forecasts[-1]["pct_change_value"]
         guidance["fourth_week_pct_change_value"] = last_pct_value
-        guidance["fourth_week_pct_change"] = _format_pct(last_pct_value)
-        if bounds:
+        guidance["fourth_week_pct_change"] = _format_pct(last_pct_value, digits=pct_digits)
+        if clamp_on_fourth_week and bounds:
             p10 = _clean_float(_to_volume(bounds.get("p10")))
             p90 = _clean_float(_to_volume(bounds.get("p90")))
             if (
@@ -590,7 +670,9 @@ def _apply_forecast_model(
                 clamped = max(p10, min(p90, last_pct_value))
                 clamped_clean = _clean_float(clamped, digits=4)
                 guidance["fourth_week_pct_change_clamped_value"] = clamped_clean
-                guidance["fourth_week_pct_change_clamped"] = _format_pct(clamped_clean)
+                guidance["fourth_week_pct_change_clamped"] = _format_pct(
+                    clamped_clean, digits=pct_digits
+                )
     return guidance
 
 
@@ -600,7 +682,11 @@ def _build_forecast_guidance(
     *,
     alpha: float,
     thresholds: Mapping[str, float],
-    bounds: Mapping[str, float],
+    bounds: Mapping[str, float] | None,
+    vol_digits: int,
+    pct_digits: int,
+    wow_digits: int,
+    clamp_on_fourth_week: bool,
 ) -> Mapping[str, Any]:
     flat_band = abs(float(thresholds.get("flat_band_pct", 0.01)))
     scene_recent_changes = _week_over_week_changes(windows.recent)
@@ -615,6 +701,10 @@ def _build_forecast_guidance(
         seasonal_prior=scene_seasonal,
         flat_band=flat_band,
         bounds=bounds,
+        vol_digits=vol_digits,
+        pct_digits=pct_digits,
+        wow_digits=wow_digits,
+        clamp_on_fourth_week=clamp_on_fourth_week,
     )
     keyword_guidance: list[Mapping[str, Any]] = []
     for entry in keyword_payload:
@@ -632,6 +722,10 @@ def _build_forecast_guidance(
             recent_median=kw_median,
             seasonal_prior=kw_seasonal,
             flat_band=flat_band,
+            vol_digits=vol_digits,
+            pct_digits=pct_digits,
+            wow_digits=wow_digits,
+            clamp_on_fourth_week=clamp_on_fourth_week,
         )
         kw_guidance = dict(kw_guidance)
         kw_guidance["keyword"] = entry.get("keyword")
@@ -647,6 +741,9 @@ def _build_analysis_evidence(
     scene_signals: Mapping[str, Any],
     keyword_payload: Sequence[Mapping[str, Any]],
     forecast_guidance: Mapping[str, Any],
+    *,
+    vol_digits: int,
+    wow_digits: int,
 ) -> Mapping[str, Any]:
     latest_signals = scene_signals.get("latest", {}) if scene_signals else {}
     scene_guidance = forecast_guidance.get("scene", {})
@@ -654,10 +751,10 @@ def _build_analysis_evidence(
     scene_evidence: dict[str, Any] = {}
     latest_vol = _latest_volume(windows.recent)
     if latest_vol is not None:
-        scene_evidence["latest_vol"] = _clean_float(latest_vol, digits=2)
+        scene_evidence["latest_vol"] = _clean_float(latest_vol, digits=vol_digits)
     for key in ("wow", "yoy", "wow_sa"):
         value = latest_signals.get(key)
-        clean = _clean_float(_to_volume(value), digits=4)
+        clean = _clean_float(_to_volume(value), digits=wow_digits)
         if clean is not None:
             scene_evidence[key] = clean
     median_value = scene_guidance.get("recent_wow_median")
@@ -679,7 +776,7 @@ def _build_analysis_evidence(
         kw_evidence: dict[str, Any] = {"keyword": keyword}
         kw_latest_vol = _latest_volume(entry.get("recent_4w", []))
         if kw_latest_vol is not None:
-            kw_evidence["latest_vol"] = _clean_float(kw_latest_vol, digits=2)
+            kw_evidence["latest_vol"] = _clean_float(kw_latest_vol, digits=vol_digits)
         latest_contrib = kw_guidance.get("latest_contrib")
         if latest_contrib is not None:
             kw_evidence["latest_contrib"] = latest_contrib
@@ -697,7 +794,9 @@ def _build_analysis_evidence(
 def _compute_data_quality(
     windows: SceneWindows,
     keyword_payload: Sequence[Mapping[str, object]],
-) -> dict[str, Any]:
+    *,
+    min_non_missing: int,
+) -> tuple[dict[str, Any], bool]:
     keyword_quality = [
         {
             "keyword": item.get("keyword"),
@@ -707,43 +806,24 @@ def _compute_data_quality(
         }
         for item in keyword_payload
     ]
-    return {
-        "scene": {
-            "recent_4w_missing": _count_missing(windows.recent),
-            "last_year_past_4w_missing": _count_missing(windows.last_year_past),
-            "last_year_future_4w_missing": _count_missing(windows.last_year_future),
-        },
-        "keywords": keyword_quality,
+    scene_quality = {
+        "recent_4w_missing": _count_missing(windows.recent),
+        "last_year_past_4w_missing": _count_missing(windows.last_year_past),
+        "last_year_future_4w_missing": _count_missing(windows.last_year_future),
     }
-
-
-def _load_forecast_parameters() -> tuple[dict[str, float], dict[str, float]]:
-    def _env_float(name: str, default: float) -> float:
-        raw = os.getenv(name)
-        if raw is None:
-            return default
-        try:
-            value = float(raw)
-        except ValueError:
-            return default
-        if pd.isna(value):
-            return default
-        return value
-
-    recent_weight = _env_float("SCENE_BLEND_WEIGHT_RECENT_WOW", 0.6)
-    seasonal_weight = _env_float("SCENE_BLEND_WEIGHT_SEASONAL", 0.4)
-    total = recent_weight + seasonal_weight
-    if total <= 0:
-        recent_weight, seasonal_weight = 0.6, 0.4
-        total = 1.0
-    blend_weights = {
-        "recent_wow": recent_weight / total,
-        "seasonal": seasonal_weight / total,
-    }
-    flat_band = abs(_env_float("SCENE_THRESHOLD_FLAT_BAND_PCT", 0.01))
-    thresholds = {"flat_band_pct": flat_band}
-    return blend_weights, thresholds
-
+    quality = {"scene": scene_quality, "keywords": keyword_quality}
+    min_required = max(0, int(min_non_missing))
+    if min_required == 0:
+        return quality, False
+    total_recent = len(windows.recent)
+    total_past = len(windows.last_year_past)
+    total_future = len(windows.last_year_future)
+    insufficient = (
+        total_recent - scene_quality["recent_4w_missing"] < min_required
+        or total_past - scene_quality["last_year_past_4w_missing"] < min_required
+        or total_future - scene_quality["last_year_future_4w_missing"] < min_required
+    )
+    return quality, insufficient
 
 def _dynamic_alpha(latest: pd.Series) -> float:
     vol8 = float(latest.get("volatility_8w") or 0.0)
@@ -763,7 +843,7 @@ def _build_scene_summary_payload(
     blend_weights: Mapping[str, float],
     thresholds: Mapping[str, float],
     data_quality: Mapping[str, Any],
-    bounds: Mapping[str, float],
+    bounds: Mapping[str, Any],
     scene_signals: Mapping[str, Any],
     forecast_guidance: Mapping[str, Any],
     analysis_evidence: Mapping[str, Any],
@@ -887,6 +967,32 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
 
     if topn <= 0:
         topn = 10
+
+    scene_config = _scene_forecast_config()
+    output_config = _config_section("output")
+    blend_config = _config_section("blend_weights")
+    threshold_config = _config_section("thresholds")
+    quality_config = _config_section("quality")
+    bounds_config = _config_section("bounds")
+
+    forecast_horizon = _as_int(output_config.get("forecast_horizon_weeks"), 4, minimum=1)
+    vol_digits = _as_int(output_config.get("vol_digits"), 2, minimum=0)
+    pct_digits = _as_int(output_config.get("pct_digits"), 2, minimum=0)
+    wow_digits = _as_int(output_config.get("wow_digits"), 4, minimum=0)
+
+    min_non_missing = _as_int(quality_config.get("min_non_missing"), 2, minimum=0)
+    quality_notes_template = quality_config.get("quality_notes_template")
+    if not isinstance(quality_notes_template, str) or not quality_notes_template.strip():
+        quality_notes_template = None
+
+    bounds_enabled = bool(bounds_config.get("enabled", True))
+    clamp_on_fourth_week = bool(bounds_config.get("clamp_on_4th_week", True))
+    raw_columns = bounds_config.get("use_columns", [])
+    if isinstance(raw_columns, (list, tuple)):
+        bounds_columns = [str(column) for column in raw_columns]
+    else:
+        bounds_columns = []
+
     with engine.connect() as conn:
         features = pd.read_sql_query(FEATURES_SQL, conn, params={"scene": scene, "mk": mk})
         if features.empty:
@@ -900,7 +1006,7 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
             conn,
             params={"scene": scene, "mk": mk, "yearweek": yearweek},
         )
-        windows = _derive_scene_windows(features)
+        windows = _derive_scene_windows(features, horizon=forecast_horizon)
         top_keywords = _select_top_keywords(drivers, topn)
         keyword_dates: list[date] = []
         keyword_dates.extend(windows.recent_dates)
@@ -914,18 +1020,59 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
             keyword_dates,
         )
     keyword_payload = _prepare_keyword_payload(top_keywords, keyword_frame, windows)
-    blend_weights, thresholds = _load_forecast_parameters()
-    alpha = _dynamic_alpha(latest_row)
-    blend_weights = {"recent_wow": round(alpha, 3), "seasonal": round(1 - alpha, 3)}
-    conf = float(latest_row.get("confidence") or 0.0)
-    cov = float(latest_row.get("coverage") or 0.0)
-    flat_band = 0.02 if (conf < 0.6 or cov < 0.6) else 0.01
-    thresholds = {"flat_band_pct": flat_band}
-    bounds = {
-        "p10": float(latest_row.get("forecast_p10") or 0.0),
-        "p50": float(latest_row.get("forecast_p50") or 0.0),
-        "p90": float(latest_row.get("forecast_p90") or 0.0),
+
+    dynamic_blend = bool(blend_config.get("dynamic", True))
+    base_recent_weight = _as_float(blend_config.get("recent_wow"), 0.6)
+    base_seasonal_weight = _as_float(blend_config.get("seasonal"), 0.4)
+    if dynamic_blend:
+        alpha = _dynamic_alpha(latest_row)
+        seasonal_share = 1.0 - alpha
+    else:
+        total_weight = base_recent_weight + base_seasonal_weight
+        if total_weight <= 0:
+            base_recent_weight, base_seasonal_weight = 0.6, 0.4
+            total_weight = 1.0
+        alpha = base_recent_weight / total_weight
+        seasonal_share = base_seasonal_weight / total_weight
+    blend_weights = {
+        "recent_wow": round(alpha, 3),
+        "seasonal": round(seasonal_share, 3),
     }
+
+    conf_value = _to_volume(latest_row.get("confidence"))
+    cov_value = _to_volume(latest_row.get("coverage"))
+    conf = float(conf_value) if conf_value is not None else 0.0
+    cov = float(cov_value) if cov_value is not None else 0.0
+
+    base_flat_band = abs(_as_float(threshold_config.get("flat_band_pct"), 0.01))
+    low_conf_flat_band = abs(_as_float(threshold_config.get("low_conf_flat_band"), base_flat_band))
+    applied_flat_band = low_conf_flat_band if (conf < 0.6 or cov < 0.6) else base_flat_band
+    thresholds = {
+        "flat_band_pct": applied_flat_band,
+        "base_flat_band_pct": base_flat_band,
+        "low_conf_flat_band_pct": low_conf_flat_band,
+    }
+
+    bounds_values: dict[str, float] = {}
+    if bounds_enabled:
+        for column in bounds_columns:
+            value = _to_volume(latest_row.get(column))
+            if value is None:
+                continue
+            key = str(column)
+            if key.startswith("forecast_"):
+                key = key[len("forecast_") :]
+            bounds_values[key] = float(value)
+    bounds_payload = {
+        "enabled": bounds_enabled,
+        "use_columns": bounds_columns,
+        "values": bounds_values,
+        "clamp_on_4th_week": clamp_on_fourth_week,
+    }
+    bounds_for_guidance: Mapping[str, float] | None = (
+        bounds_values if bounds_enabled and bounds_values else None
+    )
+
     scene_signals = {
         "latest": {
             "wow": latest_row.get("wow"),
@@ -941,25 +1088,33 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
             "strength_bucket": latest_row.get("strength_bucket"),
         }
     }
-    data_quality = _compute_data_quality(windows, keyword_payload)
-    insufficient = (
-        _count_missing(windows.recent) >= 2
-        or _count_missing(windows.last_year_past) >= 2
-        or _count_missing(windows.last_year_future) >= 2
+
+    data_quality, insufficient = _compute_data_quality(
+        windows,
+        keyword_payload,
+        min_non_missing=min_non_missing,
     )
-    quality_notes = "样本不足：某些4周窗口缺失≥2个数据点" if insufficient else None
+    data_quality["min_non_missing"] = min_non_missing
+    quality_notes = quality_notes_template if (insufficient and quality_notes_template) else None
+
     forecast_guidance = _build_forecast_guidance(
         windows,
         keyword_payload,
         alpha=alpha,
         thresholds=thresholds,
-        bounds=bounds,
+        bounds=bounds_for_guidance,
+        vol_digits=vol_digits,
+        pct_digits=pct_digits,
+        wow_digits=wow_digits,
+        clamp_on_fourth_week=clamp_on_fourth_week,
     )
     analysis_evidence = _build_analysis_evidence(
         windows,
         scene_signals,
         keyword_payload,
         forecast_guidance,
+        vol_digits=vol_digits,
+        wow_digits=wow_digits,
     )
     payload = _build_scene_summary_payload(
         scene,
@@ -969,7 +1124,7 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
         blend_weights=blend_weights,
         thresholds=thresholds,
         data_quality=data_quality,
-        bounds=bounds,
+        bounds=bounds_payload,
         scene_signals=scene_signals,
         forecast_guidance=forecast_guidance,
         analysis_evidence=analysis_evidence,
@@ -978,13 +1133,22 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
     schema = _load_schema()
     settings = get_deepseek_settings()
     client = create_client_from_env(settings=settings)
+    max_attempts = _as_int(scene_config.get("max_attempts"), 2, minimum=1)
+    temperature = _as_float(scene_config.get("temperature"), 0.1)
+    if temperature < 0:
+        temperature = 0.0
+    model_override = scene_config.get("model")
+    model_name = settings.model
+    if isinstance(model_override, str) and model_override.strip():
+        model_name = model_override.strip()
+
     errors: list[str] = []
     repair_hints: list[str] = []
     previous_response: str | None = None
     last_raw: str | None = None
     failure_message = ""
     try:
-        for attempt in range(1, 3):
+        for attempt in range(1, max_attempts + 1):
             content = _compose_user_content(
                 payload,
                 schema,
@@ -1002,8 +1166,8 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
                 response = client.generate(
                     prompt=SYSTEM_PROMPT,
                     facts=content,
-                    model=settings.model,
-                    temperature=0.1,
+                    model=model_name,
+                    temperature=temperature,
                     response_format="json_object",
                 )
             except DeepSeekError as exc:
@@ -1019,7 +1183,7 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
                 repair_hints.append(message)
                 previous_response = raw_content
                 failure_message = "LLM returned invalid JSON"
-                if attempt == 1:
+                if attempt < max_attempts:
                     continue
                 raise SceneSummarizationError(failure_message, raw=raw_content, details=errors) from exc
             try:
@@ -1030,7 +1194,7 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
                 repair_hints.append(message)
                 previous_response = raw_content
                 failure_message = "Scene summary failed schema validation"
-                if attempt == 1:
+                if attempt < max_attempts:
                     continue
                 raise SceneSummarizationError(failure_message, raw=raw_content, details=errors) from exc
             return parsed

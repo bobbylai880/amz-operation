@@ -1,0 +1,47 @@
+scene_forecast:
+  # -------------------------------
+  # 一、预测权重
+  # -------------------------------
+  blend_weights:
+    recent_wow: 0.6       # 最近4周WoW中位数的权重 (短期趋势)
+    seasonal: 0.4         # 去年同期季节项权重 (季节先验)
+    dynamic: true         # 是否启用动态α计算（根据波动性和覆盖率自动调整）
+
+  # -------------------------------
+  # 二、预测阈值
+  # -------------------------------
+  thresholds:
+    flat_band_pct: 0.01   # 方向阈值 ±1%，低于此视为“flat”
+    low_conf_flat_band: 0.02 # 当置信度或覆盖率<0.6时使用较宽阈值
+
+  # -------------------------------
+  # 三、数据质量判断
+  # -------------------------------
+  quality:
+    min_non_missing: 2    # 每个4周窗口至少需有2个有效数据点，否则 insufficient_data=true
+    quality_notes_template: "样本不足：某些4周窗口缺失≥2个数据点"
+
+  # -------------------------------
+  # 四、约束边界 (P10 / P50 / P90)
+  # -------------------------------
+  bounds:
+    enabled: true          # 是否启用边界约束
+    use_columns: [forecast_p10, forecast_p50, forecast_p90]
+    clamp_on_4th_week: true # 第4周累计变化若越界则取边界值
+
+  # -------------------------------
+  # 五、输出与格式
+  # -------------------------------
+  output:
+    forecast_horizon_weeks: 4  # 预测未来几周
+    pct_digits: 2              # 百分比保留小数位
+    vol_digits: 2              # 数量保留小数位
+    wow_digits: 4              # WoW中位数精度
+
+  # -------------------------------
+  # 六、日志与重试策略
+  # -------------------------------
+  prompt_log_dir: storage/prompt_logs  # LLM Prompt保存目录
+  max_attempts: 2                      # LLM调用最大重试次数
+  temperature: 0.1                     # DeepSeek模型温度
+  model: deepseek-chat                 # 模型名称（对应 get_deepseek_settings ）
