@@ -42,16 +42,21 @@ class DeepSeekClient:
         *,
         model: str,
         temperature: float,
-        response_format: str,
+        response_format: Mapping[str, Any] | str,
         top_p: float = 0.9,
     ) -> DeepSeekResponse:
         """Send a structured generation request to DeepSeek."""
+
+        if isinstance(response_format, str):
+            response_format_payload: Mapping[str, Any] = {"type": response_format}
+        else:
+            response_format_payload = response_format
 
         payload = {
             "model": model,
             "temperature": temperature,
             "top_p": top_p,
-            "response_format": response_format,
+            "response_format": response_format_payload,
             "messages": [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": facts},
