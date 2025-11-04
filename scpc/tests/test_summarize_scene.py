@@ -136,32 +136,54 @@ def test_summarize_scene_retries_on_schema_error(
                                 "week_num": 13,
                                 "start_date": "2025-03-30",
                                 "direction": "up",
-                                "pct_change": 1.2,
+                                "projected_vol": 260.0,
+                                "pct_change": "1.20%",
+                                "pct_change_value": 0.012,
                             },
                             {
                                 "year": 2025,
                                 "week_num": 14,
                                 "start_date": "2025-04-06",
                                 "direction": "up",
-                                "pct_change": 1.5,
+                                "projected_vol": 270.0,
+                                "pct_change": "1.50%",
+                                "pct_change_value": 0.015,
                             },
                             {
                                 "year": 2025,
                                 "week_num": 15,
                                 "start_date": "2025-04-13",
                                 "direction": "flat",
-                                "pct_change": 0.4,
+                                "projected_vol": 275.0,
+                                "pct_change": "0.40%",
+                                "pct_change_value": 0.004,
                             },
                             {
                                 "year": 2025,
                                 "week_num": 16,
                                 "start_date": "2025-04-20",
                                 "direction": "down",
-                                "pct_change": -0.6,
+                                "projected_vol": 268.0,
+                                "pct_change": "-0.60%",
+                                "pct_change_value": -0.006,
                             },
                         ]
                     },
                     "top_keywords_forecast": [
+                        {
+                            "keyword": "alpha",
+                            "weeks": [
+                                {
+                                    "year": 2025,
+                                    "week_num": 13,
+                                    "start_date": "2025-03-30",
+                                    "direction": "up",
+                                    "projected_vol": 340.0,
+                                    "pct_change": "1.10%",
+                                    "pct_change_value": 0.011,
+                                }
+                            ],
+                        },
                         {
                             "keyword": "beta",
                             "weeks": [
@@ -170,10 +192,26 @@ def test_summarize_scene_retries_on_schema_error(
                                     "week_num": 13,
                                     "start_date": "2025-03-30",
                                     "direction": "up",
-                                    "pct_change": 1.1,
+                                    "projected_vol": 312.0,
+                                    "pct_change": "0.80%",
+                                    "pct_change_value": 0.008,
                                 }
                             ],
-                        }
+                        },
+                        {
+                            "keyword": "gamma",
+                            "weeks": [
+                                {
+                                    "year": 2025,
+                                    "week_num": 13,
+                                    "start_date": "2025-03-30",
+                                    "direction": "flat",
+                                    "projected_vol": 284.0,
+                                    "pct_change": "0.20%",
+                                    "pct_change_value": 0.002,
+                                }
+                            ],
+                        },
                     ],
                     "confidence": 0.72,
                     "insufficient_data": False,
@@ -200,6 +238,24 @@ def test_summarize_scene_retries_on_schema_error(
     parsed = json.loads(calls[0])
     assert "scene_recent_4w" in parsed
     assert "response_schema" in parsed
+    forecast_guidance = parsed.get("forecast_guidance", {})
+    scene_guidance = forecast_guidance.get("scene", {}) if isinstance(forecast_guidance, dict) else {}
+    weeks = scene_guidance.get("forecast_weeks", []) if isinstance(scene_guidance, dict) else []
+    if weeks:
+        first_week = weeks[0]
+        assert isinstance(first_week.get("pct_change"), str)
+        assert first_week["pct_change"].endswith("%")
+        assert "pct_change_value" in first_week
+        assert "projected_vol" in first_week
+    keyword_guidance = forecast_guidance.get("keywords", []) if isinstance(forecast_guidance, dict) else []
+    assert len(keyword_guidance) == 3
+    for kw in keyword_guidance:
+        weeks = kw.get("forecast_weeks", [])
+        if weeks:
+            first_kw_week = weeks[0]
+            assert "projected_vol" in first_kw_week
+            assert isinstance(first_kw_week.get("pct_change"), str)
+            assert first_kw_week["pct_change"].endswith("%")
 
 
 def test_summarize_scene_raises_after_two_schema_errors(
