@@ -570,11 +570,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                     )
                 except SceneSummarizationError as exc:
                     summary_error = exc
-                    LOGGER.error(
-                        "scene_pipeline_llm_failed scene=%s mk=%s call=%s error=%s",
+                    message = "scene_pipeline_llm_failed scene=%s mk=%s call=%s error=%s" % (
                         args.scene,
                         args.mk,
+                        "summarize_scene",
                         exc,
+                    )
+                    LOGGER.error(
+                        message,
                         extra={
                             "scene": args.scene,
                             "mk": args.mk,
@@ -584,11 +587,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                     )
                 except Exception as exc:  # pragma: no cover - defensive guard
                     summary_error = SceneSummarizationError(str(exc))
-                    LOGGER.exception(
-                        "scene_pipeline_llm_failed scene=%s mk=%s call=%s unexpected",
+                    message = "scene_pipeline_llm_failed scene=%s mk=%s call=%s unexpected" % (
                         args.scene,
                         args.mk,
                         "summarize_scene",
+                    )
+                    LOGGER.exception(
+                        message,
                         extra={"scene": args.scene, "mk": args.mk, "call": "summarize_scene"},
                     )
 
