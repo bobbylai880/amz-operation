@@ -42,9 +42,7 @@ OUTPUT_INSTRUCTIONS.append(
     "analysis_summary 必须引用 facts.analysis_evidence 中至少两个具体指标值（如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）作为结论依据。"
 )
 
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "scene.schema.json"
-
-FEATURES_SQL = text(
+KEYWORD_VOLUMES_SQL = text(
     """
     SELECT scene, marketplace_id, year, week_num, start_date, VOL,
            wow, yoy, wow_sa, slope8, breadth_wow_pos, breadth_yoy_pos, HHI_kw,
@@ -54,17 +52,7 @@ FEATURES_SQL = text(
     WHERE scene = :scene AND marketplace_id = :mk
     ORDER BY year, week_num
     """
-)
-
-DRIVERS_SQL = text(
-    """
-    SELECT scene, marketplace_id, year, week_num, start_date, horizon, direction,
-           keyword, contrib, vol_delta, rank_delta, clickShare_delta,
-           conversionShare_delta, is_new_kw
-    FROM bi_amz_scene_drivers
-    WHERE scene = :scene AND marketplace_id = :mk AND (year * 100 + week_num) = :yearweek
-    """
-)
+).bindparams(bindparam("keywords", expanding=True))
 
 KEYWORD_VOLUMES_SQL = text(
     """
