@@ -65,6 +65,15 @@ KEYWORD_VOLUMES_SQL = text(
     """
 ).bindparams(bindparam("keywords", expanding=True))
 
+KEYWORD_VOLUMES_SQL_TEMPLATE = """
+    SELECT keyword_norm, year, week_num, startDate, vol
+    FROM bi_amz_vw_kw_week
+    WHERE marketplace_id = :mk
+      AND keyword_norm IN ({keywords})
+      AND startDate BETWEEN :start_min AND :start_max
+    ORDER BY keyword_norm, year, week_num
+"""
+
 
 @dataclass(slots=True)
 class SceneSummaryPayload:
@@ -240,15 +249,22 @@ def _fetch_keyword_volumes(
         return pd.DataFrame(columns=["keyword_norm", "year", "week_num", "startDate", "vol"])
     start_min = min(dates)
     start_max = max(dates)
+    placeholders = ", ".join(f":kw_{idx}" for idx in range(len(unique_keywords)))
+    statement = text(
+        KEYWORD_VOLUMES_SQL_TEMPLATE.format(
+            keywords=placeholders,
+        )
+    )
+    params = {
+        "mk": mk,
+        "start_min": start_min.isoformat(),
+        "start_max": start_max.isoformat(),
+    }
+    params.update({f"kw_{idx}": value for idx, value in enumerate(unique_keywords)})
     frame = pd.read_sql_query(
-        KEYWORD_VOLUMES_SQL,
+        statement,
         conn,
-        params={
-            "mk": mk,
-            "keywords": unique_keywords,
-            "start_min": start_min.isoformat(),
-            "start_max": start_max.isoformat(),
-        },
+        params=params,
     )
     if frame.empty:
         return frame
