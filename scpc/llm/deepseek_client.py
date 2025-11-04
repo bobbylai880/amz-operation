@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from json import dumps
 from typing import Any, Mapping
 
-from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 from scpc.settings import DeepSeekSettings, get_deepseek_settings
 
@@ -42,16 +43,21 @@ class DeepSeekClient:
         *,
         model: str,
         temperature: float,
-        response_format: str,
+        response_format: Mapping[str, Any] | str,
         top_p: float = 0.9,
     ) -> DeepSeekResponse:
         """Send a structured generation request to DeepSeek."""
+
+        if isinstance(response_format, str):
+            response_format_payload: Mapping[str, Any] = {"type": response_format}
+        else:
+            response_format_payload = response_format
 
         payload = {
             "model": model,
             "temperature": temperature,
             "top_p": top_p,
-            "response_format": response_format,
+            "response_format": response_format_payload,
             "messages": [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": facts},
@@ -61,8 +67,22 @@ class DeepSeekClient:
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
+        parsed = urlparse(self._base_url)
+        base_path = parsed.path.rstrip("/")
+        if base_path.endswith("/chat/completions"):
+            endpoint_path = base_path or "/v1/chat/completions"
+        elif base_path:
+            endpoint_path = f"{base_path}/chat/completions"
+        else:
+            endpoint_path = "/v1/chat/completions"
+
+        if not endpoint_path.startswith("/"):
+            endpoint_path = f"/{endpoint_path}"
+
+        endpoint = urlunparse(parsed._replace(path=endpoint_path))
+
         request = Request(
-            f"{self._base_url}/v1/chat/completions",
+            endpoint,
             data=dumps(payload).encode("utf-8"),
             headers=headers,
             method="POST",
@@ -71,7 +91,16 @@ class DeepSeekClient:
             with urlopen(request, timeout=self._timeout) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:  # pragma: no cover - network failure path
-            raise DeepSeekError(f"DeepSeek error: {exc.read().decode('utf-8')}") from exc
+            body: str
+            try:
+                body = exc.read().decode("utf-8")
+            except Exception:  # pragma: no cover - defensive guard
+                body = ""
+            if not body:
+                reason = getattr(exc, "reason", "")
+                status = getattr(exc, "code", "")
+                body = " ".join(str(part) for part in (status, reason) if part).strip()
+            raise DeepSeekError(f"DeepSeek error: {body}") from exc
         except URLError as exc:  # pragma: no cover - network failure path
             raise DeepSeekError(f"DeepSeek network error: {exc.reason}") from exc
         import json
