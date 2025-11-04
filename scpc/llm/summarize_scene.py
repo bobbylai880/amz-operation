@@ -52,18 +52,18 @@ KEYWORD_VOLUMES_SQL = text(
     WHERE scene = :scene AND marketplace_id = :mk
     ORDER BY year, week_num
     """
-).bindparams(bindparam("keywords", expanding=True))
+)
 
 KEYWORD_VOLUMES_SQL = text(
     """
     SELECT keyword_norm, year, week_num, startDate, vol
     FROM bi_amz_vw_kw_week
     WHERE marketplace_id = :mk
-      AND keyword_norm IN :keywords
+      AND keyword_norm IN (:keywords)
       AND startDate BETWEEN :start_min AND :start_max
     ORDER BY keyword_norm, year, week_num
     """
-).bindparams(bindparam("keywords", expanding=True))
+)
 
 KEYWORD_VOLUMES_SQL_TEMPLATE = """
     SELECT keyword_norm, year, week_num, startDate, vol
@@ -73,21 +73,6 @@ KEYWORD_VOLUMES_SQL_TEMPLATE = """
       AND startDate BETWEEN :start_min AND :start_max
     ORDER BY keyword_norm, year, week_num
 """
-
-KEYWORD_VOLUMES_SQL = (
-    text(
-        """
-        SELECT keyword_norm, year, week_num, startDate, vol
-        FROM bi_amz_vw_kw_week
-        WHERE marketplace_id = :mk
-          AND keyword_norm IN :keywords
-          AND startDate BETWEEN :start_min AND :start_max
-        ORDER BY keyword_norm, year, week_num
-        """
-    )
-    .bindparams(bindparam("keywords", expanding=True))
-)
-
 
 @dataclass(slots=True)
 class SceneSummaryPayload:
@@ -287,15 +272,32 @@ def _fetch_keyword_volumes(
     start_max = max(dates)
     params = {
         "mk": mk,
+        "keywords": unique_keywords,
         "start_min": start_min.isoformat(),
         "start_max": start_max.isoformat(),
-        "keywords": unique_keywords,
     }
-    frame = pd.read_sql_query(
-        KEYWORD_VOLUMES_SQL,
-        conn,
-        params=params,
-    )
+    try:
+        stmt = KEYWORD_VOLUMES_SQL.bindparams(bindparam("keywords", expanding=True))
+        frame = pd.read_sql_query(stmt, conn, params=params)
+    except Exception:
+        placeholders = ", ".join(f":kw_{i}" for i in range(len(unique_keywords)))
+        sql = text(
+            f"""
+            SELECT keyword_norm, year, week_num, startDate, vol
+            FROM bi_amz_vw_kw_week
+            WHERE marketplace_id = :mk
+              AND keyword_norm IN ({placeholders})
+              AND startDate BETWEEN :start_min AND :start_max
+            ORDER BY keyword_norm, year, week_num
+            """
+        )
+        dyn_params = {
+            "mk": mk,
+            "start_min": start_min.isoformat(),
+            "start_max": start_max.isoformat(),
+            **{f"kw_{i}": v for i, v in enumerate(unique_keywords)},
+        }
+        frame = pd.read_sql_query(sql, conn, params=dyn_params)
     if frame.empty:
         return frame
     frame["startDate"] = pd.to_datetime(frame["startDate"]).dt.date
