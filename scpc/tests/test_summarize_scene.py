@@ -98,7 +98,7 @@ def sample_keyword_volumes():
 
 
 def test_summarize_scene_retries_on_schema_error(
-    monkeypatch, sample_features, sample_drivers, sample_keyword_volumes
+    monkeypatch, tmp_path, sample_features, sample_drivers, sample_keyword_volumes
 ):
     calls = []
 
@@ -136,32 +136,54 @@ def test_summarize_scene_retries_on_schema_error(
                                 "week_num": 13,
                                 "start_date": "2025-03-30",
                                 "direction": "up",
-                                "pct_change": 1.2,
+                                "projected_vol": 260.0,
+                                "pct_change": "1.20%",
+                                "pct_change_value": 0.012,
                             },
                             {
                                 "year": 2025,
                                 "week_num": 14,
                                 "start_date": "2025-04-06",
                                 "direction": "up",
-                                "pct_change": 1.5,
+                                "projected_vol": 270.0,
+                                "pct_change": "1.50%",
+                                "pct_change_value": 0.015,
                             },
                             {
                                 "year": 2025,
                                 "week_num": 15,
                                 "start_date": "2025-04-13",
                                 "direction": "flat",
-                                "pct_change": 0.4,
+                                "projected_vol": 275.0,
+                                "pct_change": "0.40%",
+                                "pct_change_value": 0.004,
                             },
                             {
                                 "year": 2025,
                                 "week_num": 16,
                                 "start_date": "2025-04-20",
                                 "direction": "down",
-                                "pct_change": -0.6,
+                                "projected_vol": 268.0,
+                                "pct_change": "-0.60%",
+                                "pct_change_value": -0.006,
                             },
                         ]
                     },
                     "top_keywords_forecast": [
+                        {
+                            "keyword": "alpha",
+                            "weeks": [
+                                {
+                                    "year": 2025,
+                                    "week_num": 13,
+                                    "start_date": "2025-03-30",
+                                    "direction": "up",
+                                    "projected_vol": 340.0,
+                                    "pct_change": "1.10%",
+                                    "pct_change_value": 0.011,
+                                }
+                            ],
+                        },
                         {
                             "keyword": "beta",
                             "weeks": [
@@ -170,10 +192,26 @@ def test_summarize_scene_retries_on_schema_error(
                                     "week_num": 13,
                                     "start_date": "2025-03-30",
                                     "direction": "up",
-                                    "pct_change": 1.1,
+                                    "projected_vol": 312.0,
+                                    "pct_change": "0.80%",
+                                    "pct_change_value": 0.008,
                                 }
                             ],
-                        }
+                        },
+                        {
+                            "keyword": "gamma",
+                            "weeks": [
+                                {
+                                    "year": 2025,
+                                    "week_num": 13,
+                                    "start_date": "2025-03-30",
+                                    "direction": "flat",
+                                    "projected_vol": 284.0,
+                                    "pct_change": "0.20%",
+                                    "pct_change_value": 0.002,
+                                }
+                            ],
+                        },
                     ],
                     "confidence": 0.72,
                     "insufficient_data": False,
@@ -190,6 +228,7 @@ def test_summarize_scene_retries_on_schema_error(
     monkeypatch.setattr("scpc.llm.summarize_scene.pd.read_sql_query", fake_read_sql)
     monkeypatch.setattr("scpc.llm.summarize_scene.create_client_from_env", lambda settings: StubClient())
     monkeypatch.setattr("scpc.llm.summarize_scene.get_deepseek_settings", lambda: settings)
+    monkeypatch.setenv("SCPC_PROMPT_LOG_DIR", str(tmp_path))
 
     result = summarize_scene(engine=DummyEngine(), scene="X", mk="US", topn=5)
 
@@ -200,10 +239,38 @@ def test_summarize_scene_retries_on_schema_error(
     parsed = json.loads(calls[0])
     assert "scene_recent_4w" in parsed
     assert "response_schema" in parsed
+    forecast_guidance = parsed.get("forecast_guidance", {})
+    scene_guidance = forecast_guidance.get("scene", {}) if isinstance(forecast_guidance, dict) else {}
+    weeks = scene_guidance.get("forecast_weeks", []) if isinstance(scene_guidance, dict) else []
+    if weeks:
+        first_week = weeks[0]
+        assert isinstance(first_week.get("pct_change"), str)
+        assert first_week["pct_change"].endswith("%")
+        assert "pct_change_value" in first_week
+        assert "projected_vol" in first_week
+    keyword_guidance = forecast_guidance.get("keywords", []) if isinstance(forecast_guidance, dict) else []
+    assert len(keyword_guidance) == 3
+    for kw in keyword_guidance:
+        weeks = kw.get("forecast_weeks", [])
+        if weeks:
+            first_kw_week = weeks[0]
+            assert "projected_vol" in first_kw_week
+            assert isinstance(first_kw_week.get("pct_change"), str)
+            assert first_kw_week["pct_change"].endswith("%")
+
+    artifacts = sorted(tmp_path.glob("*.json"))
+    assert len(artifacts) == 2
+    latest = artifacts[-1]
+    stored = json.loads(latest.read_text(encoding="utf-8"))
+    assert stored["system_prompt"] == summarize_scene.__globals__["SYSTEM_PROMPT"]
+    assert stored["scene"] == "X"
+    assert stored["marketplace_id"] == "US"
+    assert isinstance(stored["facts"], dict)
+    assert stored["facts"]["scene"] == "X"
 
 
 def test_summarize_scene_raises_after_two_schema_errors(
-    monkeypatch, sample_features, sample_drivers, sample_keyword_volumes
+    monkeypatch, tmp_path, sample_features, sample_drivers, sample_keyword_volumes
 ):
     def fake_read_sql(query, _conn, params):
         text_query = str(query)
@@ -236,6 +303,7 @@ def test_summarize_scene_raises_after_two_schema_errors(
     monkeypatch.setattr("scpc.llm.summarize_scene.pd.read_sql_query", fake_read_sql)
     monkeypatch.setattr("scpc.llm.summarize_scene.create_client_from_env", lambda settings: StubClient())
     monkeypatch.setattr("scpc.llm.summarize_scene.get_deepseek_settings", lambda: settings)
+    monkeypatch.setenv("SCPC_PROMPT_LOG_DIR", str(tmp_path))
 
     with pytest.raises(SceneSummarizationError) as excinfo:
         summarize_scene(engine=DummyEngine(), scene="X", mk="US", topn=5)
@@ -243,3 +311,5 @@ def test_summarize_scene_raises_after_two_schema_errors(
     error = excinfo.value
     assert any("Missing required key" in detail for detail in error.details)
     assert error.raw is not None
+    artifacts = sorted(tmp_path.glob("*.json"))
+    assert len(artifacts) == 2

@@ -24,14 +24,18 @@
               "week_num",
               "start_date",
               "direction",
-              "pct_change"
+              "projected_vol",
+              "pct_change",
+              "pct_change_value"
             ],
             "properties": {
               "year": {"type": "integer"},
               "week_num": {"type": "integer"},
               "start_date": {"type": "string", "format": "date"},
               "direction": {"type": "string", "enum": ["up", "down", "flat"]},
-              "pct_change": {"type": "number"}
+              "projected_vol": {"type": "number"},
+              "pct_change": {"type": "string"},
+              "pct_change_value": {"type": "number"}
             }
           }
         }
@@ -56,14 +60,18 @@
                 "week_num",
                 "start_date",
                 "direction",
-                "pct_change"
+                "projected_vol",
+                "pct_change",
+                "pct_change_value"
               ],
               "properties": {
                 "year": {"type": "integer"},
                 "week_num": {"type": "integer"},
                 "start_date": {"type": "string", "format": "date"},
                 "direction": {"type": "string", "enum": ["up", "down", "flat"]},
-                "pct_change": {"type": "number"}
+                "projected_vol": {"type": "number"},
+                "pct_change": {"type": "string"},
+                "pct_change_value": {"type": "number"}
               }
             }
           }

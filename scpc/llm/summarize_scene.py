@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from statistics import StatisticsError, median
 from typing import Any, Mapping, Sequence
@@ -19,13 +20,17 @@ from scpc.llm.deepseek_client import DeepSeekError, create_client_from_env
 from scpc.settings import get_deepseek_settings
 
 
+logger = logging.getLogger(__name__)
+
+
 SYSTEM_PROMPT = """你是一位资深亚马逊跨境电商总监，负责场景级预测。\n严格遵守：\n1. 仅基于输入 JSON，禁止引入额外数据或假设。\n2. 引用任意时间必须同时包含 year、week_num、start_date（周日）。\n3. 输出必须使用中文，并严格匹配 response_schema。\n4. 在 analysis_summary 中，用不超过400字的中文总结场景与主要关键词未来趋势及驱动原因，并引用至少两个具体指标数值作为依据（例如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）。\n5. 预测规则：\n   • 本年最近4周 WoW 中位数 = 短期趋势项 r。\n   • 去年“过去4周 + 未来4周”体量计算季节先验：s[h] = (LY_future_4w[h].vol / LY_pivot.vol) - 1。\n   • 组合增速：w[h] = α * r + (1-α) * s[h]，默认 α=0.6，可由 blend_weights 覆盖。\n   • 逐周滚动：pred[0] = 当前最后一周 vol；pred[h] = pred[h-1] * (1 + w[h])。\n   • 方向阈值：pct_change ≥ +1% → up；≤ −1% → down；其余 flat，pct_change 对“最后观测周”计算并保留1位小数。\n   • 关键词预测与场景同法、独立计算。\n6. 数据不足或缺行 → insufficient_data=true，并在 notes 说明原因。\n"""
 
 OUTPUT_INSTRUCTIONS = [
     "仅返回一个 JSON 对象，UTF-8 编码，无额外解释或 Markdown。",
     "必须包含字段 scene_forecast、top_keywords_forecast、confidence、insufficient_data、analysis_summary；可选 notes（为空请输出 null）。",
-    "scene_forecast.weeks 与 top_keywords_forecast[*].weeks 均需列出未来4周的 direction 与 pct_change。",
-    "top_keywords_forecast 数量不超过 3。",
+    "scene_forecast.weeks 与 top_keywords_forecast[*].weeks 均需列出未来4周的 direction、projected_vol、pct_change（百分号字符串，保留两位小数）",
+    "scene_forecast.weeks[*].pct_change 同时需要提供 pct_change_value（小数形式，便于系统后续计算）。",
+    "top_keywords_forecast 数量不超过 3，且需覆盖输入 facts.top_keywords 中的全部关键词（若不足3个则全部输出）。",
     "analysis_summary 需以中文总结场景与主要关键词的趋势及主因，长度不超过400字。",
 ]
 
@@ -33,10 +38,10 @@ OUTPUT_INSTRUCTIONS.append(
     "若提供 bounds.p10/p90，则第4周累计相对变化需落在该区间，越界时取边界值。"
 )
 OUTPUT_INSTRUCTIONS.append(
-    "若 facts.forecast_guidance.scene.forecast_weeks 非空，则 scene_forecast 的 direction 与 pct_change 必须与之保持一致（允许按四舍五入保留一位小数）。"
+    "若 facts.forecast_guidance.scene.forecast_weeks 非空，则 scene_forecast 的 direction、projected_vol、pct_change_value 必须与之保持一致，pct_change 需为 pct_change_value×100 后按四舍五入保留两位小数并追加%符号。"
 )
 OUTPUT_INSTRUCTIONS.append(
-    "若 facts.forecast_guidance.keywords[*].forecast_weeks 非空，则对应 keyword 的 direction 与 pct_change 需与之保持一致（允许按四舍五入保留一位小数）。"
+    "若 facts.forecast_guidance.keywords[*].forecast_weeks 非空，则对应 keyword 的 direction、projected_vol、pct_change_value 需与之保持一致，pct_change 同样需输出百分号字符串。"
 )
 OUTPUT_INSTRUCTIONS.append(
     "analysis_summary 必须引用 facts.analysis_evidence 中至少两个具体指标值（如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）作为结论依据。"
@@ -108,6 +113,52 @@ def _norm_kw(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9]+", " ", s).strip()
     return re.sub(r"\s+", " ", s)
+
+
+def _sanitize_identifier(value: str) -> str:
+    if not value:
+        return "unknown"
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return sanitized or "unknown"
+
+
+def _persist_prompt_artifact(
+    scene: str,
+    marketplace_id: str,
+    attempt: int,
+    *,
+    system_prompt: str,
+    facts: str,
+) -> None:
+    base_dir = os.getenv("SCPC_PROMPT_LOG_DIR")
+    directory = Path(base_dir) if base_dir else Path("storage") / "prompt_logs"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Failed to create prompt log directory %s: %s", directory, exc)
+        return
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    filename = (
+        f"{_sanitize_identifier(scene)}__{_sanitize_identifier(marketplace_id)}"
+        f"__{timestamp}__attempt{attempt}.json"
+    )
+    path = directory / filename
+    try:
+        try:
+            facts_obj = json.loads(facts)
+        except json.JSONDecodeError:
+            facts_obj = facts
+        payload = {
+            "scene": scene,
+            "marketplace_id": marketplace_id,
+            "attempt": attempt,
+            "timestamp": timestamp,
+            "system_prompt": system_prompt,
+            "facts": facts_obj,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write prompt artifact %s: %s", path, exc)
 
 
 def _to_volume(value: object) -> float | None:
@@ -258,8 +309,7 @@ def _select_top_keywords(drivers: pd.DataFrame, limit: int) -> list[dict[str, ob
     subset = drivers.copy()
     subset["keyword"] = subset["keyword"].astype(str)
     subset["contrib"] = pd.to_numeric(subset["contrib"], errors="coerce")
-    subset["abs_contrib"] = subset["contrib"].abs()
-    subset = subset[subset["abs_contrib"] >= 0.01]
+    subset["abs_contrib"] = subset["contrib"].abs().fillna(0)
     subset = subset.sort_values("abs_contrib", ascending=False)
     seen: set[str] = set()
     results: list[dict[str, object]] = []
@@ -456,6 +506,18 @@ def _clean_float(value: float | None, *, digits: int | None = None) -> float | N
     return float(value)
 
 
+def _format_pct(value: float | None, *, digits: int = 2) -> str | None:
+    if value is None or not math.isfinite(value):
+        return None
+    scaled = float(value) * 100.0
+    if digits is not None:
+        scaled = round(scaled, digits)
+        if abs(scaled) < 0.5 * (10 ** -digits):
+            scaled = 0.0
+        return f"{scaled:.{digits}f}%"
+    return f"{scaled}%"
+
+
 def _apply_forecast_model(
     base_vol: float | None,
     future_calendar: Sequence[Mapping[str, object]],
@@ -498,27 +560,37 @@ def _apply_forecast_model(
         if base != 0:
             pct_change = (next_vol - base) / base
         direction = _classify_direction(pct_change, flat_band)
+        pct_change_value = _clean_float(pct_change, digits=4)
         forecasts.append(
             {
                 "week_index": idx + 1,
                 "target_week": week_meta,
                 "growth_rate": _clean_float(weight, digits=4),
                 "projected_vol": _clean_float(next_vol, digits=2),
-                "pct_change": _clean_float(pct_change, digits=4),
+                "pct_change": _format_pct(pct_change_value),
+                "pct_change_value": pct_change_value,
                 "direction": direction,
             }
         )
         last = next_vol
     guidance["forecast_weeks"] = forecasts
     if forecasts:
-        last_pct = forecasts[-1]["pct_change"]
-        guidance["fourth_week_pct_change"] = last_pct
+        last_pct_value = forecasts[-1]["pct_change_value"]
+        guidance["fourth_week_pct_change_value"] = last_pct_value
+        guidance["fourth_week_pct_change"] = _format_pct(last_pct_value)
         if bounds:
             p10 = _clean_float(_to_volume(bounds.get("p10")))
             p90 = _clean_float(_to_volume(bounds.get("p90")))
-            if last_pct is not None and p10 is not None and p90 is not None and p10 <= p90:
-                clamped = max(p10, min(p90, last_pct))
-                guidance["fourth_week_pct_change_clamped"] = _clean_float(clamped, digits=4)
+            if (
+                last_pct_value is not None
+                and p10 is not None
+                and p90 is not None
+                and p10 <= p90
+            ):
+                clamped = max(p10, min(p90, last_pct_value))
+                clamped_clean = _clean_float(clamped, digits=4)
+                guidance["fourth_week_pct_change_clamped_value"] = clamped_clean
+                guidance["fourth_week_pct_change_clamped"] = _format_pct(clamped_clean)
     return guidance
 
 
@@ -918,6 +990,13 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
                 schema,
                 validation_errors=repair_hints if repair_hints else None,
                 previous_response=previous_response,
+            )
+            _persist_prompt_artifact(
+                scene,
+                mk,
+                attempt,
+                system_prompt=SYSTEM_PROMPT,
+                facts=content,
             )
             try:
                 response = client.generate(
