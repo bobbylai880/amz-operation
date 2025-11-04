@@ -60,6 +60,14 @@ WHERE scene = :scene AND marketplace_id = :mk
 ORDER BY year, week_num
 """
 
+LATEST_YEARWEEK_SQL = text(
+    """
+    SELECT MAX(year * 100 + week_num) AS yearweek
+    FROM bi_amz_scene_features
+    WHERE scene = :scene AND marketplace_id = :mk
+    """
+)
+
 
 def _compute_min_yrwk(weeks_back: int) -> int:
     today = date.today()
@@ -96,6 +104,28 @@ def _latest_yearweek(outputs: dict[str, pd.DataFrame]) -> int | None:
                 latest = int(values.max())
                 return latest
     return None
+
+
+def _fetch_latest_yearweek(engine: Engine, scene: str, marketplace_id: str) -> int | None:
+    with engine.connect() as conn:
+        result = conn.execute(
+            LATEST_YEARWEEK_SQL,
+            {"scene": scene, "mk": marketplace_id},
+        )
+        value = result.scalar()
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):  # pragma: no cover - defensive guard
+        LOGGER.warning(
+            "scene_pipeline_yearweek_invalid scene=%s mk=%s value=%s",
+            scene,
+            marketplace_id,
+            value,
+            extra={"scene": scene, "mk": marketplace_id, "value": value},
+        )
+        return None
 
 
 def _ensure_output_directory(base: Path, scene: str, marketplace_id: str, yearweek: int) -> Path:
@@ -465,6 +495,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--emit-json", action="store_true", help="Write scene summary JSON to disk")
     parser.add_argument("--emit-md", action="store_true", help="Write Markdown report to disk")
     parser.add_argument(
+        "--llm-only",
+        action="store_true",
+        help="Skip ETL and only invoke DeepSeek summarisation using existing tables",
+    )
+    parser.add_argument(
         "--outputs-dir",
         default="storage/outputs/scene",
         help="Base directory for generated outputs",
@@ -475,7 +510,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     else:
         argv_list = list(argv)
 
-    return parser.parse_args(_normalise_argv(argv_list))
+    namespace = parser.parse_args(_normalise_argv(argv_list))
+    if namespace.llm_only and namespace.write:
+        parser.error("--llm-only cannot be combined with --write")
+    if namespace.llm_only:
+        namespace.with_llm = True
+    return namespace
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -497,41 +537,43 @@ def main(argv: Sequence[str] | None = None) -> None:
     topn = args.scene_topn if args.scene_topn is not None else default_topn
     engine = create_doris_engine()
     try:
-        try:
-            outputs = run_scene_pipeline(
-                args.scene,
-                args.mk,
-                args.weeks_back,
-                engine=engine,
-                write=args.write,
-                topn=topn,
-            )
-        except OperationalError as exc:
-            LOGGER.error(
-                "scene_pipeline_connection_failed scene=%s mk=%s call=%s",
-                args.scene,
-                args.mk,
-                "run_scene_pipeline",
-                extra={"scene": args.scene, "mk": args.mk, "call": "run_scene_pipeline"},
-                exc_info=False,
-            )
-            host = os.getenv("DORIS_HOST", "<unknown>")
-            port = os.getenv("DORIS_PORT", "<unknown>")
-            details = getattr(exc.orig, "args", ())
-            if isinstance(details, tuple) and details:
-                hint = " ".join(str(item) for item in details)
-            elif details:
-                hint = str(details)
-            else:
-                hint = str(exc)
-            message = (
-                f"Failed to connect to Doris at {host}:{port}. "
-                "Please verify network connectivity, VPN access, and credentials. "
-                f"Original error: {hint}"
-            )
-            raise SystemExit(message)
+        outputs: dict[str, pd.DataFrame] = {}
+        if not args.llm_only:
+            try:
+                outputs = run_scene_pipeline(
+                    args.scene,
+                    args.mk,
+                    args.weeks_back,
+                    engine=engine,
+                    write=args.write,
+                    topn=topn,
+                )
+            except OperationalError as exc:
+                LOGGER.error(
+                    "scene_pipeline_connection_failed scene=%s mk=%s call=%s",
+                    args.scene,
+                    args.mk,
+                    "run_scene_pipeline",
+                    extra={"scene": args.scene, "mk": args.mk, "call": "run_scene_pipeline"},
+                    exc_info=False,
+                )
+                host = os.getenv("DORIS_HOST", "<unknown>")
+                port = os.getenv("DORIS_PORT", "<unknown>")
+                details = getattr(exc.orig, "args", ())
+                if isinstance(details, tuple) and details:
+                    hint = " ".join(str(item) for item in details)
+                elif details:
+                    hint = str(details)
+                else:
+                    hint = str(exc)
+                message = (
+                    f"Failed to connect to Doris at {host}:{port}. "
+                    "Please verify network connectivity, VPN access, and credentials. "
+                    f"Original error: {hint}"
+                )
+                raise SystemExit(message)
 
-        if not args.write:
+        if not args.llm_only and not args.write:
             summary = {name: len(df) for name, df in outputs.items()}
             print(json.dumps(summary, default=str))
 
@@ -539,7 +581,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         summary_error: SceneSummarizationError | None = None
         if args.with_llm:
             features_df = outputs.get("features", pd.DataFrame())
-            if features_df.empty:
+            if not args.llm_only and features_df.empty:
                 LOGGER.warning(
                     "scene_pipeline_llm_skipped scene=%s mk=%s reason=no_features",
                     args.scene,
@@ -598,7 +640,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     )
 
         if args.with_llm and (args.emit_json or args.emit_md):
-            yearweek = _latest_yearweek(outputs)
+            yearweek = _latest_yearweek(outputs) if outputs else None
+            if yearweek is None and args.llm_only:
+                yearweek = _fetch_latest_yearweek(engine, args.scene, args.mk)
             if yearweek is None:
                 LOGGER.warning(
                     "scene_pipeline_outputs_skipped scene=%s mk=%s reason=no_yearweek",
