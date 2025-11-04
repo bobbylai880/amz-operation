@@ -42,16 +42,21 @@ class DeepSeekClient:
         *,
         model: str,
         temperature: float,
-        response_format: str,
+        response_format: Mapping[str, Any] | str,
         top_p: float = 0.9,
     ) -> DeepSeekResponse:
         """Send a structured generation request to DeepSeek."""
+
+        if isinstance(response_format, str):
+            response_format_payload: Mapping[str, Any] = {"type": response_format}
+        else:
+            response_format_payload = response_format
 
         payload = {
             "model": model,
             "temperature": temperature,
             "top_p": top_p,
-            "response_format": response_format,
+            "response_format": response_format_payload,
             "messages": [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": facts},
@@ -71,7 +76,16 @@ class DeepSeekClient:
             with urlopen(request, timeout=self._timeout) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:  # pragma: no cover - network failure path
-            raise DeepSeekError(f"DeepSeek error: {exc.read().decode('utf-8')}") from exc
+            body: str
+            try:
+                body = exc.read().decode("utf-8")
+            except Exception:  # pragma: no cover - defensive guard
+                body = ""
+            if not body:
+                reason = getattr(exc, "reason", "")
+                status = getattr(exc, "code", "")
+                body = " ".join(str(part) for part in (status, reason) if part).strip()
+            raise DeepSeekError(f"DeepSeek error: {body}") from exc
         except URLError as exc:  # pragma: no cover - network failure path
             raise DeepSeekError(f"DeepSeek network error: {exc.reason}") from exc
         import json
