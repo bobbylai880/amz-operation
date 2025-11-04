@@ -125,6 +125,7 @@ def test_summarize_scene_retries_on_schema_error(
                     "top_keywords_forecast": [],
                     "confidence": 0.7,
                     "insufficient_data": False,
+                    "analysis_summary": "场景数据不足，无法输出有效趋势。",
                 }
             else:
                 payload = {
@@ -176,6 +177,7 @@ def test_summarize_scene_retries_on_schema_error(
                     ],
                     "confidence": 0.72,
                     "insufficient_data": False,
+                    "analysis_summary": "场景未来两周延续上行，关键词beta放量拉动，随后受库存调整回落。",
                     "notes": None,
                 }
             return DeepSeekResponse(content=json.dumps(payload), usage={})
@@ -193,6 +195,7 @@ def test_summarize_scene_retries_on_schema_error(
 
     assert "scene_forecast" in result
     assert len(result["scene_forecast"]["weeks"]) == 4
+    assert "analysis_summary" in result
     assert calls, "expected DeepSeek to be invoked"
     parsed = json.loads(calls[0])
     assert "scene_recent_4w" in parsed

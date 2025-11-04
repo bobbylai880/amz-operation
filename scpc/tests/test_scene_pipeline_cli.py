@@ -50,7 +50,12 @@ def test_main_emits_scene_summary_json(tmp_path, monkeypatch):
 
     monkeypatch.setattr("scpc.etl.scene_pipeline.run_scene_pipeline", lambda *args, **kwargs: outputs)
     monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: DummyEngine())
-    summary = {"status": "OK", "drivers": [], "insufficient_data": False}
+    summary = {
+        "status": "OK",
+        "drivers": [],
+        "insufficient_data": False,
+        "analysis_summary": "场景稳定，关键词影响有限。",
+    }
     monkeypatch.setattr("scpc.etl.scene_pipeline.summarize_scene", lambda **kwargs: summary)
     monkeypatch.setenv("SCPC_LOG_DIR", str(log_dir))
 
@@ -87,7 +92,12 @@ def test_main_emits_scene_markdown(tmp_path, monkeypatch):
 
     monkeypatch.setattr("scpc.etl.scene_pipeline.run_scene_pipeline", lambda *args, **kwargs: outputs)
     monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: DummyEngine())
-    summary = {"status": "OK", "drivers": [], "insufficient_data": False}
+    summary = {
+        "status": "OK",
+        "drivers": [],
+        "insufficient_data": False,
+        "analysis_summary": "场景稳定，关键词影响有限。",
+    }
     monkeypatch.setattr("scpc.etl.scene_pipeline.summarize_scene", lambda **kwargs: summary)
     monkeypatch.setattr("scpc.etl.scene_pipeline.build_scene_markdown", lambda payload: "# Demo\n")
     monkeypatch.setenv("SCPC_LOG_DIR", str(log_dir))
@@ -132,7 +142,12 @@ def test_main_llm_only_invokes_llm_without_etl(tmp_path, monkeypatch):
     dummy_engine = DummyEngine()
     monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: dummy_engine)
 
-    summary = {"status": "OK", "drivers": [], "insufficient_data": False}
+    summary = {
+        "status": "OK",
+        "drivers": [],
+        "insufficient_data": False,
+        "analysis_summary": "场景稳定，关键词影响有限。",
+    }
 
     called = {"summarize": False, "yearweek": False}
 
@@ -187,7 +202,12 @@ def test_main_llm_only_emits_json_with_fallback_yearweek(tmp_path, monkeypatch):
     dummy_engine = DummyEngine()
     monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: dummy_engine)
 
-    summary = {"status": "OK", "drivers": [], "insufficient_data": False}
+    summary = {
+        "status": "OK",
+        "drivers": [],
+        "insufficient_data": False,
+        "analysis_summary": "场景稳定，关键词影响有限。",
+    }
 
     monkeypatch.setattr("scpc.etl.scene_pipeline.summarize_scene", lambda **_kwargs: summary)
     monkeypatch.setattr("scpc.etl.scene_pipeline._fetch_latest_yearweek", lambda *_args, **_kwargs: None)

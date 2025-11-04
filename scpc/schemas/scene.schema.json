@@ -5,7 +5,8 @@
     "scene_forecast",
     "top_keywords_forecast",
     "confidence",
-    "insufficient_data"
+    "insufficient_data",
+    "analysis_summary"
   ],
   "properties": {
     "scene_forecast": {
@@ -71,6 +72,7 @@
     },
     "confidence": {"type": "number"},
     "insufficient_data": {"type": "boolean"},
+    "analysis_summary": {"type": "string", "minLength": 1, "maxLength": 400},
     "notes": {"type": ["string", "null"]}
   }
 }

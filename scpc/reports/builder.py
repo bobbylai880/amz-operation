@@ -71,6 +71,11 @@ def build_scene_markdown(summary: Mapping[str, object]) -> str:
         if conf_val is not None:
             lines.append(f"置信度：{conf_val:.2f}\n")
 
+    analysis_summary = summary.get("analysis_summary")
+    if isinstance(analysis_summary, str) and analysis_summary.strip():
+        lines.append("## 综合分析\n")
+        lines.append(analysis_summary.strip() + "\n")
+
     forecast = summary.get("scene_forecast", {})
     weeks = forecast.get("weeks", []) if isinstance(forecast, Mapping) else []
     if weeks:
