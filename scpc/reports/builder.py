@@ -51,6 +51,19 @@ def build_report(
 
 
 def _format_pct(value: object) -> str:
+    if value is None:
+        return "?"
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return "?"
+        if stripped.endswith("%"):
+            return stripped
+        try:
+            number = float(stripped)
+        except ValueError:
+            return "?"
+        return f"{number:.1f}%"
     try:
         number = float(value)
     except (TypeError, ValueError):
