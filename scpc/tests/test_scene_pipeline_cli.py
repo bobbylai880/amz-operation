@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from scpc.etl.scene_pipeline import main, parse_args
@@ -32,6 +34,7 @@ def test_parse_args_llm_only_enables_with_llm():
     args = parse_args(["--scene", "S", "--mk", "US", "--llm-only"])
     assert args.llm_only is True
     assert args.with_llm is True
+    assert args.emit_json is True
 
 
 def test_parse_args_llm_only_conflicts_with_write():
@@ -47,7 +50,12 @@ def test_main_emits_scene_summary_json(tmp_path, monkeypatch):
 
     monkeypatch.setattr("scpc.etl.scene_pipeline.run_scene_pipeline", lambda *args, **kwargs: outputs)
     monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: DummyEngine())
-    summary = {"status": "OK", "drivers": [], "insufficient_data": False}
+    summary = {
+        "status": "OK",
+        "drivers": [],
+        "insufficient_data": False,
+        "analysis_summary": "场景稳定，关键词影响有限。",
+    }
     monkeypatch.setattr("scpc.etl.scene_pipeline.summarize_scene", lambda **kwargs: summary)
     monkeypatch.setenv("SCPC_LOG_DIR", str(log_dir))
 
@@ -84,7 +92,12 @@ def test_main_emits_scene_markdown(tmp_path, monkeypatch):
 
     monkeypatch.setattr("scpc.etl.scene_pipeline.run_scene_pipeline", lambda *args, **kwargs: outputs)
     monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: DummyEngine())
-    summary = {"status": "OK", "drivers": [], "insufficient_data": False}
+    summary = {
+        "status": "OK",
+        "drivers": [],
+        "insufficient_data": False,
+        "analysis_summary": "场景稳定，关键词影响有限。",
+    }
     monkeypatch.setattr("scpc.etl.scene_pipeline.summarize_scene", lambda **kwargs: summary)
     monkeypatch.setattr("scpc.etl.scene_pipeline.build_scene_markdown", lambda payload: "# Demo\n")
     monkeypatch.setenv("SCPC_LOG_DIR", str(log_dir))
@@ -129,7 +142,12 @@ def test_main_llm_only_invokes_llm_without_etl(tmp_path, monkeypatch):
     dummy_engine = DummyEngine()
     monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: dummy_engine)
 
-    summary = {"status": "OK", "drivers": [], "insufficient_data": False}
+    summary = {
+        "status": "OK",
+        "drivers": [],
+        "insufficient_data": False,
+        "analysis_summary": "场景稳定，关键词影响有限。",
+    }
 
     called = {"summarize": False, "yearweek": False}
 
@@ -152,7 +170,6 @@ def test_main_llm_only_invokes_llm_without_etl(tmp_path, monkeypatch):
             "--mk",
             "JP",
             "--llm-only",
-            "--emit-json",
             "--outputs-dir",
             str(outputs_dir),
         ]
@@ -170,6 +187,53 @@ def test_main_llm_only_invokes_llm_without_etl(tmp_path, monkeypatch):
     log_contents = logs[-1].read_text(encoding="utf-8")
     assert "call=summarize_scene" in log_contents
 
+
+def test_main_llm_only_emits_json_with_fallback_yearweek(tmp_path, monkeypatch):
+    outputs_dir = tmp_path / "scene"
+    log_dir = tmp_path / "logs"
+
+    monkeypatch.setenv("SCPC_LOG_DIR", str(log_dir))
+
+    def _unexpected(*_args, **_kwargs):  # pragma: no cover - ensures we skip ETL
+        raise AssertionError("run_scene_pipeline should not be invoked when --llm-only is set")
+
+    monkeypatch.setattr("scpc.etl.scene_pipeline.run_scene_pipeline", _unexpected)
+
+    dummy_engine = DummyEngine()
+    monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: dummy_engine)
+
+    summary = {
+        "status": "OK",
+        "drivers": [],
+        "insufficient_data": False,
+        "analysis_summary": "场景稳定，关键词影响有限。",
+    }
+
+    monkeypatch.setattr("scpc.etl.scene_pipeline.summarize_scene", lambda **_kwargs: summary)
+    monkeypatch.setattr("scpc.etl.scene_pipeline._fetch_latest_yearweek", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("scpc.etl.scene_pipeline._current_yearweek", lambda: 202450)
+
+    main(
+        [
+            "--scene",
+            "Fallback",
+            "--mk",
+            "UK",
+            "--llm-only",
+            "--outputs-dir",
+            str(outputs_dir),
+        ]
+    )
+
+    yearweek_dir = outputs_dir / "Fallback" / "UK" / "202450"
+    artifact = yearweek_dir / "scene_summary.json"
+    assert artifact.exists()
+    assert json.loads(artifact.read_text(encoding="utf-8")) == summary
+
+    logs = sorted(log_dir.glob("scene_pipeline_*.log"))
+    assert logs, "expected log file to be created"
+    log_contents = logs[-1].read_text(encoding="utf-8")
+    assert "reason=no_yearweek" in log_contents
 
 def test_main_exits_gracefully_on_operational_error(tmp_path, monkeypatch):
     dummy_engine = DummyEngine()
