@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -26,11 +27,18 @@ OUTPUT_INSTRUCTIONS = [
     "analysis_summary 需以中文总结场景与主要关键词的趋势及主因，长度不超过400字。",
 ]
 
+OUTPUT_INSTRUCTIONS.append(
+    "若提供 bounds.p10/p90，则第4周累计相对变化需落在该区间，越界时取边界值。"
+)
+
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "scene.schema.json"
 
 FEATURES_SQL = text(
     """
-    SELECT scene, marketplace_id, year, week_num, start_date, VOL
+    SELECT scene, marketplace_id, year, week_num, start_date, VOL,
+           wow, yoy, wow_sa, slope8, breadth_wow_pos, breadth_yoy_pos, HHI_kw,
+           volatility_8w, coverage, new_kw_share, strength_bucket,
+           forecast_p10, forecast_p50, forecast_p90, confidence
     FROM bi_amz_scene_features
     WHERE scene = :scene AND marketplace_id = :mk
     ORDER BY year, week_num
@@ -73,6 +81,12 @@ class SceneSummarizationError(RuntimeError):
         super().__init__(message)
         self.raw = raw
         self.details = details or []
+
+
+def _norm_kw(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+    return re.sub(r"\s+", " ", s)
 
 
 def _to_volume(value: object) -> float | None:
@@ -202,6 +216,7 @@ def _select_top_keywords(drivers: pd.DataFrame, limit: int) -> list[dict[str, ob
     subset["keyword"] = subset["keyword"].astype(str)
     subset["contrib"] = pd.to_numeric(subset["contrib"], errors="coerce")
     subset["abs_contrib"] = subset["contrib"].abs()
+    subset = subset[subset["abs_contrib"] >= 0.01]
     subset = subset.sort_values("abs_contrib", ascending=False)
     seen: set[str] = set()
     results: list[dict[str, object]] = []
@@ -282,7 +297,12 @@ def _prepare_keyword_payload(
     payload: list[dict[str, object]] = []
     for entry in keywords:
         keyword = entry["keyword"]
-        subset = keyword_frame[keyword_frame["keyword_norm"] == keyword] if not keyword_frame.empty else pd.DataFrame()
+        norm = _norm_kw(keyword)
+        subset = (
+            keyword_frame[keyword_frame["keyword_norm"] == norm]
+            if not keyword_frame.empty
+            else pd.DataFrame()
+        )
         payload.append(
             {
                 "keyword": keyword,
@@ -350,6 +370,15 @@ def _load_forecast_parameters() -> tuple[dict[str, float], dict[str, float]]:
     return blend_weights, thresholds
 
 
+def _dynamic_alpha(latest: pd.Series) -> float:
+    vol8 = float(latest.get("volatility_8w") or 0.0)
+    vol8 = max(0.0, min(1.0, vol8))
+    cov = float(latest.get("coverage") or 0.0)
+    cov = max(0.0, min(1.0, cov))
+    alpha = 0.4 + 0.35 * (1 - vol8) + 0.25 * cov
+    return max(0.4, min(0.8, alpha))
+
+
 def _build_scene_summary_payload(
     scene: str,
     marketplace_id: str,
@@ -359,6 +388,9 @@ def _build_scene_summary_payload(
     blend_weights: Mapping[str, float],
     thresholds: Mapping[str, float],
     data_quality: Mapping[str, Any],
+    bounds: Mapping[str, float],
+    scene_signals: Mapping[str, Any],
+    quality_notes: str | None = None,
 ) -> SceneSummaryPayload:
     facts = {
         "scene": scene,
@@ -372,7 +404,11 @@ def _build_scene_summary_payload(
         "blend_weights": blend_weights,
         "thresholds": thresholds,
         "data_quality": data_quality,
+        "bounds": bounds,
+        "scene_signals": scene_signals,
     }
+    if quality_notes:
+        facts["quality_notes"] = quality_notes
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps(facts, ensure_ascii=False)},
@@ -478,6 +514,7 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
             raise SceneSummarizationError("No scene_features rows available for summarisation")
         features["start_date"] = pd.to_datetime(features["start_date"]).dt.date
         features["VOL"] = pd.to_numeric(features["VOL"], errors="coerce")
+        latest_row = features.sort_values("start_date").iloc[-1]
         yearweek = _latest_yearweek(features)
         drivers = pd.read_sql_query(
             DRIVERS_SQL,
@@ -490,15 +527,48 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
         keyword_dates.extend(windows.recent_dates)
         keyword_dates.extend(windows.last_year_past_dates)
         keyword_dates.extend(windows.last_year_future_dates)
+        kw_norm_list = [_norm_kw(entry["keyword"]) for entry in top_keywords]
         keyword_frame = _fetch_keyword_volumes(
             conn,
             mk,
-            [entry["keyword"] for entry in top_keywords],
+            kw_norm_list,
             keyword_dates,
         )
     keyword_payload = _prepare_keyword_payload(top_keywords, keyword_frame, windows)
     blend_weights, thresholds = _load_forecast_parameters()
+    alpha = _dynamic_alpha(latest_row)
+    blend_weights = {"recent_wow": round(alpha, 3), "seasonal": round(1 - alpha, 3)}
+    conf = float(latest_row.get("confidence") or 0.0)
+    cov = float(latest_row.get("coverage") or 0.0)
+    flat_band = 0.02 if (conf < 0.6 or cov < 0.6) else 0.01
+    thresholds = {"flat_band_pct": flat_band}
+    bounds = {
+        "p10": float(latest_row.get("forecast_p10") or 0.0),
+        "p50": float(latest_row.get("forecast_p50") or 0.0),
+        "p90": float(latest_row.get("forecast_p90") or 0.0),
+    }
+    scene_signals = {
+        "latest": {
+            "wow": latest_row.get("wow"),
+            "yoy": latest_row.get("yoy"),
+            "wow_sa": latest_row.get("wow_sa"),
+            "slope8": latest_row.get("slope8"),
+            "breadth_wow_pos": latest_row.get("breadth_wow_pos"),
+            "breadth_yoy_pos": latest_row.get("breadth_yoy_pos"),
+            "HHI_kw": latest_row.get("HHI_kw"),
+            "volatility_8w": latest_row.get("volatility_8w"),
+            "coverage": latest_row.get("coverage"),
+            "new_kw_share": latest_row.get("new_kw_share"),
+            "strength_bucket": latest_row.get("strength_bucket"),
+        }
+    }
     data_quality = _compute_data_quality(windows, keyword_payload)
+    insufficient = (
+        _count_missing(windows.recent) >= 2
+        or _count_missing(windows.last_year_past) >= 2
+        or _count_missing(windows.last_year_future) >= 2
+    )
+    quality_notes = "样本不足：某些4周窗口缺失≥2个数据点" if insufficient else None
     payload = _build_scene_summary_payload(
         scene,
         mk,
@@ -507,6 +577,9 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
         blend_weights=blend_weights,
         thresholds=thresholds,
         data_quality=data_quality,
+        bounds=bounds,
+        scene_signals=scene_signals,
+        quality_notes=quality_notes,
     )
     schema = _load_schema()
     settings = get_deepseek_settings()
