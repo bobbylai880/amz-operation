@@ -42,9 +42,7 @@ OUTPUT_INSTRUCTIONS.append(
     "analysis_summary 必须引用 facts.analysis_evidence 中至少两个具体指标值（如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）作为结论依据。"
 )
 
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "scene.schema.json"
-
-FEATURES_SQL = text(
+KEYWORD_VOLUMES_SQL = text(
     """
     SELECT scene, marketplace_id, year, week_num, start_date, VOL,
            wow, yoy, wow_sa, slope8, breadth_wow_pos, breadth_yoy_pos, HHI_kw,
@@ -54,17 +52,27 @@ FEATURES_SQL = text(
     WHERE scene = :scene AND marketplace_id = :mk
     ORDER BY year, week_num
     """
-)
+).bindparams(bindparam("keywords", expanding=True))
 
-DRIVERS_SQL = text(
+KEYWORD_VOLUMES_SQL = text(
     """
-    SELECT scene, marketplace_id, year, week_num, start_date, horizon, direction,
-           keyword, contrib, vol_delta, rank_delta, clickShare_delta,
-           conversionShare_delta, is_new_kw
-    FROM bi_amz_scene_drivers
-    WHERE scene = :scene AND marketplace_id = :mk AND (year * 100 + week_num) = :yearweek
+    SELECT keyword_norm, year, week_num, startDate, vol
+    FROM bi_amz_vw_kw_week
+    WHERE marketplace_id = :mk
+      AND keyword_norm IN :keywords
+      AND startDate BETWEEN :start_min AND :start_max
+    ORDER BY keyword_norm, year, week_num
     """
-)
+).bindparams(bindparam("keywords", expanding=True))
+
+KEYWORD_VOLUMES_SQL_TEMPLATE = """
+    SELECT keyword_norm, year, week_num, startDate, vol
+    FROM bi_amz_vw_kw_week
+    WHERE marketplace_id = :mk
+      AND keyword_norm IN ({keywords})
+      AND startDate BETWEEN :start_min AND :start_max
+    ORDER BY keyword_norm, year, week_num
+"""
 
 KEYWORD_VOLUMES_SQL = (
     text(
@@ -139,6 +147,28 @@ def _row_to_scene_record(row: pd.Series) -> dict[str, object]:
         "vol": vol,
     }
 
+def _row_to_scene_record(row: pd.Series) -> dict[str, object]:
+    start = row.get("start_date")
+    if isinstance(start, pd.Timestamp):
+        start = start.date()
+    if not isinstance(start, date):
+        raise ValueError("start_date must be datetime.date for scene features")
+    vol = _to_volume(row.get("VOL"))
+    iso = start.isocalendar()
+    try:
+        year = int(row.get("year"))
+    except (TypeError, ValueError):
+        year = int(iso[0])
+    try:
+        week = int(row.get("week_num"))
+    except (TypeError, ValueError):
+        week = int(iso[1])
+    return {
+        "year": year,
+        "week_num": week,
+        "start_date": start.isoformat(),
+        "vol": vol,
+    }
 
 def _lookup_feature_row(features: pd.DataFrame, target: date) -> pd.Series | None:
     if features.empty:
