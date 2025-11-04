@@ -45,6 +45,29 @@ DRIVERS_SQL = text(
     """
 )
 
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "scene.schema.json"
+
+FEATURES_SQL = text(
+    """
+    SELECT scene, marketplace_id, year, week_num, start_date, VOL, wow, yoy, wow_sa, slope8,
+           breadth_wow_pos, breadth_yoy_pos, HHI_kw, volatility_8w, coverage,
+           new_kw_share, strength_bucket, forecast_p10, forecast_p50, forecast_p90, confidence
+    FROM bi_amz_scene_features
+    WHERE scene = :scene AND marketplace_id = :mk
+    ORDER BY year, week_num
+    """
+)
+
+DRIVERS_SQL = text(
+    """
+    SELECT scene, marketplace_id, year, week_num, start_date, horizon, direction,
+           keyword, contrib, vol_delta, rank_delta, clickShare_delta,
+           conversionShare_delta, is_new_kw
+    FROM bi_amz_scene_drivers
+    WHERE scene = :scene AND marketplace_id = :mk AND (year * 100 + week_num) = :yearweek
+    """
+)
+
 
 @dataclass(slots=True)
 class SceneSummaryPayload:
