@@ -74,6 +74,20 @@ KEYWORD_VOLUMES_SQL_TEMPLATE = """
     ORDER BY keyword_norm, year, week_num
 """
 
+KEYWORD_VOLUMES_SQL = (
+    text(
+        """
+        SELECT keyword_norm, year, week_num, startDate, vol
+        FROM bi_amz_vw_kw_week
+        WHERE marketplace_id = :mk
+          AND keyword_norm IN :keywords
+          AND startDate BETWEEN :start_min AND :start_max
+        ORDER BY keyword_norm, year, week_num
+        """
+    )
+    .bindparams(bindparam("keywords", expanding=True))
+)
+
 
 @dataclass(slots=True)
 class SceneSummaryPayload:
@@ -133,6 +147,28 @@ def _row_to_scene_record(row: pd.Series) -> dict[str, object]:
         "vol": vol,
     }
 
+def _row_to_scene_record(row: pd.Series) -> dict[str, object]:
+    start = row.get("start_date")
+    if isinstance(start, pd.Timestamp):
+        start = start.date()
+    if not isinstance(start, date):
+        raise ValueError("start_date must be datetime.date for scene features")
+    vol = _to_volume(row.get("VOL"))
+    iso = start.isocalendar()
+    try:
+        year = int(row.get("year"))
+    except (TypeError, ValueError):
+        year = int(iso[0])
+    try:
+        week = int(row.get("week_num"))
+    except (TypeError, ValueError):
+        week = int(iso[1])
+    return {
+        "year": year,
+        "week_num": week,
+        "start_date": start.isoformat(),
+        "vol": vol,
+    }
 
 def _lookup_feature_row(features: pd.DataFrame, target: date) -> pd.Series | None:
     if features.empty:
@@ -249,20 +285,14 @@ def _fetch_keyword_volumes(
         return pd.DataFrame(columns=["keyword_norm", "year", "week_num", "startDate", "vol"])
     start_min = min(dates)
     start_max = max(dates)
-    placeholders = ", ".join(f":kw_{idx}" for idx in range(len(unique_keywords)))
-    statement = text(
-        KEYWORD_VOLUMES_SQL_TEMPLATE.format(
-            keywords=placeholders,
-        )
-    )
     params = {
         "mk": mk,
         "start_min": start_min.isoformat(),
         "start_max": start_max.isoformat(),
+        "keywords": unique_keywords,
     }
-    params.update({f"kw_{idx}": value for idx, value in enumerate(unique_keywords)})
     frame = pd.read_sql_query(
-        statement,
+        KEYWORD_VOLUMES_SQL,
         conn,
         params=params,
     )
