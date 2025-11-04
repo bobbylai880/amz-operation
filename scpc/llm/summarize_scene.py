@@ -48,8 +48,7 @@ FEATURES_SQL = text(
 DRIVERS_SQL = text(
     """
     SELECT scene, marketplace_id, year, week_num, start_date, horizon, direction,
-           keyword, contrib, vol_delta, rank_delta, clickShare_delta,
-           conversionShare_delta, is_new_kw
+           keyword, contrib
     FROM bi_amz_scene_drivers
     WHERE scene = :scene AND marketplace_id = :mk AND (year * 100 + week_num) = :yearweek
     """
