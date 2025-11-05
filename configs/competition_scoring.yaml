@@ -1,0 +1,52 @@
+# 竞对模块使用的 Sigmoid 评分配置。
+#
+# 本配置中的数值参数复刻 Doris 历史表
+# `bi_amz_comp_scoring_rule`，默认情况下保持 ETL 输出一致。
+# 每组规则定义特征差异的 Sigmoid 参数（theta/k）以及
+# 在最终竞争压力得分中的相对权重。
+#
+# theta：Sigmoid 曲线的水平平移。正值表示
+#         当特征差异超过阈值前推迟惩罚。
+# k：Sigmoid 的斜率，数值越大响应越陡峭。
+# weight：该特征在加权求和中的贡献（需合计为 1.0）。
+#
+# band_cuts 将加权得分映射为离散的竞争强度分档。
+# 调整这些阈值即可重新划分竞争强度等级，
+# 无需改动应用代码。
+rule_sets:
+  default:
+    description: >-
+      周度竞对报告的基准参数。复刻 Doris 规则表 `bi_amz_comp_scoring_rule`，保持历史行为一致。
+    features:
+      price:
+        description: "与竞品的价格差（我方价格减去对方价格）。"
+        theta: 0.0
+        k: 1.5
+        weight: 0.30
+      rank:
+        description: "自然排名的百分位（排名越低越强）。"
+        theta: 0.0
+        k: 6.0
+        weight: 0.25
+      content:
+        description: "内容质量差距（综合图片、视频、要点和 A+）。"
+        theta: 0.0
+        k: 5.0
+        weight: 0.20
+      social:
+        description: "社交证明差异（来源于评分 × 评论量）。"
+        theta: 0.0
+        k: 4.0
+        weight: 0.15
+      badge:
+        description: "营销徽章差异（如 Best Seller、Amazon's Choice 等）。"
+        theta: 0.0
+        k: 3.0
+        weight: 0.10
+    band_cuts:
+      description: "将加权得分映射为强度分档的阈值。"
+      values:
+        C1: 0.25
+        C2: 0.50
+        C3: 0.75
+        C4: 1.00
