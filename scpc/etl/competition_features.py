@@ -368,8 +368,11 @@ class CompetitionTables:
     """Structured artefacts mirroring Doris competition tables."""
 
     entities: pd.DataFrame
+    traffic_entities: pd.DataFrame
     pairs: pd.DataFrame
+    traffic_pairs: pd.DataFrame
     pairs_each: pd.DataFrame
+    traffic_pairs_each: pd.DataFrame
     delta: pd.DataFrame
     summary: pd.DataFrame
 
@@ -1047,17 +1050,21 @@ def build_competition_pairs(
     rule_name: str = "default",
     traffic_scoring: Mapping[str, Any] | None = None,
     traffic_rule_name: str = "default_traffic",
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Generate pairwise comparison rows for leader and median competitors."""
 
     if entities.empty:
-        return pd.DataFrame(columns=_pair_columns())
+        return (
+            pd.DataFrame(columns=_pair_columns()),
+            pd.DataFrame(columns=_traffic_pair_columns()),
+        )
 
     feature_rules, band_cuts = _prepare_scoring_rules(scoring_rules, rule_name)
     traffic_context = _prepare_traffic_scoring(traffic_scoring, traffic_rule_name)
 
     group_cols = ["scene_tag", "base_scene", "morphology", "marketplace_id", "week", "sunday"]
-    records: list[dict[str, Any]] = []
+    page_records: list[dict[str, Any]] = []
+    traffic_records: list[dict[str, Any]] = []
 
     for _, group in entities.groupby(group_cols, dropna=False):
         mine = group.loc[group["hyy_asin"] == 1]
@@ -1084,7 +1091,7 @@ def build_competition_pairs(
 
         for _, my_row in mine.iterrows():
             for opp_type, opp_row in (("leader", leader), ("median", median)):
-                record = _compute_pair_row(
+                page_record, traffic_metrics = _compute_pair_row(
                     my_row,
                     opp_row,
                     opp_type=opp_type,
@@ -1096,11 +1103,24 @@ def build_competition_pairs(
                     traffic_context=traffic_context,
                     traffic_median=traffic_median,
                 )
-                records.append(record)
+                traffic_record = _build_traffic_pair_record(
+                    my_row,
+                    opp_row,
+                    opp_type=opp_type,
+                    metrics=traffic_metrics,
+                )
+                page_records.append(page_record)
+                traffic_records.append(traffic_record)
 
-    if not records:
-        return pd.DataFrame(columns=_pair_columns())
-    return pd.DataFrame.from_records(records, columns=_pair_columns())
+    if not page_records:
+        return (
+            pd.DataFrame(columns=_pair_columns()),
+            pd.DataFrame(columns=_traffic_pair_columns()),
+        )
+
+    pairs_df = pd.DataFrame.from_records(page_records, columns=_pair_columns())
+    traffic_df = pd.DataFrame.from_records(traffic_records, columns=_traffic_pair_columns())
+    return pairs_df, traffic_df
 
 
 def build_competition_pairs_each(
@@ -1110,17 +1130,21 @@ def build_competition_pairs_each(
     rule_name: str = "default",
     traffic_scoring: Mapping[str, Any] | None = None,
     traffic_rule_name: str = "default_traffic",
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Generate one-to-one competition records for every opposing ASIN."""
 
     if entities.empty:
-        return pd.DataFrame(columns=_pair_each_columns())
+        return (
+            pd.DataFrame(columns=_pair_each_columns()),
+            pd.DataFrame(columns=_traffic_pair_each_columns()),
+        )
 
     feature_rules, band_cuts = _prepare_scoring_rules(scoring_rules, rule_name)
     traffic_context = _prepare_traffic_scoring(traffic_scoring, traffic_rule_name)
 
     group_cols = ["scene_tag", "base_scene", "morphology", "marketplace_id", "week", "sunday"]
-    records: list[dict[str, Any]] = []
+    page_records: list[dict[str, Any]] = []
+    traffic_records: list[dict[str, Any]] = []
 
     for _, group in entities.groupby(group_cols, dropna=False):
         mine = group.loc[group["hyy_asin"] == 1]
@@ -1132,7 +1156,7 @@ def build_competition_pairs_each(
 
         for _, my_row in mine.iterrows():
             for _, opp_row in competitors.iterrows():
-                record = _compute_pair_each_row(
+                page_record, traffic_metrics = _compute_pair_each_row(
                     my_row,
                     opp_row,
                     feature_rules=feature_rules,
@@ -1140,11 +1164,25 @@ def build_competition_pairs_each(
                     traffic_context=traffic_context,
                     traffic_median=traffic_median,
                 )
-                records.append(record)
+                traffic_record = _build_traffic_pair_each_record(
+                    my_row,
+                    opp_row,
+                    traffic_metrics,
+                )
+                page_records.append(page_record)
+                traffic_records.append(traffic_record)
 
-    if not records:
-        return pd.DataFrame(columns=_pair_each_columns())
-    return pd.DataFrame.from_records(records, columns=_pair_each_columns())
+    if not page_records:
+        return (
+            pd.DataFrame(columns=_pair_each_columns()),
+            pd.DataFrame(columns=_traffic_pair_each_columns()),
+        )
+
+    pairs_each_df = pd.DataFrame.from_records(page_records, columns=_pair_each_columns())
+    traffic_pairs_each_df = pd.DataFrame.from_records(
+        traffic_records, columns=_traffic_pair_each_columns()
+    )
+    return pairs_each_df, traffic_pairs_each_df
 
 
 def build_competition_delta(
@@ -1295,22 +1333,6 @@ def build_competition_delta(
                 current.get("kw_attribute_share_gap"),
                 previous.get("kw_attribute_share_gap") if previous is not None else None,
             ),
-            "d_t_score_mix": _diff_float(
-                current.get("t_score_mix"),
-                previous.get("t_score_mix") if previous is not None else None,
-            ),
-            "d_t_score_kw": _diff_float(
-                current.get("t_score_kw"),
-                previous.get("t_score_kw") if previous is not None else None,
-            ),
-            "d_t_pressure": _diff_float(
-                current.get("t_pressure"),
-                previous.get("t_pressure") if previous is not None else None,
-            ),
-            "d_t_confidence": _diff_float(
-                current.get("t_confidence"),
-                previous.get("t_confidence") if previous is not None else None,
-            ),
         }
         rows.append(row)
 
@@ -1320,6 +1342,7 @@ def build_competition_delta(
 def summarise_competition_scene(
     *,
     pairs_current: pd.DataFrame,
+    traffic_pairs_current: pd.DataFrame,
     delta_window: pd.DataFrame,
     entities_current: pd.DataFrame,
     entities_previous: pd.DataFrame,
@@ -1331,6 +1354,7 @@ def summarise_competition_scene(
 
     summary_stats = _build_summary(
         pairs_current=pairs_current,
+        traffic_pairs_current=traffic_pairs_current,
         delta_window=delta_window,
         entities_current=entities_current,
         entities_previous=entities_previous,
@@ -1380,14 +1404,21 @@ def build_competition_tables(
         scene_tags=scene_tags,
         traffic=traffic,
     )
-    pairs = build_competition_pairs(
+    traffic_entity_cols = [col for col in _traffic_entity_columns() if col in entities.columns]
+    traffic_entities = (
+        entities.loc[:, traffic_entity_cols].copy()
+        if traffic_entity_cols
+        else entities.iloc[0:0].copy()
+    )
+
+    pairs, traffic_pairs = build_competition_pairs(
         entities,
         scoring_rules=scoring_rules,
         rule_name=rule_name,
         traffic_scoring=traffic_scoring,
         traffic_rule_name=traffic_rule_name,
     )
-    pairs_each = build_competition_pairs_each(
+    pairs_each, traffic_pairs_each = build_competition_pairs_each(
         entities,
         scoring_rules=scoring_rules,
         rule_name=rule_name,
@@ -1400,13 +1431,36 @@ def build_competition_tables(
         target_weeks.add(previous_week)
 
     pairs_subset = pairs.loc[pairs["week"].isin(target_weeks)].copy() if not pairs.empty else pairs
+    traffic_pairs_subset = (
+        traffic_pairs.loc[traffic_pairs["week"].isin(target_weeks)].copy()
+        if not traffic_pairs.empty
+        else traffic_pairs
+    )
     pairs_each_subset = (
         pairs_each.loc[pairs_each["week"].isin(target_weeks)].copy() if not pairs_each.empty else pairs_each
     )
-    entities_subset = entities.loc[entities["week"].isin(target_weeks)].copy() if not entities.empty else entities
+    traffic_pairs_each_subset = (
+        traffic_pairs_each.loc[traffic_pairs_each["week"].isin(target_weeks)].copy()
+        if not traffic_pairs_each.empty
+        else traffic_pairs_each
+    )
+    entities_subset = (
+        entities.loc[entities["week"].isin(target_weeks)].copy()
+        if not entities.empty
+        else entities
+    )
+    traffic_entities_subset = (
+        traffic_entities.loc[traffic_entities["week"].isin(target_weeks)].copy()
+        if not traffic_entities.empty
+        else traffic_entities
+    )
 
     pairs_current = _filter_week(pairs_subset, week)
     pairs_previous = _filter_week(pairs_subset, previous_week) if previous_week else pairs_subset.iloc[0:0]
+    traffic_pairs_current = _filter_week(traffic_pairs_subset, week)
+    traffic_pairs_previous = (
+        _filter_week(traffic_pairs_subset, previous_week) if previous_week else traffic_pairs_subset.iloc[0:0]
+    )
 
     deltas = build_competition_delta(
         entities_subset,
@@ -1418,6 +1472,7 @@ def build_competition_tables(
 
     summary = summarise_competition_scene(
         pairs_current=pairs_current,
+        traffic_pairs_current=traffic_pairs_current,
         delta_window=deltas,
         entities_current=_filter_week(entities_subset, week),
         entities_previous=_filter_week(entities_subset, previous_week) if previous_week else entities_subset.iloc[0:0],
@@ -1425,8 +1480,11 @@ def build_competition_tables(
 
     return CompetitionTables(
         entities=entities_subset,
+        traffic_entities=traffic_entities_subset,
         pairs=pairs_subset,
+        traffic_pairs=traffic_pairs_subset,
         pairs_each=pairs_each_subset,
+        traffic_pairs_each=traffic_pairs_each_subset,
         delta=deltas,
         summary=summary,
     )
@@ -1436,8 +1494,11 @@ def compute_competition_features(
     snapshots: pd.DataFrame | None = None,
     *,
     entities: pd.DataFrame | None = None,
+    traffic_entities: pd.DataFrame | None = None,
     pairs: pd.DataFrame | None = None,
+    traffic_pairs: pd.DataFrame | None = None,
     pairs_each: pd.DataFrame | None = None,
+    traffic_pairs_each: pd.DataFrame | None = None,
     deltas: pd.DataFrame | None = None,
     week: str,
     previous_week: str | None = None,
@@ -1467,15 +1528,29 @@ def compute_competition_features(
             traffic_rule_name=traffic_rule_name,
         )
         entities = tables.entities
+        traffic_entities = tables.traffic_entities
         pairs = tables.pairs
+        traffic_pairs = tables.traffic_pairs
         pairs_each = tables.pairs_each
+        traffic_pairs_each = tables.traffic_pairs_each
         deltas = tables.delta
 
-    if entities is None or pairs is None or deltas is None or pairs_each is None:
-        raise ValueError("entities, pairs, pairs_each, and deltas must be provided")
+    if (
+        entities is None
+        or traffic_entities is None
+        or pairs is None
+        or traffic_pairs is None
+        or deltas is None
+        or pairs_each is None
+        or traffic_pairs_each is None
+    ):
+        raise ValueError(
+            "entities, traffic_entities, pairs, traffic_pairs, pairs_each, traffic_pairs_each, and deltas must be provided"
+        )
 
     pairs_current = _filter_week(pairs, week)
     pairs_each_current = _filter_week(pairs_each, week)
+    traffic_pairs_current = _filter_week(traffic_pairs, week)
     metadata = _extract_metadata(pairs_current, week)
 
     if previous_week:
@@ -1505,7 +1580,6 @@ def compute_competition_features(
                 "pressure_p50": None,
                 "pressure_p90": None,
                 "confidence_p50": None,
-                "coverage_p50": None,
                 "lagging_pairs": 0,
                 "avg_mix_gap": None,
                 "avg_keyword_gap": None,
@@ -1521,8 +1595,22 @@ def compute_competition_features(
 
     entities_current = _filter_week(entities, week)
     entities_previous = _filter_week(entities, previous_week) if previous_week else entities.iloc[0:0]
+    traffic_entities_current = _filter_week(traffic_entities, week)
+    traffic_entities_previous = (
+        _filter_week(traffic_entities, previous_week) if previous_week else traffic_entities.iloc[0:0]
+    )
     pairs_previous = _filter_week(pairs, previous_week) if previous_week else pairs.iloc[0:0]
     pairs_each_previous = _filter_week(pairs_each, previous_week) if previous_week else pairs_each.iloc[0:0]
+    traffic_pairs_previous = (
+        _filter_week(traffic_pairs, previous_week) if previous_week else traffic_pairs.iloc[0:0]
+    )
+    traffic_pairs_each_current = _filter_week(traffic_pairs_each, week)
+    traffic_pairs_each_previous = (
+        _filter_week(traffic_pairs_each, previous_week)
+        if previous_week
+        else traffic_pairs_each.iloc[0:0]
+    )
+    traffic_context = _prepare_traffic_scoring(traffic_scoring, traffic_rule_name)
 
     if previous_week:
         metadata["previous_sunday"] = _extract_first_date(pairs_previous, "sunday") or _extract_first_date(
@@ -1536,6 +1624,22 @@ def compute_competition_features(
         (row["my_asin"], row["opp_asin"]): row
         for _, row in pairs_each_current.iterrows()
     }
+    traffic_pair_lookup = {
+        (row["my_asin"], row.get("opp_asin"), row["opp_type"]): row
+        for _, row in traffic_pairs_current.iterrows()
+    }
+    traffic_pair_prev_lookup = {
+        (row["my_asin"], row.get("opp_asin"), row["opp_type"]): row
+        for _, row in traffic_pairs_previous.iterrows()
+    }
+    traffic_pair_each_lookup = {
+        (row["my_asin"], row["opp_asin"]): row
+        for _, row in traffic_pairs_each_current.iterrows()
+    }
+    traffic_pair_each_prev_lookup = {
+        (row["my_asin"], row["opp_asin"]): row
+        for _, row in traffic_pairs_each_previous.iterrows()
+    }
     for row in pairs_current.itertuples(index=False):
         prev_row = _match_previous_pair(pairs_previous, row)
         delta_row = _match_delta(delta_window, row)
@@ -1544,6 +1648,11 @@ def compute_competition_features(
         opp_current = _lookup_entity(entities_current, row.opp_asin)
         opp_previous = _lookup_entity(entities_previous, row.opp_asin)
         pair_each_row = pair_each_lookup.get((row.my_asin, getattr(row, "opp_asin", None)))
+        traffic_key = (row.my_asin, getattr(row, "opp_asin", None), row.opp_type)
+        traffic_row = traffic_pair_lookup.get(traffic_key)
+        traffic_prev_row = traffic_pair_prev_lookup.get(traffic_key)
+        traffic_pair_each_row = traffic_pair_each_lookup.get((row.my_asin, getattr(row, "opp_asin", None)))
+        traffic_pair_each_prev = traffic_pair_each_prev_lookup.get((row.my_asin, getattr(row, "opp_asin", None)))
 
         pair_features.append(
             _build_pair_feature(
@@ -1555,11 +1664,17 @@ def compute_competition_features(
                 opp_current=opp_current,
                 opp_previous=opp_previous,
                 pair_each_row=pair_each_row,
+                traffic_row=traffic_row,
+                traffic_prev_row=traffic_prev_row,
+                traffic_context=traffic_context,
+                traffic_pair_each_row=traffic_pair_each_row,
+                traffic_pair_each_prev=traffic_pair_each_prev,
             )
         )
 
     summary = _build_summary(
         pairs_current=pairs_current,
+        traffic_pairs_current=traffic_pairs_current,
         delta_window=delta_window,
         entities_current=entities_current,
         entities_previous=entities_previous,
@@ -1568,6 +1683,9 @@ def compute_competition_features(
     top_opponents = _build_top_opponents(
         pairs_each_current=pairs_each_current,
         pairs_each_previous=pairs_each_previous,
+        traffic_pairs_each_current=traffic_pairs_each_current,
+        traffic_pairs_each_previous=traffic_pairs_each_previous,
+        traffic_context=traffic_context,
     )
 
     return CompetitionFeatureResult(
@@ -1746,12 +1864,14 @@ def _compute_traffic_metrics(
         "kw_hhi_gap": kw_hhi_gap,
     }
 
-    mix_scores: dict[str, float | None] = {}
-    for name, value in mix_values.items():
-        mix_scores[name] = _score_feature(value, context.mix_rules.get(name))
-    keyword_scores: dict[str, float | None] = {}
-    for name, value in keyword_values.items():
-        keyword_scores[name] = _score_feature(value, context.keyword_rules.get(name))
+    mix_scores = {
+        name: _score_feature(value, context.mix_rules.get(name))
+        for name, value in mix_values.items()
+    }
+    keyword_scores = {
+        name: _score_feature(value, context.keyword_rules.get(name))
+        for name, value in keyword_values.items()
+    }
 
     mix_available = [
         (score, context.mix_rules.get(name, {}).get("weight", 0.0))
@@ -1821,7 +1941,7 @@ def _compute_traffic_metrics(
     t_band = _assign_band(t_pressure, context.band_cuts) if t_pressure is not None else None
 
     return {
-        "ad_ratio_gap": ad_ratio_gap,
+        "ad_ratio_gap_leader": ad_ratio_gap,
         "ad_ratio_index_med": ad_ratio_index,
         "ad_to_natural_gap": ad_to_natural_gap,
         "sp_share_in_ad_gap": sp_share_gap,
@@ -1840,12 +1960,7 @@ def _compute_traffic_metrics(
         "t_score_kw": keyword_pressure,
         "t_pressure": t_pressure,
         "t_intensity_band": t_band,
-        "t_mix_confidence": mix_confidence,
-        "t_keyword_confidence": keyword_confidence,
-        "t_coverage_ratio": coverage_ratio,
         "t_confidence": t_confidence,
-        "t_mix_scores": mix_scores,
-        "t_keyword_scores": keyword_scores,
     }
 def _compute_pair_each_row(
     my_row: Mapping[str, Any],
@@ -1855,7 +1970,7 @@ def _compute_pair_each_row(
     band_cuts: dict[str, float],
     traffic_context: TrafficScoringContext,
     traffic_median: Mapping[str, float | None],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     my_badges = _normalise_badges(my_row.get("badge_json"))
     opp_badges = _normalise_badges(opp_row.get("badge_json"))
 
@@ -1906,10 +2021,6 @@ def _compute_pair_each_row(
         context=traffic_context,
     )
 
-    traffic_gap = _extract_traffic_gap(traffic_metrics)
-    traffic_scores = _extract_traffic_scores(traffic_metrics)
-    traffic_confidence = _extract_traffic_confidence(traffic_metrics)
-
     record = {
         "scene_tag": my_row.get("scene_tag"),
         "base_scene": my_row.get("base_scene"),
@@ -1950,8 +2061,7 @@ def _compute_pair_each_row(
         "traffic_scores": traffic_scores,
         "traffic_confidence": traffic_confidence,
     }
-    record.update(traffic_metrics)
-    return record
+    return record, traffic_metrics
 
 
 def _compute_pair_row(
@@ -1966,7 +2076,7 @@ def _compute_pair_row(
     band_cuts: dict[str, float],
     traffic_context: TrafficScoringContext,
     traffic_median: Mapping[str, float | None],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     my_badges = _normalise_badges(my_row.get("badge_json"))
     opp_badges = _normalise_badges(opp_row.get("badge_json"))
     price_gap = _diff_float(my_row.get("price_current"), opp_row.get("price_current"))
@@ -2003,10 +2113,6 @@ def _compute_pair_row(
         context=traffic_context,
     )
 
-    traffic_gap = _extract_traffic_gap(traffic_metrics)
-    traffic_scores = _extract_traffic_scores(traffic_metrics)
-    traffic_confidence = _extract_traffic_confidence(traffic_metrics)
-
     record = {
         "scene_tag": my_row.get("scene_tag"),
         "base_scene": my_row.get("base_scene"),
@@ -2039,8 +2145,7 @@ def _compute_pair_row(
         "traffic_scores": traffic_scores,
         "traffic_confidence": traffic_confidence,
     }
-    record.update(traffic_metrics)
-    return record
+    return record, traffic_metrics
 
 
 def _safe_ratio(numerator: Any, denominator: Any) -> float | None:
@@ -2132,11 +2237,11 @@ def _pair_columns() -> list[str]:
         "marketplace_id",
         "week",
         "sunday",
-        "my_parent_asin",
         "my_asin",
         "opp_type",
-        "opp_parent_asin",
+        "my_parent_asin",
         "opp_asin",
+        "opp_parent_asin",
         "price_index_med",
         "price_gap_leader",
         "price_z",
@@ -2192,10 +2297,10 @@ def _pair_each_columns() -> list[str]:
         "marketplace_id",
         "week",
         "sunday",
-        "my_parent_asin",
         "my_asin",
-        "opp_parent_asin",
         "opp_asin",
+        "opp_parent_asin",
+        "my_parent_asin",
         "my_price_net",
         "opp_price_net",
         "my_rank_leaf",
@@ -2252,6 +2357,205 @@ def _pair_each_columns() -> list[str]:
     ]
 
 
+def _traffic_pair_columns() -> list[str]:
+    return [
+        "scene_tag",
+        "base_scene",
+        "morphology",
+        "marketplace_id",
+        "week",
+        "sunday",
+        "my_asin",
+        "opp_type",
+        "my_parent_asin",
+        "opp_parent_asin",
+        "opp_asin",
+        "ad_ratio_gap_leader",
+        "ad_ratio_index_med",
+        "ad_to_natural_gap",
+        "sp_share_in_ad_gap",
+        "sbv_share_in_ad_gap",
+        "sb_share_in_ad_gap",
+        "kw_entropy_gap",
+        "kw_hhi_gap",
+        "kw_top1_share_gap",
+        "kw_top3_share_gap",
+        "kw_top10_share_gap",
+        "kw_brand_share_gap",
+        "kw_competitor_share_gap",
+        "kw_generic_share_gap",
+        "kw_attribute_share_gap",
+        "t_score_mix",
+        "t_score_kw",
+        "t_pressure",
+        "t_intensity_band",
+        "t_confidence",
+    ]
+
+
+def _traffic_pair_each_columns() -> list[str]:
+    return [
+        "scene_tag",
+        "base_scene",
+        "morphology",
+        "marketplace_id",
+        "week",
+        "sunday",
+        "my_asin",
+        "opp_asin",
+        "my_parent_asin",
+        "opp_parent_asin",
+        "my_ad_ratio",
+        "opp_ad_ratio",
+        "my_nf_ratio",
+        "opp_nf_ratio",
+        "my_recommend_ratio",
+        "opp_recommend_ratio",
+        "my_sp_share_in_ad",
+        "opp_sp_share_in_ad",
+        "my_sbv_share_in_ad",
+        "opp_sbv_share_in_ad",
+        "my_sb_share_in_ad",
+        "opp_sb_share_in_ad",
+        "my_ad_to_natural",
+        "opp_ad_to_natural",
+        "ad_ratio_gap_each",
+        "ad_to_natural_gap_each",
+        "sp_share_gap_each",
+        "sbv_share_gap_each",
+        "sb_share_gap_each",
+        "my_kw_entropy_7d_avg",
+        "opp_kw_entropy_7d_avg",
+        "my_kw_hhi_7d_avg",
+        "opp_kw_hhi_7d_avg",
+        "my_kw_top3_share_7d_avg",
+        "opp_kw_top3_share_7d_avg",
+        "my_kw_brand_share_7d_avg",
+        "opp_kw_brand_share_7d_avg",
+        "my_kw_competitor_share_7d_avg",
+        "opp_kw_competitor_share_7d_avg",
+        "t_score_mix",
+        "t_score_kw",
+        "t_pressure",
+        "t_intensity_band",
+        "t_confidence",
+    ]
+
+
+def _traffic_entity_columns() -> list[str]:
+    return [
+        "scene_tag",
+        "base_scene",
+        "morphology",
+        "marketplace_id",
+        "week",
+        "sunday",
+        "asin",
+        "parent_asin",
+        "hyy_asin",
+        "ad_ratio",
+        "nf_ratio",
+        "recommend_ratio",
+        "sp_ratio",
+        "sbv_ratio",
+        "sb_ratio",
+        "sp_share_in_ad",
+        "sbv_share_in_ad",
+        "sb_share_in_ad",
+        "ad_to_natural",
+        "kw_entropy_7d_avg",
+        "kw_hhi_7d_avg",
+        "kw_top1_share_7d_avg",
+        "kw_top3_share_7d_avg",
+        "kw_top10_share_7d_avg",
+        "kw_brand_share_7d_avg",
+        "kw_competitor_share_7d_avg",
+        "kw_generic_share_7d_avg",
+        "kw_attribute_share_7d_avg",
+    ]
+
+
+def _build_traffic_pair_record(
+    my_row: Mapping[str, Any],
+    opp_row: Mapping[str, Any],
+    *,
+    opp_type: str,
+    metrics: Mapping[str, Any],
+) -> dict[str, Any]:
+    record = {
+        "scene_tag": my_row.get("scene_tag"),
+        "base_scene": my_row.get("base_scene"),
+        "morphology": my_row.get("morphology"),
+        "marketplace_id": my_row.get("marketplace_id"),
+        "week": my_row.get("week"),
+        "sunday": my_row.get("sunday"),
+        "my_asin": my_row.get("asin"),
+        "opp_type": opp_type,
+        "my_parent_asin": my_row.get("parent_asin"),
+        "opp_parent_asin": opp_row.get("parent_asin"),
+        "opp_asin": opp_row.get("asin"),
+    }
+    for key in metrics:
+        value = metrics.get(key)
+        if key == "t_intensity_band":
+            record[key] = value
+        else:
+            record[key] = _clean_float(value)
+    return record
+
+
+def _build_traffic_pair_each_record(
+    my_row: Mapping[str, Any],
+    opp_row: Mapping[str, Any],
+    metrics: Mapping[str, Any],
+) -> dict[str, Any]:
+    record = {
+        "scene_tag": my_row.get("scene_tag"),
+        "base_scene": my_row.get("base_scene"),
+        "morphology": my_row.get("morphology"),
+        "marketplace_id": my_row.get("marketplace_id"),
+        "week": my_row.get("week"),
+        "sunday": my_row.get("sunday"),
+        "my_asin": my_row.get("asin"),
+        "opp_asin": opp_row.get("asin"),
+        "my_parent_asin": my_row.get("parent_asin"),
+        "opp_parent_asin": opp_row.get("parent_asin"),
+        "my_ad_ratio": _clean_float(my_row.get("ad_ratio")),
+        "opp_ad_ratio": _clean_float(opp_row.get("ad_ratio")),
+        "my_nf_ratio": _clean_float(my_row.get("nf_ratio")),
+        "opp_nf_ratio": _clean_float(opp_row.get("nf_ratio")),
+        "my_recommend_ratio": _clean_float(my_row.get("recommend_ratio")),
+        "opp_recommend_ratio": _clean_float(opp_row.get("recommend_ratio")),
+        "my_sp_share_in_ad": _clean_float(my_row.get("sp_share_in_ad")),
+        "opp_sp_share_in_ad": _clean_float(opp_row.get("sp_share_in_ad")),
+        "my_sbv_share_in_ad": _clean_float(my_row.get("sbv_share_in_ad")),
+        "opp_sbv_share_in_ad": _clean_float(opp_row.get("sbv_share_in_ad")),
+        "my_sb_share_in_ad": _clean_float(my_row.get("sb_share_in_ad")),
+        "opp_sb_share_in_ad": _clean_float(opp_row.get("sb_share_in_ad")),
+        "my_ad_to_natural": _clean_float(my_row.get("ad_to_natural")),
+        "opp_ad_to_natural": _clean_float(opp_row.get("ad_to_natural")),
+        "ad_ratio_gap_each": _clean_float(metrics.get("ad_ratio_gap_leader")),
+        "ad_to_natural_gap_each": _clean_float(metrics.get("ad_to_natural_gap")),
+        "sp_share_gap_each": _clean_float(metrics.get("sp_share_in_ad_gap")),
+        "sbv_share_gap_each": _clean_float(metrics.get("sbv_share_in_ad_gap")),
+        "sb_share_gap_each": _clean_float(metrics.get("sb_share_in_ad_gap")),
+        "my_kw_entropy_7d_avg": _clean_float(my_row.get("kw_entropy_7d_avg")),
+        "opp_kw_entropy_7d_avg": _clean_float(opp_row.get("kw_entropy_7d_avg")),
+        "my_kw_hhi_7d_avg": _clean_float(my_row.get("kw_hhi_7d_avg")),
+        "opp_kw_hhi_7d_avg": _clean_float(opp_row.get("kw_hhi_7d_avg")),
+        "my_kw_top3_share_7d_avg": _clean_float(my_row.get("kw_top3_share_7d_avg")),
+        "opp_kw_top3_share_7d_avg": _clean_float(opp_row.get("kw_top3_share_7d_avg")),
+        "my_kw_brand_share_7d_avg": _clean_float(my_row.get("kw_brand_share_7d_avg")),
+        "opp_kw_brand_share_7d_avg": _clean_float(opp_row.get("kw_brand_share_7d_avg")),
+        "my_kw_competitor_share_7d_avg": _clean_float(my_row.get("kw_competitor_share_7d_avg")),
+        "opp_kw_competitor_share_7d_avg": _clean_float(opp_row.get("kw_competitor_share_7d_avg")),
+    }
+    for key in ("t_score_mix", "t_score_kw", "t_pressure", "t_confidence"):
+        record[key] = _clean_float(metrics.get(key))
+    record["t_intensity_band"] = metrics.get("t_intensity_band")
+    return record
+
+
 def _delta_columns() -> list[str]:
     return [
         "scene_tag",
@@ -2259,13 +2563,13 @@ def _delta_columns() -> list[str]:
         "morphology",
         "marketplace_id",
         "window_id",
+        "my_asin",
+        "opp_type",
         "week_w0",
         "sunday_w0",
         "week_w1",
         "sunday_w1",
         "my_parent_asin",
-        "my_asin",
-        "opp_type",
         "d_price_net",
         "d_rank_score",
         "d_social_proof",
@@ -2414,20 +2718,35 @@ def _build_pair_feature(
     opp_current: dict[str, Any] | None,
     opp_previous: dict[str, Any] | None,
     pair_each_row: Mapping[str, Any] | None,
+    traffic_row: Mapping[str, Any] | None,
+    traffic_prev_row: Mapping[str, Any] | None,
+    traffic_context: TrafficScoringContext,
+    traffic_pair_each_row: Mapping[str, Any] | None,
+    traffic_pair_each_prev: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     current_gap = _extract_gap(row._asdict())
     previous_gap = _extract_gap(prev_row) if prev_row else None
     delta_gap = _extract_delta_gap(delta_row, row._asdict(), prev_row)
-    traffic_gap = _extract_traffic_gap(row._asdict())
-    traffic_delta = _extract_traffic_delta(delta_row, row._asdict(), prev_row)
-    traffic_scores = _extract_traffic_scores(row._asdict())
-    traffic_confidence = _extract_traffic_confidence(row._asdict())
+    traffic_gap = _extract_traffic_gap(traffic_row)
+    traffic_delta = _extract_traffic_delta(traffic_row, traffic_prev_row)
+    traffic_scores = _extract_traffic_scores(traffic_row, traffic_context)
+    traffic_confidence = _extract_traffic_confidence(
+        traffic_row,
+        my_current,
+        opp_current,
+        traffic_context,
+    )
     my_snapshot = _build_entity_snapshot(my_current)
     my_change = _build_my_change(delta_row, my_current, my_previous)
     opp_snapshot = _build_entity_snapshot(opp_current)
     opp_change = _build_entity_change(opp_current, opp_previous)
     score_components = _extract_scores(row._asdict())
-    primary_competitor = _extract_pair_each_metrics(pair_each_row)
+    primary_competitor = _extract_pair_each_metrics(
+        pair_each_row,
+        traffic_pair_each_row,
+        traffic_pair_each_prev,
+        traffic_context,
+    )
 
     return {
         "my_asin": row.my_asin,
@@ -2459,7 +2778,12 @@ def _build_pair_feature(
     }
 
 
-def _extract_pair_each_metrics(row: Mapping[str, Any] | pd.Series | None) -> dict[str, Any] | None:
+def _extract_pair_each_metrics(
+    row: Mapping[str, Any] | pd.Series | None,
+    traffic_row: Mapping[str, Any] | pd.Series | None,
+    traffic_prev_row: Mapping[str, Any] | pd.Series | None,
+    traffic_context: TrafficScoringContext,
+) -> dict[str, Any] | None:
     if row is None:
         return None
 
@@ -2468,9 +2792,19 @@ def _extract_pair_each_metrics(row: Mapping[str, Any] | pd.Series | None) -> dic
     else:
         data = row
 
-    traffic_gap = _extract_traffic_gap(data)
-    traffic_scores = _extract_traffic_scores(data)
-    traffic_confidence = _extract_traffic_confidence(data)
+    if isinstance(traffic_row, pd.Series):
+        traffic_data = traffic_row.to_dict()
+    else:
+        traffic_data = traffic_row
+    if isinstance(traffic_prev_row, pd.Series):
+        traffic_prev = traffic_prev_row.to_dict()
+    else:
+        traffic_prev = traffic_prev_row
+
+    traffic_gap = _extract_traffic_gap(traffic_data)
+    traffic_scores = _extract_traffic_scores(traffic_data, traffic_context)
+    traffic_confidence = _extract_traffic_confidence(traffic_data, None, None, traffic_context)
+    traffic_delta = _extract_traffic_delta(traffic_data, traffic_prev)
 
     fields_float = (
         "my_price_net",
@@ -2498,6 +2832,7 @@ def _extract_pair_each_metrics(row: Mapping[str, Any] | pd.Series | None) -> dic
         "traffic_gap": traffic_gap,
         "traffic_scores": traffic_scores,
         "traffic_confidence": traffic_confidence,
+        "traffic_delta": traffic_delta,
     }
     for field in fields_float:
         result[field] = _clean_float(data.get(field))
@@ -2540,7 +2875,7 @@ def _extract_traffic_gap(row: Mapping[str, Any] | None) -> dict[str, dict[str, f
     if row is None:
         return {"mix": {}, "keyword": {}}
     mix_fields = {
-        "ad_ratio_gap": row.get("ad_ratio_gap"),
+        "ad_ratio_gap": row.get("ad_ratio_gap_leader"),
         "ad_ratio_index_med": row.get("ad_ratio_index_med"),
         "ad_to_natural_gap": row.get("ad_to_natural_gap"),
         "sp_share_in_ad_gap": row.get("sp_share_in_ad_gap"),
@@ -2564,7 +2899,10 @@ def _extract_traffic_gap(row: Mapping[str, Any] | None) -> dict[str, dict[str, f
     }
 
 
-def _extract_traffic_scores(row: Mapping[str, Any] | None) -> dict[str, Any]:
+def _extract_traffic_scores(
+    row: Mapping[str, Any] | None,
+    context: TrafficScoringContext,
+) -> dict[str, Any]:
     if row is None:
         return {
             "mix_score": None,
@@ -2574,8 +2912,21 @@ def _extract_traffic_scores(row: Mapping[str, Any] | None) -> dict[str, Any]:
             "mix_components": {},
             "keyword_components": {},
         }
-    mix_components = _normalise_score_map(row.get("t_mix_scores"))
-    keyword_components = _normalise_score_map(row.get("t_keyword_scores"))
+
+    mix_components: dict[str, float | None] = {}
+    for feature, params in context.mix_rules.items():
+        mix_components[feature] = _score_feature(
+            _clean_float(row.get(feature)),
+            params,
+        )
+
+    keyword_components: dict[str, float | None] = {}
+    for feature, params in context.keyword_rules.items():
+        keyword_components[feature] = _score_feature(
+            _clean_float(row.get(feature)),
+            params,
+        )
+
     return {
         "mix_score": _clean_float(row.get("t_score_mix")),
         "keyword_score": _clean_float(row.get("t_score_kw")),
@@ -2586,15 +2937,89 @@ def _extract_traffic_scores(row: Mapping[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _extract_traffic_confidence(row: Mapping[str, Any] | None) -> dict[str, float | None]:
+def _extract_traffic_confidence(
+    row: Mapping[str, Any] | None,
+    my_entity: Mapping[str, Any] | None,
+    opp_entity: Mapping[str, Any] | None,
+    context: TrafficScoringContext,
+) -> dict[str, float | None]:
     if row is None:
         return {"overall": None, "mix": None, "keyword": None, "coverage": None}
+
+    mix_values = [
+        _clean_float(row.get("ad_ratio_index_med")),
+        _clean_float(row.get("ad_to_natural_gap")),
+        _clean_float(row.get("sp_share_in_ad_gap")),
+        _clean_float(row.get("sbv_share_in_ad_gap")),
+        _clean_float(row.get("sb_share_in_ad_gap")),
+    ]
+    keyword_values = [
+        _clean_float(row.get("kw_entropy_gap")),
+        _clean_float(row.get("kw_top3_share_gap")),
+        _clean_float(row.get("kw_brand_share_gap")),
+        _clean_float(row.get("kw_competitor_share_gap")),
+        _clean_float(row.get("kw_generic_share_gap")),
+        _clean_float(row.get("kw_attribute_share_gap")),
+        _clean_float(row.get("kw_top1_share_gap")),
+        _clean_float(row.get("kw_top10_share_gap")),
+        _clean_float(row.get("kw_hhi_gap")),
+    ]
+    mix_confidence = _confidence(mix_values)
+    keyword_confidence = _confidence(keyword_values)
+
+    coverage_values: list[float] = []
+    for entity in (my_entity, opp_entity):
+        if entity is None:
+            continue
+        coverage = _clean_float(entity.get("kw_coverage_ratio"))
+        if coverage is not None:
+            coverage_values.append(float(np.clip(coverage, 0.0, 1.0)))
+    coverage = min(coverage_values) if coverage_values else None
+
     return {
         "overall": _clean_float(row.get("t_confidence")),
-        "mix": _clean_float(row.get("t_mix_confidence")),
-        "keyword": _clean_float(row.get("t_keyword_confidence")),
-        "coverage": _clean_float(row.get("t_coverage_ratio")),
+        "mix": mix_confidence,
+        "keyword": keyword_confidence,
+        "coverage": coverage,
     }
+
+
+def _extract_traffic_delta(
+    current_row: Mapping[str, Any] | None,
+    previous_row: Mapping[str, Any] | None,
+) -> dict[str, dict[str, float | None]]:
+    if current_row is None or previous_row is None:
+        return {"mix": {}, "keyword": {}, "scores": {}}
+
+    def _diff(field: str) -> float | None:
+        return _diff_float(current_row.get(field), previous_row.get(field))
+
+    mix_delta = {
+        "ad_ratio_gap": _diff("ad_ratio_gap_leader"),
+        "ad_ratio_index_med": _diff("ad_ratio_index_med"),
+        "ad_to_natural_gap": _diff("ad_to_natural_gap"),
+        "sp_share_in_ad_gap": _diff("sp_share_in_ad_gap"),
+        "sbv_share_in_ad_gap": _diff("sbv_share_in_ad_gap"),
+        "sb_share_in_ad_gap": _diff("sb_share_in_ad_gap"),
+    }
+    keyword_delta = {
+        "kw_entropy_gap": _diff("kw_entropy_gap"),
+        "kw_hhi_gap": _diff("kw_hhi_gap"),
+        "kw_top1_share_gap": _diff("kw_top1_share_gap"),
+        "kw_top3_share_gap": _diff("kw_top3_share_gap"),
+        "kw_top10_share_gap": _diff("kw_top10_share_gap"),
+        "kw_brand_share_gap": _diff("kw_brand_share_gap"),
+        "kw_competitor_share_gap": _diff("kw_competitor_share_gap"),
+        "kw_generic_share_gap": _diff("kw_generic_share_gap"),
+        "kw_attribute_share_gap": _diff("kw_attribute_share_gap"),
+    }
+    score_delta = {
+        "t_score_mix": _diff("t_score_mix"),
+        "t_score_kw": _diff("t_score_kw"),
+        "t_pressure": _diff("t_pressure"),
+        "t_confidence": _diff("t_confidence"),
+    }
+    return {"mix": mix_delta, "keyword": keyword_delta, "scores": score_delta}
 
 
 def _extract_delta_gap(
@@ -2793,6 +3218,7 @@ def _build_entity_change(current: dict[str, Any] | None, previous: dict[str, Any
 def _build_summary(
     *,
     pairs_current: pd.DataFrame,
+    traffic_pairs_current: pd.DataFrame,
     delta_window: pd.DataFrame,
     entities_current: pd.DataFrame,
     entities_previous: pd.DataFrame,
@@ -2823,30 +3249,25 @@ def _build_summary(
     }
 
     traffic_pressure_series = (
-        pd.to_numeric(pairs_current.get("t_pressure"), errors="coerce")
-        if not pairs_current.empty
+        pd.to_numeric(traffic_pairs_current.get("t_pressure"), errors="coerce")
+        if not traffic_pairs_current.empty
         else pd.Series(dtype=float)
     )
     traffic_pressure_p50 = _quantile(traffic_pressure_series, 0.5)
     traffic_pressure_p90 = _quantile(traffic_pressure_series, 0.9)
     traffic_confidence_series = (
-        pd.to_numeric(pairs_current.get("t_confidence"), errors="coerce")
-        if not pairs_current.empty
-        else pd.Series(dtype=float)
-    )
-    traffic_coverage_series = (
-        pd.to_numeric(pairs_current.get("t_coverage_ratio"), errors="coerce")
-        if not pairs_current.empty
+        pd.to_numeric(traffic_pairs_current.get("t_confidence"), errors="coerce")
+        if not traffic_pairs_current.empty
         else pd.Series(dtype=float)
     )
     mix_gap_series = (
-        pd.to_numeric(pairs_current.get("ad_ratio_gap"), errors="coerce")
-        if not pairs_current.empty
+        pd.to_numeric(traffic_pairs_current.get("ad_ratio_gap_leader"), errors="coerce")
+        if not traffic_pairs_current.empty
         else pd.Series(dtype=float)
     )
     keyword_gap_series = (
-        pd.to_numeric(pairs_current.get("kw_top3_share_gap"), errors="coerce")
-        if not pairs_current.empty
+        pd.to_numeric(traffic_pairs_current.get("kw_top3_share_gap"), errors="coerce")
+        if not traffic_pairs_current.empty
         else pd.Series(dtype=float)
     )
     lagging_pairs = 0
@@ -2872,6 +3293,14 @@ def _build_summary(
             "avg_keyword_gap": _nanmean(keyword_gap_series),
         },
     }
+    summary["traffic"] = {
+        "pressure_p50": traffic_pressure_p50,
+        "pressure_p90": traffic_pressure_p90,
+        "confidence_p50": _quantile(traffic_confidence_series, 0.5),
+        "lagging_pairs": lagging_pairs,
+        "avg_mix_gap": _nanmean(mix_gap_series),
+        "avg_keyword_gap": _nanmean(keyword_gap_series),
+    }
     return summary
 
 
@@ -2879,6 +3308,9 @@ def _build_top_opponents(
     *,
     pairs_each_current: pd.DataFrame,
     pairs_each_previous: pd.DataFrame,
+    traffic_pairs_each_current: pd.DataFrame,
+    traffic_pairs_each_previous: pd.DataFrame,
+    traffic_context: TrafficScoringContext,
 ) -> list[dict[str, Any]]:
     if pairs_each_current.empty:
         return []
@@ -2886,6 +3318,15 @@ def _build_top_opponents(
     previous_lookup = {
         (row["scene_tag"], row["marketplace_id"], row["my_asin"], row["opp_asin"]): row
         for _, row in pairs_each_previous.iterrows()
+    }
+
+    traffic_lookup = {
+        (row["scene_tag"], row["marketplace_id"], row["my_asin"], row["opp_asin"]): row
+        for _, row in traffic_pairs_each_current.iterrows()
+    }
+    traffic_prev_lookup = {
+        (row["scene_tag"], row["marketplace_id"], row["my_asin"], row["opp_asin"]): row
+        for _, row in traffic_pairs_each_previous.iterrows()
     }
 
     group_cols = ["scene_tag", "base_scene", "morphology", "marketplace_id", "week", "my_asin"]
@@ -2900,6 +3341,22 @@ def _build_top_opponents(
         for _, opp_row in sorted_group.iterrows():
             prev_key = (*key_prefix, opp_row.get("opp_asin"))
             prev_row = previous_lookup.get(prev_key)
+            traffic_current = traffic_lookup.get(prev_key)
+            traffic_previous = traffic_prev_lookup.get(prev_key)
+            traffic_metrics = _extract_pair_each_metrics(
+                opp_row,
+                traffic_current,
+                traffic_previous,
+                traffic_context,
+            )
+            traffic_details = None
+            if traffic_metrics is not None:
+                traffic_details = {
+                    "gap": traffic_metrics.get("traffic_gap"),
+                    "delta": traffic_metrics.get("traffic_delta"),
+                    "scores": traffic_metrics.get("traffic_scores"),
+                    "confidence": traffic_metrics.get("traffic_confidence"),
+                }
             opponents.append(
                 {
                     "opp_asin": opp_row.get("opp_asin"),
@@ -2916,6 +3373,7 @@ def _build_top_opponents(
                     "content_gap_each": _clean_float(opp_row.get("content_gap_each")),
                     "social_gap_each": _clean_float(opp_row.get("social_gap_each")),
                     "badge_delta_sum": _clean_int(opp_row.get("badge_delta_sum")),
+                    "traffic": traffic_details,
                 }
             )
 

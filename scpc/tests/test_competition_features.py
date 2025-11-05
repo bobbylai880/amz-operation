@@ -74,26 +74,28 @@ def test_build_pairs_and_deltas_respect_scoring_rules() -> None:
         scene_tags=scene_tags,
         traffic=traffic,
     )
-    pairs = build_competition_pairs(entities, scoring_rules=rules)
-    pairs_each = build_competition_pairs_each(entities, scoring_rules=rules)
+    pairs, traffic_pairs = build_competition_pairs(entities, scoring_rules=rules)
+    pairs_each, traffic_pairs_each = build_competition_pairs_each(entities, scoring_rules=rules)
 
     assert set(pairs["opp_type"]) == {"leader", "median"}
     assert not pairs_each.empty
 
     leader = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "leader")].iloc[0]
+    leader_traffic = traffic_pairs[(traffic_pairs["week"] == "2025W10") & (traffic_pairs["opp_type"] == "leader")].iloc[0]
     assert leader["price_gap_leader"] == pytest.approx(1.50, rel=1e-3)
     assert leader["price_index_med"] == pytest.approx(19.99 / 20.49, rel=1e-3)
     assert leader["pressure"] == pytest.approx(0.847, rel=1e-3)
     assert leader["intensity_band"] == "C4"
-    assert leader["ad_ratio_gap"] == pytest.approx(0.45 - 0.55, rel=1e-3)
-    assert leader["t_pressure"] is not None
-    assert leader["t_intensity_band"] in {"C1", "C2", "C3", "C4"}
+    assert leader_traffic["ad_ratio_gap_leader"] == pytest.approx(0.45 - 0.55, rel=1e-3)
+    assert leader_traffic["t_pressure"] is not None
+    assert leader_traffic["t_intensity_band"] in {"C1", "C2", "C3", "C4"}
 
     median = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "median")].iloc[0]
+    median_traffic = traffic_pairs[(traffic_pairs["week"] == "2025W10") & (traffic_pairs["opp_type"] == "median")].iloc[0]
     assert median["price_gap_leader"] == pytest.approx(-0.50, rel=1e-3)
     assert median["pressure"] == pytest.approx(0.499, rel=1e-3)
     assert median["intensity_band"] == "C2"
-    assert median["t_confidence"] is not None
+    assert median_traffic["t_confidence"] is not None
 
     deltas = build_competition_delta(
         entities,
@@ -124,12 +126,13 @@ def test_build_pairs_uses_yaml_defaults_when_rules_missing() -> None:
         traffic=traffic,
     )
 
-    pairs = build_competition_pairs(entities)
+    pairs, traffic_pairs = build_competition_pairs(entities)
 
     leader = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "leader")].iloc[0]
     assert leader["pressure"] == pytest.approx(0.847, rel=1e-3)
     assert leader["intensity_band"] == "C4"
-    assert leader["t_pressure"] is not None
+    leader_traffic = traffic_pairs[(traffic_pairs["week"] == "2025W10") & (traffic_pairs["opp_type"] == "leader")].iloc[0]
+    assert leader_traffic["t_pressure"] is not None
 
     median = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "median")].iloc[0]
     assert median["pressure"] == pytest.approx(0.499, rel=1e-3)
@@ -153,11 +156,15 @@ def test_build_tables_and_compute_competition_features() -> None:
     )
 
     assert not tables.entities.empty
+    assert not tables.traffic_entities.empty
     assert not tables.pairs.empty
+    assert not tables.traffic_pairs.empty
     assert not tables.pairs_each.empty
+    assert not tables.traffic_pairs_each.empty
     assert not tables.delta.empty
     assert not tables.summary.empty
     pairs_each = tables.pairs_each
+    traffic_pairs_each = tables.traffic_pairs_each
 
     summary_row = tables.summary.iloc[0]
     assert summary_row["my_asin_cnt"] == 1
@@ -196,6 +203,8 @@ def test_build_tables_and_compute_competition_features() -> None:
     assert leader_pair["traffic"]["scores"]["pressure"] is not None
     assert leader_pair["traffic"]["confidence"]["overall"] >= 0.0
 
+    assert payload["summary"]["traffic"]["lagging_pairs"] >= 0
+
     summary = payload["summary"]
     assert summary["moves"]["moves_coupon_up"] == 1
     assert summary["worsen_ratio"] == pytest.approx(0.0, abs=1e-4)
@@ -208,4 +217,12 @@ def test_build_tables_and_compute_competition_features() -> None:
     assert not primary.empty
     leader_each = primary[primary["opp_asin"] == leader_pair["opp_asin"]].iloc[0]
     assert leader_each["price_gap_each"] == pytest.approx(-0.499, rel=1e-3)
-    assert leader_each["traffic_scores"]["pressure"] is not None
+
+    traffic_primary = traffic_pairs_each[
+        (traffic_pairs_each["week"] == "2025W10")
+        & (traffic_pairs_each["my_asin"] == "MY-ASIN-1")
+        & (traffic_pairs_each["opp_asin"] == leader_pair["opp_asin"])
+    ]
+    assert not traffic_primary.empty
+    leader_traffic_each = traffic_primary.iloc[0]
+    assert leader_traffic_each["t_pressure"] is not None
