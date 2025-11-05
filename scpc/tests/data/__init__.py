@@ -12,6 +12,9 @@ __all__ = [
     "build_competition_snapshot_sample",
     "build_scene_tag_sample",
     "build_scoring_rules_sample",
+    "build_traffic_flow_sample",
+    "build_keyword_daily_sample",
+    "build_keyword_tag_sample",
 ]
 
 from .scene_samples import (
@@ -27,4 +30,7 @@ from .competition_samples import (
     build_competition_snapshot_sample,
     build_scene_tag_sample,
     build_scoring_rules_sample,
+    build_keyword_daily_sample,
+    build_keyword_tag_sample,
+    build_traffic_flow_sample,
 )

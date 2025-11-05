@@ -50,3 +50,63 @@ rule_sets:
         C2: 0.50
         C3: 0.75
         C4: 1.00
+  default_traffic:
+    description: >-
+      流量模块的基准 Sigmoid 参数与权重配置，覆盖广告结构与关键词类差异。
+    mix:
+      ad_ratio_index_med:
+        theta: 1.0
+        k: 8.0
+        weight: 0.35
+        invert: true
+      ad_to_natural_gap:
+        theta: -0.05
+        k: 6.0
+        weight: 0.25
+        invert: true
+      sp_share_in_ad_gap:
+        theta: 0.0
+        k: 10.0
+        weight: 0.20
+        invert: true
+      sbv_share_in_ad_gap:
+        theta: 0.0
+        k: 8.0
+        weight: 0.10
+        invert: true
+      sb_share_in_ad_gap:
+        theta: 0.0
+        k: 8.0
+        weight: 0.10
+        invert: true
+    keyword:
+      kw_top3_share_gap:
+        theta: 0.0
+        k: 8.0
+        weight: 0.30
+        invert: true
+      kw_brand_share_gap:
+        theta: 0.0
+        k: 8.0
+        weight: 0.25
+        invert: true
+      kw_competitor_share_gap:
+        theta: 0.02
+        k: 6.0
+        weight: 0.25
+        invert: false
+      kw_entropy_gap:
+        theta: 0.0
+        k: 5.0
+        weight: 0.20
+        invert: true
+    bands:
+      traffic_intensity:
+        C1: 0.25
+        C2: 0.50
+        C3: 0.75
+        C4: 1.00
+    pressure_weights:
+      mix: 0.5
+      keyword: 0.5
+
