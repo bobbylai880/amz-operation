@@ -78,29 +78,36 @@ python -m scpc.etl.scene_pipeline \
 与 WoW 正负驱动，确保关键逻辑在无真实数据库时也能复现。
 
 ## Competition 模块：竞对特征工程
-`scpc/etl/competition_features.py` 完成 Doris 事实表 `bi_amz_asin_product_snapshot` 到竞对中间表（实体清洗、配对、环比、周汇总）的整
-体链路，实现第二模块“竞争对比”的特征工程需求。模块对齐 Doris 建表 2–5 的字段定义，可直接写入清洗层与宽表，为后续 LLM 裁决
-提供结构化输入。
+`scpc/etl/competition_features.py` 将竞争分析扩展为“事实→特征→对比→规则→LLM”的端到端流水线：从 Doris 周度快照抽取实体特征，生成主配对与逐对配对，再衍生环比、场景汇总、落后洞察与根因证据包，为 LLM 判因提供统一事实底座。
 
 ### 数据契约
-- **输入事实**：
-  - `bi_amz_asin_product_snapshot`（周度页面快照，含价格、排名、素材、优惠信息）。
-  - `bi_amz_asin_scene_tag`（ASIN × 站点的场景/形态映射，用于定位 `scene_tag/base_scene/morphology`）。
-- **输出表格**：
-  1. `clean_competition_entities()` → `bi_amz_comp_entities_clean`（派生净价、排名得分、社交背书、内容得分，并标注我方 ASIN）。
-  2. `build_competition_pairs()` → `bi_amz_comp_pairs`（按站点/场景/周，将我方 ASIN 与竞品 Leader/Median 配对，计算价差、排名差、素材差及 Sigmoid 打分、压力分档）。
-  3. `build_competition_delta()` → `bi_amz_comp_delta`（基于上一周的配对记录与实体，输出 WoW 差值与压力变化）。
-  4. `summarise_competition_scene()` → `bi_amz_comp_scene_week_metrics`（周度聚合：竞品数量、压力分位数、恶化占比、我方动作计数、平均得分）。
+- **输入事实层**：
+  - `bi_amz_asin_product_snapshot`：ASIN 页面周级快照（含锚点/补录、价格、排名、素材、优惠等原子字段）。
+  - `bi_amz_asin_scene_tag`：场景形态标签映射，补齐 `scene_tag/base_scene/morphology/hyy_asin`。
+- **特征与对比层输出**：
+  1. `clean_competition_entities()` → `bi_amz_comp_entities_clean`：计算净价、排名得分、内容/社交得分等派生特征，区分我方与竞品实体。
+  2. `build_competition_pairs()` → `bi_amz_comp_pairs`：按 Leader/Median 口径输出主配对差异、压力带、评分与置信度。
+  3. `build_competition_pairs_each()` → `bi_amz_comp_pairs_each`：沉淀我方 ASIN 与每个竞品的逐对差异与对手证据。
+  4. `build_competition_delta()` → `bi_amz_comp_delta`：严格 7D 环比窗口，追踪价差、压力、得分的 WoW 变化。
+  5. `summarise_competition_scene()` → `bi_amz_comp_scene_week_metrics`：场景级周汇总，统计压力分位、恶化占比与关键动作。
+- **规则与 LLM 层输出**：
+  6. `score_lag_signals()` → `bi_amz_comp_lag_insights`：匹配 `bi_amz_comp_lag_rule`，识别落后类型、严重度与 Top 竞品。
+  7. `assemble_llm_packets()` → `bi_amz_comp_llm_packet`：按 lag_type 打包根因证据 JSON 与 Prompt Hint。
+  8. `create_llm_overview()` → `vw_amz_comp_llm_overview`：供 LLM 快速判定 lag_type 的概览视图。
 
 ### 处理流程
-1. **实体清洗**：`clean_competition_entities` 先根据 `bi_amz_asin_scene_tag` 贴上场景/形态标签，再归一化价格、优惠、排名、素材字段，生成净价 `price_net`、排名得分 `rank_score`（组内最优=1）、
-   社交背书 `social_proof`（评分×评论数对数）与内容得分 `content_score`（图/视频/文案/A+ 权重组合）。
-2. **竞品配对**：`build_competition_pairs` 按 `(scene_tag, base_scene, morphology, marketplace_id, week)` 聚合，识别排名得分最高的 Leader 与中位竞品，
-   计算价差、排名差、内容/社交差，依据 Doris 规则表 `bi_amz_comp_scoring_rule` 进行 Sigmoid 打分并输出压力等级 `intensity_band`。
-3. **环比比较**：`build_competition_delta` 对比当前与上一周配对行，补齐我方净价/内容/社交变化，以及价差、压力的 WoW 变化，用于识别竞态恶化。
-4. **周度汇总**：`summarise_competition_scene` 统计我方动作（提券/降价/新增视频/新增徽章）、压力分位数和恶化占比，为周报与看板提供摘要指标。
-5. **一键编排**：`build_competition_tables` 封装上述步骤，返回 `CompetitionTables`（含实体/配对/环比/周汇总四张 DataFrame），`compute_competition_features`
-   则在此基础上组装 LLM Facts（pairs + summary），与 Scene 模块的消费方式保持一致。
+1. **事实→特征**：以场景标签关联页面快照，补齐我方标记并衍生 `price_net/rank_score/social_proof/content_score` 等指标，结果写入 `bi_amz_comp_entities_clean`。
+2. **特征→对比（周内）**：
+   - `build_competition_pairs` 选取 Leader/Median 竞品，与我方比较价差、排名、内容、社交、徽章差异，并依据 `configs/competition_scoring.yaml` 计算多维得分与压力带；
+   - `build_competition_pairs_each` 输出我方 × 所有竞品的逐对配对，用于落后洞察与 LLM 证据复用。
+3. **对比→环比/汇总**：
+   - `build_competition_delta` 结合上一周主配对与实体特征，计算 WoW 差异与压力变化；
+   - `summarise_competition_scene` 汇聚主配对与环比，生成场景周报级指标与动作计数。
+4. **规则→洞察**：`score_lag_signals` 根据 `bi_amz_comp_lag_rule` 的阈值与权重，对主/逐对配对执行落后判定，产出 `lag_type/opp_type/severity` 及 Top 对手列表。
+5. **LLM 判因**：
+   - `create_llm_overview` 汇总核心指标（价差、排名差、压力、置信度等）供 LLM 第一层级判定问题所在；
+   - `assemble_llm_packets` 为每种 lag_type 准备根因证据包（我方/竞品/差异/Top 对手/提示语），支持 LLM 生成最根本原因与行动建议。
+6. **一键编排**：`build_competition_tables` 返回实体、主配对、逐对配对、环比、场景汇总五张 DataFrame；`compute_competition_features` 在此基础上构造 LLM Facts（概览 + 落后洞察 + 证据包），与 Scene 模块消费方式保持一致。
 
 ### 使用示例
 ```python
