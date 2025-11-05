@@ -1378,6 +1378,7 @@ def summarise_competition_scene(
         "moves_price_down": summary_stats["moves"]["moves_price_down"],
         "moves_new_video": summary_stats["moves"]["moves_new_video"],
         "moves_badge_gain": summary_stats["moves"]["moves_badge_gain"],
+        "traffic": summary_stats.get("traffic"),
     }
     return pd.DataFrame([row], columns=_summary_columns())
 
@@ -2056,6 +2057,9 @@ def _compute_pair_each_row(
         "pressure": pressure,
         "intensity_band": intensity_band,
         "confidence": confidence,
+        "traffic_gap": traffic_gap,
+        "traffic_scores": traffic_scores,
+        "traffic_confidence": traffic_confidence,
     }
     return record, traffic_metrics
 
@@ -2137,6 +2141,9 @@ def _compute_pair_row(
         "pressure": pressure,
         "intensity_band": intensity_band,
         "confidence": confidence,
+        "traffic_gap": traffic_gap,
+        "traffic_scores": traffic_scores,
+        "traffic_confidence": traffic_confidence,
     }
     return record, traffic_metrics
 
@@ -2251,6 +2258,34 @@ def _pair_columns() -> list[str]:
         "pressure",
         "intensity_band",
         "confidence",
+        "traffic_gap",
+        "traffic_scores",
+        "traffic_confidence",
+        "ad_ratio_gap",
+        "ad_ratio_index_med",
+        "ad_to_natural_gap",
+        "sp_share_in_ad_gap",
+        "sbv_share_in_ad_gap",
+        "sb_share_in_ad_gap",
+        "kw_entropy_gap",
+        "kw_hhi_gap",
+        "kw_top1_share_gap",
+        "kw_top3_share_gap",
+        "kw_top10_share_gap",
+        "kw_brand_share_gap",
+        "kw_competitor_share_gap",
+        "kw_generic_share_gap",
+        "kw_attribute_share_gap",
+        "t_score_mix",
+        "t_score_kw",
+        "t_pressure",
+        "t_intensity_band",
+        "t_mix_confidence",
+        "t_keyword_confidence",
+        "t_coverage_ratio",
+        "t_confidence",
+        "t_mix_scores",
+        "t_keyword_scores",
     ]
 
 
@@ -2291,6 +2326,34 @@ def _pair_each_columns() -> list[str]:
         "pressure",
         "intensity_band",
         "confidence",
+        "traffic_gap",
+        "traffic_scores",
+        "traffic_confidence",
+        "ad_ratio_gap",
+        "ad_ratio_index_med",
+        "ad_to_natural_gap",
+        "sp_share_in_ad_gap",
+        "sbv_share_in_ad_gap",
+        "sb_share_in_ad_gap",
+        "kw_entropy_gap",
+        "kw_hhi_gap",
+        "kw_top1_share_gap",
+        "kw_top3_share_gap",
+        "kw_top10_share_gap",
+        "kw_brand_share_gap",
+        "kw_competitor_share_gap",
+        "kw_generic_share_gap",
+        "kw_attribute_share_gap",
+        "t_score_mix",
+        "t_score_kw",
+        "t_pressure",
+        "t_intensity_band",
+        "t_mix_confidence",
+        "t_keyword_confidence",
+        "t_coverage_ratio",
+        "t_confidence",
+        "t_mix_scores",
+        "t_keyword_scores",
     ]
 
 
@@ -2518,6 +2581,25 @@ def _delta_columns() -> list[str]:
         "d_content_gap",
         "d_social_gap",
         "delta_pressure",
+        "d_ad_ratio_gap",
+        "d_ad_ratio_index_med",
+        "d_ad_to_natural_gap",
+        "d_sp_share_in_ad_gap",
+        "d_sbv_share_in_ad_gap",
+        "d_sb_share_in_ad_gap",
+        "d_kw_entropy_gap",
+        "d_kw_hhi_gap",
+        "d_kw_top1_share_gap",
+        "d_kw_top3_share_gap",
+        "d_kw_top10_share_gap",
+        "d_kw_brand_share_gap",
+        "d_kw_competitor_share_gap",
+        "d_kw_generic_share_gap",
+        "d_kw_attribute_share_gap",
+        "d_t_score_mix",
+        "d_t_score_kw",
+        "d_t_pressure",
+        "d_t_confidence",
     ]
 
 
@@ -2538,6 +2620,7 @@ def _summary_columns() -> list[str]:
         "moves_price_down",
         "moves_new_video",
         "moves_badge_gain",
+        "traffic",
     ]
 
 
@@ -2962,6 +3045,65 @@ def _extract_delta_gap(
     return {key: None for key in ("price_gap_leader", "price_index_med", "rank_pos_pct", "content_gap", "social_gap")}
 
 
+def _extract_traffic_delta(
+    delta_row: dict[str, Any] | None,
+    current_row: dict[str, Any],
+    previous_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    mix_fields = (
+        "ad_ratio_gap",
+        "ad_ratio_index_med",
+        "ad_to_natural_gap",
+        "sp_share_in_ad_gap",
+        "sbv_share_in_ad_gap",
+        "sb_share_in_ad_gap",
+    )
+    keyword_fields = (
+        "kw_entropy_gap",
+        "kw_hhi_gap",
+        "kw_top1_share_gap",
+        "kw_top3_share_gap",
+        "kw_top10_share_gap",
+        "kw_brand_share_gap",
+        "kw_competitor_share_gap",
+        "kw_generic_share_gap",
+        "kw_attribute_share_gap",
+    )
+    if delta_row:
+        mix = {
+            field: _clean_float(delta_row.get(f"d_{field}")) for field in mix_fields
+        }
+        keyword = {
+            field: _clean_float(delta_row.get(f"d_{field}")) for field in keyword_fields
+        }
+        scores = {
+            "mix": _clean_float(delta_row.get("d_t_score_mix")),
+            "keyword": _clean_float(delta_row.get("d_t_score_kw")),
+            "pressure": _clean_float(delta_row.get("d_t_pressure")),
+            "confidence": _clean_float(delta_row.get("d_t_confidence")),
+        }
+        return {"mix": mix, "keyword": keyword, "scores": scores}
+    if previous_row:
+        mix = {
+            field: _diff_float(current_row.get(field), previous_row.get(field)) for field in mix_fields
+        }
+        keyword = {
+            field: _diff_float(current_row.get(field), previous_row.get(field)) for field in keyword_fields
+        }
+        scores = {
+            "mix": _diff_float(current_row.get("t_score_mix"), previous_row.get("t_score_mix")),
+            "keyword": _diff_float(current_row.get("t_score_kw"), previous_row.get("t_score_kw")),
+            "pressure": _diff_float(current_row.get("t_pressure"), previous_row.get("t_pressure")),
+            "confidence": _diff_float(current_row.get("t_confidence"), previous_row.get("t_confidence")),
+        }
+        return {"mix": mix, "keyword": keyword, "scores": scores}
+    return {
+        "mix": {field: None for field in mix_fields},
+        "keyword": {field: None for field in keyword_fields},
+        "scores": {"mix": None, "keyword": None, "pressure": None, "confidence": None},
+    }
+
+
 def _extract_scores(row: dict[str, Any]) -> dict[str, float | None]:
     mapping = {
         "score_price": row.get("score_price"),
@@ -3141,6 +3283,15 @@ def _build_summary(
         "worsen_ratio": worsen_ratio,
         "moves": moves,
         "avg_scores": avg_scores,
+        "traffic": {
+            "pressure_p50": traffic_pressure_p50,
+            "pressure_p90": traffic_pressure_p90,
+            "confidence_p50": _quantile(traffic_confidence_series, 0.5),
+            "coverage_p50": _quantile(traffic_coverage_series, 0.5),
+            "lagging_pairs": lagging_pairs,
+            "avg_mix_gap": _nanmean(mix_gap_series),
+            "avg_keyword_gap": _nanmean(keyword_gap_series),
+        },
     }
     summary["traffic"] = {
         "pressure_p50": traffic_pressure_p50,

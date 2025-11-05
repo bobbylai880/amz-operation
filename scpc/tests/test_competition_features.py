@@ -111,6 +111,7 @@ def test_build_pairs_and_deltas_respect_scoring_rules() -> None:
     assert leader_delta["d_price_net"] == pytest.approx(-1.959, rel=1e-3)
     assert leader_delta["badge_change"] == 1
     assert leader_delta["delta_pressure"] == pytest.approx(-0.0901, abs=5e-5)
+    assert leader_delta["d_t_pressure"] is not None
 
 
 def test_build_pairs_uses_yaml_defaults_when_rules_missing() -> None:
@@ -173,6 +174,7 @@ def test_build_tables_and_compute_competition_features() -> None:
     assert summary_row["moves_new_video"] == 1
     assert summary_row["moves_badge_gain"] == 1
     assert summary_row["pressure_p90"] == pytest.approx(0.812, rel=1e-3)
+    assert summary_row["traffic"]["lagging_pairs"] >= 0
 
     result = compute_competition_features(
         snapshots=snapshots,
