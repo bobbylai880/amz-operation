@@ -5,13 +5,108 @@ from dataclasses import dataclass
 from datetime import date
 import json
 import math
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
+import yaml
 
 
 BadgeValue = list[str]
+
+_SCORING_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "competition_scoring.yaml"
+
+_FALLBACK_SCORING_RULES: dict[str, dict[str, float]] = {
+    "price": {"theta": 0.0, "k": 1.5, "weight": 0.30},
+    "rank": {"theta": 0.0, "k": 6.0, "weight": 0.25},
+    "content": {"theta": 0.0, "k": 5.0, "weight": 0.20},
+    "social": {"theta": 0.0, "k": 4.0, "weight": 0.15},
+    "badge": {"theta": 0.0, "k": 3.0, "weight": 0.10},
+}
+
+_FALLBACK_BAND_CUTS: dict[str, float] = {"C1": 0.25, "C2": 0.50, "C3": 0.75, "C4": 1.00}
+
+
+def _clone_feature_rules(source: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    """Return a deep-ish copy of the feature-rule mapping."""
+
+    return {feature: params.copy() for feature, params in source.items()}
+
+
+def _load_scoring_config(path: Path = _SCORING_CONFIG_PATH) -> dict[str, Any]:
+    """Load the YAML scoring configuration, returning an empty mapping on failure."""
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    try:
+        data = yaml.safe_load(raw) or {}
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _extract_rule_from_config(rule_name: str, *, config: dict[str, Any] | None = None) -> tuple[
+    dict[str, dict[str, float]], dict[str, float]
+]:
+    """Return feature weights and band cuts for the requested rule name."""
+
+    feature_rules = _clone_feature_rules(_FALLBACK_SCORING_RULES)
+    band_cuts = _FALLBACK_BAND_CUTS.copy()
+
+    config = config if config is not None else _SCORING_CONFIG
+    rule_sets = config.get("rule_sets") if isinstance(config, dict) else None
+    if not isinstance(rule_sets, dict):
+        return feature_rules, band_cuts
+
+    selected = rule_sets.get(rule_name)
+    if selected is None and rule_name != "default":
+        selected = rule_sets.get("default")
+    if not isinstance(selected, dict):
+        return feature_rules, band_cuts
+
+    features = selected.get("features")
+    if isinstance(features, dict):
+        for feature, params in features.items():
+            if not isinstance(params, dict):
+                continue
+            base = feature_rules.get(feature, {"theta": 0.0, "k": 1.0, "weight": 0.0}).copy()
+            for key in ("theta", "k", "weight"):
+                if key not in params:
+                    continue
+                try:
+                    base[key] = float(params[key])
+                except (TypeError, ValueError):
+                    continue
+            feature_rules[feature] = base
+
+    band_section = selected.get("band_cuts")
+    candidate: dict[str, Any] | None = None
+    if isinstance(band_section, dict):
+        if isinstance(band_section.get("values"), dict):
+            candidate = band_section["values"]
+        else:
+            candidate = band_section
+    if isinstance(candidate, dict):
+        parsed: dict[str, float] = {}
+        for band, threshold in candidate.items():
+            try:
+                parsed[str(band)] = float(threshold)
+            except (TypeError, ValueError):
+                continue
+        if parsed:
+            band_cuts = parsed
+
+    return feature_rules, band_cuts
+
+
+_SCORING_CONFIG = _load_scoring_config()
+
+DEFAULT_SCORING_RULES, DEFAULT_BAND_CUTS = _extract_rule_from_config(
+    "default", config=_SCORING_CONFIG
+)
 
 
 @dataclass(slots=True)
@@ -49,17 +144,6 @@ class CompetitionTables:
     pairs: pd.DataFrame
     delta: pd.DataFrame
     summary: pd.DataFrame
-
-
-DEFAULT_SCORING_RULES: dict[str, dict[str, float]] = {
-    "price": {"theta": 0.0, "k": 1.5, "weight": 0.30},
-    "rank": {"theta": 0.0, "k": 6.0, "weight": 0.25},
-    "content": {"theta": 0.0, "k": 5.0, "weight": 0.20},
-    "social": {"theta": 0.0, "k": 4.0, "weight": 0.15},
-    "badge": {"theta": 0.0, "k": 3.0, "weight": 0.10},
-}
-
-DEFAULT_BAND_CUTS: dict[str, float] = {"C1": 0.25, "C2": 0.50, "C3": 0.75, "C4": 1.00}
 
 
 def _attach_scene_tags(
@@ -591,18 +675,18 @@ def _prepare_scoring_rules(
     rule_name: str,
 ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
     if scoring_rules is None:
-        return DEFAULT_SCORING_RULES.copy(), DEFAULT_BAND_CUTS.copy()
+        return _extract_rule_from_config(rule_name)
 
     if isinstance(scoring_rules, dict):
-        feature_rules = DEFAULT_SCORING_RULES.copy()
+        feature_rules = _clone_feature_rules(DEFAULT_SCORING_RULES)
         feature_rules.update(scoring_rules)
         return feature_rules, DEFAULT_BAND_CUTS.copy()
 
     subset = scoring_rules.loc[scoring_rules["rule_name"] == rule_name]
     if subset.empty:
-        return DEFAULT_SCORING_RULES.copy(), DEFAULT_BAND_CUTS.copy()
+        return _extract_rule_from_config(rule_name)
 
-    feature_rules = DEFAULT_SCORING_RULES.copy()
+    feature_rules = _clone_feature_rules(DEFAULT_SCORING_RULES)
     band_cuts: dict[str, float] | None = None
     for _, row in subset.iterrows():
         feature = row.get("feature_name")

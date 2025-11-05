@@ -76,6 +76,27 @@ def test_build_pairs_and_deltas_respect_scoring_rules() -> None:
     assert leader_delta["delta_pressure"] == pytest.approx(-0.0901, abs=5e-5)
 
 
+def test_build_pairs_uses_yaml_defaults_when_rules_missing() -> None:
+    snapshots = build_competition_snapshot_sample().drop(columns=["scene_tag", "base_scene", "morphology"])
+    scene_tags = build_scene_tag_sample()
+
+    entities = clean_competition_entities(
+        snapshots,
+        my_asins=MY_ASINS_SAMPLE,
+        scene_tags=scene_tags,
+    )
+
+    pairs = build_competition_pairs(entities)
+
+    leader = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "leader")].iloc[0]
+    assert leader["pressure"] == pytest.approx(0.847, rel=1e-3)
+    assert leader["intensity_band"] == "C4"
+
+    median = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "median")].iloc[0]
+    assert median["pressure"] == pytest.approx(0.499, rel=1e-3)
+    assert median["intensity_band"] == "C2"
+
+
 def test_build_tables_and_compute_competition_features() -> None:
     snapshots = build_competition_snapshot_sample().drop(columns=["scene_tag", "base_scene", "morphology"])
     scene_tags = build_scene_tag_sample()
