@@ -77,6 +77,66 @@ python -m scpc.etl.scene_pipeline \
 中构造的“浴室架”场景样例（关键词：shower caddy / shower bag，周度事实来自 Doris 视图快照），可模拟缺失周、长缺口
 与 WoW 正负驱动，确保关键逻辑在无真实数据库时也能复现。
 
+## Competition 模块：竞对特征工程
+`scpc/etl/competition_features.py` 完成 Doris 事实表 `bi_amz_asin_product_snapshot` 到竞对中间表（实体清洗、配对、环比、周汇总）的整
+体链路，实现第二模块“竞争对比”的特征工程需求。模块对齐 Doris 建表 2–5 的字段定义，可直接写入清洗层与宽表，为后续 LLM 裁决
+提供结构化输入。
+
+### 数据契约
+- **输入事实**：
+  - `bi_amz_asin_product_snapshot`（周度页面快照，含价格、排名、素材、优惠信息）。
+  - `bi_amz_asin_scene_tag`（ASIN × 站点的场景/形态映射，用于定位 `scene_tag/base_scene/morphology`）。
+- **输出表格**：
+  1. `clean_competition_entities()` → `bi_amz_comp_entities_clean`（派生净价、排名得分、社交背书、内容得分，并标注我方 ASIN）。
+  2. `build_competition_pairs()` → `bi_amz_comp_pairs`（按站点/场景/周，将我方 ASIN 与竞品 Leader/Median 配对，计算价差、排名差、素材差及 Sigmoid 打分、压力分档）。
+  3. `build_competition_delta()` → `bi_amz_comp_delta`（基于上一周的配对记录与实体，输出 WoW 差值与压力变化）。
+  4. `summarise_competition_scene()` → `bi_amz_comp_scene_week_metrics`（周度聚合：竞品数量、压力分位数、恶化占比、我方动作计数、平均得分）。
+
+### 处理流程
+1. **实体清洗**：`clean_competition_entities` 先根据 `bi_amz_asin_scene_tag` 贴上场景/形态标签，再归一化价格、优惠、排名、素材字段，生成净价 `price_net`、排名得分 `rank_score`（组内最优=1）、
+   社交背书 `social_proof`（评分×评论数对数）与内容得分 `content_score`（图/视频/文案/A+ 权重组合）。
+2. **竞品配对**：`build_competition_pairs` 按 `(scene_tag, base_scene, morphology, marketplace_id, week)` 聚合，识别排名得分最高的 Leader 与中位竞品，
+   计算价差、排名差、内容/社交差，依据 Doris 规则表 `bi_amz_comp_scoring_rule` 进行 Sigmoid 打分并输出压力等级 `intensity_band`。
+3. **环比比较**：`build_competition_delta` 对比当前与上一周配对行，补齐我方净价/内容/社交变化，以及价差、压力的 WoW 变化，用于识别竞态恶化。
+4. **周度汇总**：`summarise_competition_scene` 统计我方动作（提券/降价/新增视频/新增徽章）、压力分位数和恶化占比，为周报与看板提供摘要指标。
+5. **一键编排**：`build_competition_tables` 封装上述步骤，返回 `CompetitionTables`（含实体/配对/环比/周汇总四张 DataFrame），`compute_competition_features`
+   则在此基础上组装 LLM Facts（pairs + summary），与 Scene 模块的消费方式保持一致。
+
+### 使用示例
+```python
+from scpc.etl.competition_features import build_competition_tables, compute_competition_features
+from scpc.tests.data import (
+    MY_ASINS_SAMPLE,
+    build_competition_snapshot_sample,
+    build_scene_tag_sample,
+    build_scoring_rules_sample,
+)
+
+snapshots = build_competition_snapshot_sample()
+scene_tags = build_scene_tag_sample()
+tables = build_competition_tables(
+    snapshots,
+    week="2025W10",
+    previous_week="2025W09",
+    my_asins=MY_ASINS_SAMPLE,
+    scene_tags=scene_tags,
+    scoring_rules=build_scoring_rules_sample(),
+)
+result = compute_competition_features(
+    snapshots=snapshots,
+    week="2025W10",
+    previous_week="2025W09",
+    my_asins=MY_ASINS_SAMPLE,
+    scene_tags=scene_tags,
+)
+```
+`tables` 可直接写入 Doris，`result.as_dict()` 则用于 LLM 消费与 JSON Schema 校验。
+
+### 模块测试
+`pytest scpc/tests/test_competition_features.py`
+覆盖实体清洗、竞品配对、环比计算与 LLM Facts 组装全链路，并基于 `scpc/tests/data/competition_samples.py` 提供的两周样例数据验证 Sigmoid
+打分、压力分档与动作识别逻辑。
+
 ## 目录结构
 ```
 configs/                 # YAML 配置（调度、阈值等）
