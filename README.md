@@ -96,11 +96,12 @@ python -m scpc.etl.scene_pipeline \
 1. **实体清洗**：`clean_competition_entities` 先根据 `bi_amz_asin_scene_tag` 贴上场景/形态标签，再归一化价格、优惠、排名、素材字段，生成净价 `price_net`、排名得分 `rank_score`（组内最优=1）、
    社交背书 `social_proof`（评分×评论数对数）与内容得分 `content_score`（图/视频/文案/A+ 权重组合）。
 2. **竞品配对**：`build_competition_pairs` 按 `(scene_tag, base_scene, morphology, marketplace_id, week)` 聚合，识别排名得分最高的 Leader 与中位竞品，
-   计算价差、排名差、内容/社交差，依据 `configs/competition_scoring.yaml`（由 Doris 规则表 `bi_amz_comp_scoring_rule` 抽离）进行 Sigmoid 打分并输出压力等级 `intensity_band`。
+   计算价差、排名差、内容/社交差，依据 `configs/competition_scoring.yaml`（由 Doris 规则表 `bi_amz_comp_scoring_rule` 抽离）进行 Sigmoid 打分并输出压力等级 `intensity_band`；
+   `build_competition_pairs_each` 同步生成我方 ASIN 与所有竞品的逐对配对行，便于后续 LLM 根因定位。
 3. **环比比较**：`build_competition_delta` 对比当前与上一周配对行，补齐我方净价/内容/社交变化，以及价差、压力的 WoW 变化，用于识别竞态恶化。
 4. **周度汇总**：`summarise_competition_scene` 统计我方动作（提券/降价/新增视频/新增徽章）、压力分位数和恶化占比，为周报与看板提供摘要指标。
-5. **一键编排**：`build_competition_tables` 封装上述步骤，返回 `CompetitionTables`（含实体/配对/环比/周汇总四张 DataFrame），`compute_competition_features`
-   则在此基础上组装 LLM Facts（pairs + summary），与 Scene 模块的消费方式保持一致。
+5. **一键编排**：`build_competition_tables` 封装上述步骤，返回 `CompetitionTables`（含实体/配对/逐对配对/环比/周汇总五张 DataFrame），`compute_competition_features`
+   则在此基础上组装 LLM Facts（pairs + top_opponents + summary），与 Scene 模块的消费方式保持一致。
 
 ### 使用示例
 ```python

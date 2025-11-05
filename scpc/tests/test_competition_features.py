@@ -5,6 +5,7 @@ import pytest
 from scpc.etl.competition_features import (
     build_competition_delta,
     build_competition_pairs,
+    build_competition_pairs_each,
     build_competition_tables,
     clean_competition_entities,
     compute_competition_features,
@@ -46,8 +47,10 @@ def test_build_pairs_and_deltas_respect_scoring_rules() -> None:
         scene_tags=scene_tags,
     )
     pairs = build_competition_pairs(entities, scoring_rules=rules)
+    pairs_each = build_competition_pairs_each(entities, scoring_rules=rules)
 
     assert set(pairs["opp_type"]) == {"leader", "median"}
+    assert not pairs_each.empty
 
     leader = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "leader")].iloc[0]
     assert leader["price_gap_leader"] == pytest.approx(1.50, rel=1e-3)
@@ -113,8 +116,10 @@ def test_build_tables_and_compute_competition_features() -> None:
 
     assert not tables.entities.empty
     assert not tables.pairs.empty
+    assert not tables.pairs_each.empty
     assert not tables.delta.empty
     assert not tables.summary.empty
+    pairs_each = tables.pairs_each
 
     summary_row = tables.summary.iloc[0]
     assert summary_row["my_asin_cnt"] == 1
@@ -123,7 +128,6 @@ def test_build_tables_and_compute_competition_features() -> None:
     assert summary_row["moves_price_down"] == 1
     assert summary_row["moves_new_video"] == 1
     assert summary_row["moves_badge_gain"] == 1
-    assert summary_row["avg_score_price"] == pytest.approx(0.613, rel=1e-3)
     assert summary_row["pressure_p90"] == pytest.approx(0.812, rel=1e-3)
 
     result = compute_competition_features(
@@ -147,8 +151,17 @@ def test_build_tables_and_compute_competition_features() -> None:
     assert leader_pair["my_change"]["price_net"] == pytest.approx(-1.959, rel=1e-3)
     assert leader_pair["my_change"]["badge_change"] == 1
     assert leader_pair["delta_pressure"] == pytest.approx(-0.0901, abs=5e-5)
+    assert leader_pair["primary_competitor"]["price_gap_each"] == pytest.approx(-0.499, rel=1e-3)
 
     summary = payload["summary"]
     assert summary["moves"]["moves_coupon_up"] == 1
-    assert summary["avg_scores"]["score_price"] == pytest.approx(0.613, rel=1e-3)
     assert summary["worsen_ratio"] == pytest.approx(0.0, abs=1e-4)
+    assert len(payload["top_opponents"]) == 1
+    top_entry = payload["top_opponents"][0]
+    assert top_entry["my_asin"] == "MY-ASIN-1"
+    assert top_entry["top_competitors"][0]["opp_asin"] == leader_pair["opp_asin"]
+    primary = pairs_each[(pairs_each["week"] == "2025W10") & (pairs_each["my_asin"] == "MY-ASIN-1")]
+    assert not primary.empty
+    leader_each = primary[primary["opp_asin"] == leader_pair["opp_asin"]].iloc[0]
+    assert leader_each["price_gap_each"] == pytest.approx(-0.499, rel=1e-3)
+

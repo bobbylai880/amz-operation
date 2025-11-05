@@ -111,12 +111,13 @@ DEFAULT_SCORING_RULES, DEFAULT_BAND_CUTS = _extract_rule_from_config(
 
 @dataclass(slots=True)
 class CompetitionFeatureResult:
-    """Container holding competition pair features and aggregates."""
+    """Container holding competition pair features, evidence, and aggregates."""
 
     metadata: dict[str, Any]
     pairs: list[dict[str, Any]]
     summary: dict[str, Any]
     insufficient_data: bool
+    top_opponents: list[dict[str, Any]] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Serialise the feature bundle into JSON-friendly primitives."""
@@ -126,6 +127,7 @@ class CompetitionFeatureResult:
             "pairs": self.pairs,
             "summary": self.summary,
             "insufficient_data": self.insufficient_data,
+            "top_opponents": self.top_opponents or [],
         }
         sunday = payload["metadata"].get("sunday")
         if isinstance(sunday, (pd.Timestamp, date)):
@@ -142,6 +144,7 @@ class CompetitionTables:
 
     entities: pd.DataFrame
     pairs: pd.DataFrame
+    pairs_each: pd.DataFrame
     delta: pd.DataFrame
     summary: pd.DataFrame
 
@@ -337,6 +340,43 @@ def build_competition_pairs(
     return pd.DataFrame.from_records(records, columns=_pair_columns())
 
 
+def build_competition_pairs_each(
+    entities: pd.DataFrame,
+    *,
+    scoring_rules: pd.DataFrame | dict[str, Any] | None = None,
+    rule_name: str = "default",
+) -> pd.DataFrame:
+    """Generate one-to-one competition records for every opposing ASIN."""
+
+    if entities.empty:
+        return pd.DataFrame(columns=_pair_each_columns())
+
+    feature_rules, band_cuts = _prepare_scoring_rules(scoring_rules, rule_name)
+
+    group_cols = ["scene_tag", "base_scene", "morphology", "marketplace_id", "week", "sunday"]
+    records: list[dict[str, Any]] = []
+
+    for _, group in entities.groupby(group_cols, dropna=False):
+        mine = group.loc[group["hyy_asin"] == 1]
+        competitors = group.loc[group["hyy_asin"] == 0]
+        if mine.empty or competitors.empty:
+            continue
+
+        for _, my_row in mine.iterrows():
+            for _, opp_row in competitors.iterrows():
+                record = _compute_pair_each_row(
+                    my_row,
+                    opp_row,
+                    feature_rules=feature_rules,
+                    band_cuts=band_cuts,
+                )
+                records.append(record)
+
+    if not records:
+        return pd.DataFrame(columns=_pair_each_columns())
+    return pd.DataFrame.from_records(records, columns=_pair_each_columns())
+
+
 def build_competition_delta(
     entities: pd.DataFrame,
     *,
@@ -468,11 +508,6 @@ def summarise_competition_scene(
         "moves_price_down": summary_stats["moves"]["moves_price_down"],
         "moves_new_video": summary_stats["moves"]["moves_new_video"],
         "moves_badge_gain": summary_stats["moves"]["moves_badge_gain"],
-        "avg_score_price": summary_stats["avg_scores"].get("score_price"),
-        "avg_score_rank": summary_stats["avg_scores"].get("score_rank"),
-        "avg_score_cont": summary_stats["avg_scores"].get("score_cont"),
-        "avg_score_soc": summary_stats["avg_scores"].get("score_soc"),
-        "avg_score_badge": summary_stats["avg_scores"].get("score_badge"),
     }
     return pd.DataFrame([row], columns=_summary_columns())
 
@@ -491,12 +526,16 @@ def build_competition_tables(
 
     entities = clean_competition_entities(snapshots, my_asins=my_asins, scene_tags=scene_tags)
     pairs = build_competition_pairs(entities, scoring_rules=scoring_rules, rule_name=rule_name)
+    pairs_each = build_competition_pairs_each(entities, scoring_rules=scoring_rules, rule_name=rule_name)
 
     target_weeks = {week}
     if previous_week:
         target_weeks.add(previous_week)
 
     pairs_subset = pairs.loc[pairs["week"].isin(target_weeks)].copy() if not pairs.empty else pairs
+    pairs_each_subset = (
+        pairs_each.loc[pairs_each["week"].isin(target_weeks)].copy() if not pairs_each.empty else pairs_each
+    )
     entities_subset = entities.loc[entities["week"].isin(target_weeks)].copy() if not entities.empty else entities
 
     pairs_current = _filter_week(pairs_subset, week)
@@ -520,6 +559,7 @@ def build_competition_tables(
     return CompetitionTables(
         entities=entities_subset,
         pairs=pairs_subset,
+        pairs_each=pairs_each_subset,
         delta=deltas,
         summary=summary,
     )
@@ -530,6 +570,7 @@ def compute_competition_features(
     *,
     entities: pd.DataFrame | None = None,
     pairs: pd.DataFrame | None = None,
+    pairs_each: pd.DataFrame | None = None,
     deltas: pd.DataFrame | None = None,
     week: str,
     previous_week: str | None = None,
@@ -554,12 +595,14 @@ def compute_competition_features(
         )
         entities = tables.entities
         pairs = tables.pairs
+        pairs_each = tables.pairs_each
         deltas = tables.delta
 
-    if entities is None or pairs is None or deltas is None:
-        raise ValueError("entities, pairs, and deltas must be provided")
+    if entities is None or pairs is None or deltas is None or pairs_each is None:
+        raise ValueError("entities, pairs, pairs_each, and deltas must be provided")
 
     pairs_current = _filter_week(pairs, week)
+    pairs_each_current = _filter_week(pairs_each, week)
     metadata = _extract_metadata(pairs_current, week)
 
     if previous_week:
@@ -591,11 +634,13 @@ def compute_competition_features(
             pairs=[],
             summary=summary,
             insufficient_data=True,
+            top_opponents=[],
         )
 
     entities_current = _filter_week(entities, week)
     entities_previous = _filter_week(entities, previous_week) if previous_week else entities.iloc[0:0]
     pairs_previous = _filter_week(pairs, previous_week) if previous_week else pairs.iloc[0:0]
+    pairs_each_previous = _filter_week(pairs_each, previous_week) if previous_week else pairs_each.iloc[0:0]
 
     if previous_week:
         metadata["previous_sunday"] = _extract_first_date(pairs_previous, "sunday") or _extract_first_date(
@@ -605,6 +650,10 @@ def compute_competition_features(
     delta_window = _filter_delta(deltas, week, previous_week)
 
     pair_features: list[dict[str, Any]] = []
+    pair_each_lookup = {
+        (row["my_asin"], row["opp_asin"]): row
+        for _, row in pairs_each_current.iterrows()
+    }
     for row in pairs_current.itertuples(index=False):
         prev_row = _match_previous_pair(pairs_previous, row)
         delta_row = _match_delta(delta_window, row)
@@ -612,6 +661,7 @@ def compute_competition_features(
         my_previous = _lookup_entity(entities_previous, row.my_asin)
         opp_current = _lookup_entity(entities_current, row.opp_asin)
         opp_previous = _lookup_entity(entities_previous, row.opp_asin)
+        pair_each_row = pair_each_lookup.get((row.my_asin, getattr(row, "opp_asin", None)))
 
         pair_features.append(
             _build_pair_feature(
@@ -622,6 +672,7 @@ def compute_competition_features(
                 my_previous=my_previous,
                 opp_current=opp_current,
                 opp_previous=opp_previous,
+                pair_each_row=pair_each_row,
             )
         )
 
@@ -632,11 +683,17 @@ def compute_competition_features(
         entities_previous=entities_previous,
     )
 
+    top_opponents = _build_top_opponents(
+        pairs_each_current=pairs_each_current,
+        pairs_each_previous=pairs_each_previous,
+    )
+
     return CompetitionFeatureResult(
         metadata=metadata,
         pairs=pair_features,
         summary=summary,
         insufficient_data=False,
+        top_opponents=top_opponents,
     )
 
 
@@ -709,6 +766,95 @@ def _prepare_scoring_rules(
     if band_cuts is None:
         band_cuts = DEFAULT_BAND_CUTS.copy()
     return feature_rules, band_cuts
+
+
+def _compute_pair_each_row(
+    my_row: Mapping[str, Any],
+    opp_row: Mapping[str, Any],
+    *,
+    feature_rules: dict[str, dict[str, float]],
+    band_cuts: dict[str, float],
+) -> dict[str, Any]:
+    my_badges = _normalise_badges(my_row.get("badge_json"))
+    opp_badges = _normalise_badges(opp_row.get("badge_json"))
+
+    my_price_net = _clean_float(my_row.get("price_net"))
+    opp_price_net = _clean_float(opp_row.get("price_net"))
+    price_gap_each = _diff_float(my_price_net, opp_price_net)
+    price_ratio_each = _safe_ratio(my_price_net, opp_price_net)
+
+    my_rank_leaf = _clean_int(my_row.get("rank_leaf"))
+    opp_rank_leaf = _clean_int(opp_row.get("rank_leaf"))
+    my_rank_pct = _clean_float(my_row.get("rank_score"))
+    opp_rank_pct = _clean_float(opp_row.get("rank_score"))
+    rank_pos_delta = _diff_float(my_rank_pct, opp_rank_pct)
+
+    my_content_score = _clean_float(my_row.get("content_score"))
+    opp_content_score = _clean_float(opp_row.get("content_score"))
+    content_gap_each = _diff_float(my_content_score, opp_content_score)
+
+    my_social_proof = _clean_float(my_row.get("social_proof"))
+    opp_social_proof = _clean_float(opp_row.get("social_proof"))
+    social_gap_each = _diff_float(my_social_proof, opp_social_proof)
+
+    badge_diff, badge_delta_sum = _badge_gap(my_badges, opp_badges)
+
+    score_price = _score_feature(price_gap_each, feature_rules.get("price"))
+    score_rank = _score_feature(rank_pos_delta, feature_rules.get("rank"))
+    score_cont = _score_feature(-content_gap_each if content_gap_each is not None else None, feature_rules.get("content"))
+    score_soc = _score_feature(-social_gap_each if social_gap_each is not None else None, feature_rules.get("social"))
+    score_badge = _score_feature(badge_delta_sum, feature_rules.get("badge"))
+
+    pressure = _weighted_sum(
+        [score_price, score_rank, score_cont, score_soc, score_badge],
+        [
+            feature_rules.get("price", {}).get("weight", 0.0),
+            feature_rules.get("rank", {}).get("weight", 0.0),
+            feature_rules.get("content", {}).get("weight", 0.0),
+            feature_rules.get("social", {}).get("weight", 0.0),
+            feature_rules.get("badge", {}).get("weight", 0.0),
+        ],
+    )
+    intensity_band = _assign_band(pressure, band_cuts)
+    confidence = _confidence([price_gap_each, rank_pos_delta, content_gap_each, social_gap_each, badge_delta_sum])
+
+    return {
+        "scene_tag": my_row.get("scene_tag"),
+        "base_scene": my_row.get("base_scene"),
+        "morphology": my_row.get("morphology"),
+        "marketplace_id": my_row.get("marketplace_id"),
+        "week": my_row.get("week"),
+        "sunday": my_row.get("sunday"),
+        "my_parent_asin": my_row.get("parent_asin"),
+        "my_asin": my_row.get("asin"),
+        "opp_parent_asin": opp_row.get("parent_asin"),
+        "opp_asin": opp_row.get("asin"),
+        "my_price_net": my_price_net,
+        "opp_price_net": opp_price_net,
+        "my_rank_leaf": my_rank_leaf,
+        "opp_rank_leaf": opp_rank_leaf,
+        "my_rank_pos_pct": my_rank_pct,
+        "opp_rank_pos_pct": opp_rank_pct,
+        "my_content_score": my_content_score,
+        "opp_content_score": opp_content_score,
+        "my_social_proof": my_social_proof,
+        "opp_social_proof": opp_social_proof,
+        "price_gap_each": price_gap_each,
+        "price_ratio_each": price_ratio_each,
+        "rank_pos_delta": rank_pos_delta,
+        "content_gap_each": content_gap_each,
+        "social_gap_each": social_gap_each,
+        "badge_diff": badge_diff,
+        "badge_delta_sum": badge_delta_sum,
+        "score_price": score_price,
+        "score_rank": score_rank,
+        "score_cont": score_cont,
+        "score_soc": score_soc,
+        "score_badge": score_badge,
+        "pressure": pressure,
+        "intensity_band": intensity_band,
+        "confidence": confidence,
+    }
 
 
 def _compute_pair_row(
@@ -891,6 +1037,46 @@ def _pair_columns() -> list[str]:
     ]
 
 
+def _pair_each_columns() -> list[str]:
+    return [
+        "scene_tag",
+        "base_scene",
+        "morphology",
+        "marketplace_id",
+        "week",
+        "sunday",
+        "my_parent_asin",
+        "my_asin",
+        "opp_parent_asin",
+        "opp_asin",
+        "my_price_net",
+        "opp_price_net",
+        "my_rank_leaf",
+        "opp_rank_leaf",
+        "my_rank_pos_pct",
+        "opp_rank_pos_pct",
+        "my_content_score",
+        "opp_content_score",
+        "my_social_proof",
+        "opp_social_proof",
+        "price_gap_each",
+        "price_ratio_each",
+        "rank_pos_delta",
+        "content_gap_each",
+        "social_gap_each",
+        "badge_diff",
+        "badge_delta_sum",
+        "score_price",
+        "score_rank",
+        "score_cont",
+        "score_soc",
+        "score_badge",
+        "pressure",
+        "intensity_band",
+        "confidence",
+    ]
+
+
 def _delta_columns() -> list[str]:
     return [
         "scene_tag",
@@ -936,11 +1122,6 @@ def _summary_columns() -> list[str]:
         "moves_price_down",
         "moves_new_video",
         "moves_badge_gain",
-        "avg_score_price",
-        "avg_score_rank",
-        "avg_score_cont",
-        "avg_score_soc",
-        "avg_score_badge",
     ]
 
 
@@ -1037,6 +1218,7 @@ def _build_pair_feature(
     my_previous: dict[str, Any] | None,
     opp_current: dict[str, Any] | None,
     opp_previous: dict[str, Any] | None,
+    pair_each_row: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     current_gap = _extract_gap(row._asdict())
     previous_gap = _extract_gap(prev_row) if prev_row else None
@@ -1046,6 +1228,7 @@ def _build_pair_feature(
     opp_snapshot = _build_entity_snapshot(opp_current)
     opp_change = _build_entity_change(opp_current, opp_previous)
     score_components = _extract_scores(row._asdict())
+    primary_competitor = _extract_pair_each_metrics(pair_each_row)
 
     return {
         "my_asin": row.my_asin,
@@ -1067,7 +1250,48 @@ def _build_pair_feature(
         "badge_diff": getattr(row, "badge_diff", None),
         "badge_delta_sum": _clean_int(getattr(row, "badge_delta_sum", None)),
         "delta_pressure": _clean_float(delta_row.get("delta_pressure")) if delta_row else None,
+        "primary_competitor": primary_competitor,
     }
+
+
+def _extract_pair_each_metrics(row: Mapping[str, Any] | pd.Series | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+
+    if isinstance(row, pd.Series):
+        data = row.to_dict()
+    else:
+        data = row
+
+    fields_float = (
+        "my_price_net",
+        "opp_price_net",
+        "price_gap_each",
+        "price_ratio_each",
+        "rank_pos_delta",
+        "content_gap_each",
+        "social_gap_each",
+        "pressure",
+        "confidence",
+    )
+    fields_int = ("my_rank_leaf", "opp_rank_leaf", "badge_delta_sum")
+    result: dict[str, Any] = {
+        "opp_asin": data.get("opp_asin"),
+        "opp_parent_asin": data.get("opp_parent_asin"),
+        "intensity_band": data.get("intensity_band"),
+        "badge_diff": data.get("badge_diff"),
+        "my_rank_pos_pct": _clean_float(data.get("my_rank_pos_pct")),
+        "opp_rank_pos_pct": _clean_float(data.get("opp_rank_pos_pct")),
+        "my_content_score": _clean_float(data.get("my_content_score")),
+        "opp_content_score": _clean_float(data.get("opp_content_score")),
+        "my_social_proof": _clean_float(data.get("my_social_proof")),
+        "opp_social_proof": _clean_float(data.get("opp_social_proof")),
+    }
+    for field in fields_float:
+        result[field] = _clean_float(data.get(field))
+    for field in fields_int:
+        result[field] = _clean_int(data.get(field))
+    return result
 
 
 def _extract_gap(row: dict[str, Any] | None) -> dict[str, float | None] | None:
@@ -1238,6 +1462,66 @@ def _build_summary(
         "avg_scores": avg_scores,
     }
     return summary
+
+
+def _build_top_opponents(
+    *,
+    pairs_each_current: pd.DataFrame,
+    pairs_each_previous: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    if pairs_each_current.empty:
+        return []
+
+    previous_lookup = {
+        (row["scene_tag"], row["marketplace_id"], row["my_asin"], row["opp_asin"]): row
+        for _, row in pairs_each_previous.iterrows()
+    }
+
+    group_cols = ["scene_tag", "base_scene", "morphology", "marketplace_id", "week", "my_asin"]
+    results: list[dict[str, Any]] = []
+
+    for _, group in pairs_each_current.groupby(group_cols, dropna=False):
+        base = group.iloc[0]
+        key_prefix = (base.get("scene_tag"), base.get("marketplace_id"), base.get("my_asin"))
+        opponents: list[dict[str, Any]] = []
+
+        sorted_group = group.sort_values(by="pressure", ascending=False, na_position="last").head(3)
+        for _, opp_row in sorted_group.iterrows():
+            prev_key = (*key_prefix, opp_row.get("opp_asin"))
+            prev_row = previous_lookup.get(prev_key)
+            opponents.append(
+                {
+                    "opp_asin": opp_row.get("opp_asin"),
+                    "opp_parent_asin": opp_row.get("opp_parent_asin"),
+                    "pressure": _clean_float(opp_row.get("pressure")),
+                    "delta_pressure": _diff_float(
+                        opp_row.get("pressure"),
+                        prev_row.get("pressure") if prev_row is not None else None,
+                    ),
+                    "intensity_band": opp_row.get("intensity_band"),
+                    "confidence": _clean_float(opp_row.get("confidence")),
+                    "price_gap_each": _clean_float(opp_row.get("price_gap_each")),
+                    "rank_pos_delta": _clean_float(opp_row.get("rank_pos_delta")),
+                    "content_gap_each": _clean_float(opp_row.get("content_gap_each")),
+                    "social_gap_each": _clean_float(opp_row.get("social_gap_each")),
+                    "badge_delta_sum": _clean_int(opp_row.get("badge_delta_sum")),
+                }
+            )
+
+        results.append(
+            {
+                "scene_tag": base.get("scene_tag"),
+                "base_scene": base.get("base_scene"),
+                "morphology": base.get("morphology"),
+                "marketplace_id": base.get("marketplace_id"),
+                "week": base.get("week"),
+                "my_parent_asin": base.get("my_parent_asin"),
+                "my_asin": base.get("my_asin"),
+                "top_competitors": opponents,
+            }
+        )
+
+    return results
 
 
 def _detect_moves(current: pd.DataFrame, previous: pd.DataFrame) -> dict[str, int]:
