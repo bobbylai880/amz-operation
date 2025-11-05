@@ -1,11 +1,144 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 
 
 MY_ASINS_SAMPLE = {"MY-ASIN-1"}
+
+
+def build_traffic_flow_sample() -> pd.DataFrame:
+    """Return synthetic weekly traffic mix records for three ASINs."""
+
+    records = [
+        {
+            "asin": "MY-ASIN-1",
+            "marketplace_id": "US",
+            "monday": date(2025, 3, 3),
+            "ad_ratio": 0.45,
+            "nf_ratio": 0.40,
+            "recommend_ratio": 0.15,
+            "sp_ratio": 0.30,
+            "sbv_ratio": 0.10,
+            "sb_ratio": 0.05,
+        },
+        {
+            "asin": "COMP-ASIN-1",
+            "marketplace_id": "US",
+            "monday": date(2025, 3, 3),
+            "ad_ratio": 0.55,
+            "nf_ratio": 0.35,
+            "recommend_ratio": 0.10,
+            "sp_ratio": 0.38,
+            "sbv_ratio": 0.10,
+            "sb_ratio": 0.07,
+        },
+        {
+            "asin": "COMP-ASIN-2",
+            "marketplace_id": "US",
+            "monday": date(2025, 3, 3),
+            "ad_ratio": 0.52,
+            "nf_ratio": 0.33,
+            "recommend_ratio": 0.15,
+            "sp_ratio": 0.34,
+            "sbv_ratio": 0.11,
+            "sb_ratio": 0.07,
+        },
+        {
+            "asin": "MY-ASIN-1",
+            "marketplace_id": "US",
+            "monday": date(2025, 2, 24),
+            "ad_ratio": 0.48,
+            "nf_ratio": 0.38,
+            "recommend_ratio": 0.14,
+            "sp_ratio": 0.32,
+            "sbv_ratio": 0.10,
+            "sb_ratio": 0.06,
+        },
+        {
+            "asin": "COMP-ASIN-1",
+            "marketplace_id": "US",
+            "monday": date(2025, 2, 24),
+            "ad_ratio": 0.58,
+            "nf_ratio": 0.32,
+            "recommend_ratio": 0.10,
+            "sp_ratio": 0.40,
+            "sbv_ratio": 0.09,
+            "sb_ratio": 0.07,
+        },
+        {
+            "asin": "COMP-ASIN-2",
+            "marketplace_id": "US",
+            "monday": date(2025, 2, 24),
+            "ad_ratio": 0.50,
+            "nf_ratio": 0.36,
+            "recommend_ratio": 0.14,
+            "sp_ratio": 0.33,
+            "sbv_ratio": 0.10,
+            "sb_ratio": 0.07,
+        },
+    ]
+    return pd.DataFrame.from_records(records)
+
+
+def build_keyword_daily_sample() -> pd.DataFrame:
+    """Return daily keyword ratio scores for two consecutive weeks."""
+
+    keywords = [
+        "brand bag",
+        "storage bag",
+        "vacuum competitor",
+        "organizer large",
+    ]
+
+    def _append(records: list[dict[str, object]], start: date, distribution: dict[str, list[float]]) -> None:
+        for offset in range(7):
+            current_day = start + timedelta(days=offset)
+            for asin, shares in distribution.items():
+                for keyword, ratio in zip(keywords, shares):
+                    records.append(
+                        {
+                            "asin": asin,
+                            "country": "US",
+                            "keyword": keyword,
+                            "snapshot_date": current_day,
+                            "ratio_score": ratio,
+                        }
+                    )
+
+    records: list[dict[str, object]] = []
+    _append(
+        records,
+        start=date(2025, 3, 3),
+        distribution={
+            "MY-ASIN-1": [0.35, 0.25, 0.25, 0.15],
+            "COMP-ASIN-1": [0.45, 0.35, 0.10, 0.10],
+            "COMP-ASIN-2": [0.40, 0.30, 0.20, 0.10],
+        },
+    )
+    _append(
+        records,
+        start=date(2025, 2, 24),
+        distribution={
+            "MY-ASIN-1": [0.30, 0.20, 0.30, 0.20],
+            "COMP-ASIN-1": [0.48, 0.30, 0.12, 0.10],
+            "COMP-ASIN-2": [0.42, 0.28, 0.20, 0.10],
+        },
+    )
+    return pd.DataFrame.from_records(records)
+
+
+def build_keyword_tag_sample() -> pd.DataFrame:
+    """Return keyword-to-tag mapping used for traffic keyword aggregation."""
+
+    records = [
+        {"keyword": "brand bag", "tag": "brand"},
+        {"keyword": "storage bag", "tag": "generic"},
+        {"keyword": "vacuum competitor", "tag": "competitor"},
+        {"keyword": "organizer large", "tag": "attribute"},
+    ]
+    return pd.DataFrame.from_records(records)
 
 
 def build_competition_snapshot_sample() -> pd.DataFrame:
