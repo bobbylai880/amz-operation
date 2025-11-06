@@ -102,6 +102,14 @@ def _iso_week_to_dates(week: str) -> tuple[date, date]:
     return monday, sunday
 
 
+def _format_monday_for_weekly_query(monday: date) -> str:
+    """Return the string representation Doris expects for weekly flow ``monday``."""
+
+    if not isinstance(monday, date):
+        raise TypeError("monday must be a date object")
+    return monday.strftime("%Y%m%d")
+
+
 def _configure_logging() -> None:
     level = os.getenv("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -386,7 +394,7 @@ def run_competition_pipeline(
     flow_df = _read_dataframe(
         engine,
         FLOW_SQL,
-        {"mk": marketplace_id, "monday": monday.isoformat()},
+        {"mk": marketplace_id, "monday": _format_monday_for_weekly_query(monday)},
     )
     flow_df = _normalise_flow_dataframe(flow_df)
     LOGGER.info(

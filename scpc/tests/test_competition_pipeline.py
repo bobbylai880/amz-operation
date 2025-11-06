@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, text
 from scpc.etl.competition_features import build_traffic_features
 
 from scpc.etl.competition_pipeline import (
+    _format_monday_for_weekly_query,
     _iso_week_to_dates,
     _latest_week_with_data,
     _normalise_flow_dataframe,
@@ -100,7 +101,7 @@ def test_normalise_flow_dataframe_adds_calendar_fields() -> None:
             {
                 "asin": "A1",
                 "marketplace_id": "US",
-                "monday": "2025-03-03",
+                "monday": "20250303",
                 "广告流量占比": "0.25",
                 "自然流量占比": 0.50,
                 "推荐流量占比": 0.25,
@@ -130,6 +131,15 @@ def test_normalise_flow_dataframe_adds_calendar_fields() -> None:
     assert normalised.loc[0, "monday"] == date(2025, 3, 3)
     assert normalised.loc[0, "sunday"] == date(2025, 3, 9)
     assert normalised.loc[0, "week"] == "2025W10"
+
+
+def test_format_monday_for_weekly_query_returns_compact_string() -> None:
+    assert _format_monday_for_weekly_query(date(2025, 3, 3)) == "20250303"
+
+
+def test_format_monday_for_weekly_query_rejects_non_date() -> None:
+    with pytest.raises(TypeError):
+        _format_monday_for_weekly_query("20250303")
 
 
 def test_latest_week_with_data_returns_latest_label() -> None:
