@@ -416,6 +416,51 @@ def _prune_to_table(
     return pruned, drop_cols, missing
 
 
+def _run_post_write_checks(engine: Engine, marketplace_id: str, week: str) -> None:
+    """Execute verification queries to confirm rows exist for the target slice."""
+
+    commands = [
+        (
+            ENTITIES_TABLE,
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {ENTITIES_TABLE} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            ),
+        ),
+        (
+            TRAFFIC_TABLE,
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {TRAFFIC_TABLE} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            ),
+        ),
+    ]
+
+    with engine.connect() as conn:
+        for idx, (table, stmt) in enumerate(commands, start=1):
+            command_preview = (
+                f"SELECT COUNT(*) AS row_count FROM {table} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            )
+            LOGGER.info(
+                "competition_pipeline_check_step step=%d table=%s command=%s",
+                idx,
+                table,
+                command_preview,
+            )
+            result = conn.execute(stmt, {"mk": marketplace_id, "week": week})
+            row_count = result.scalar() or 0
+            status = "ok" if row_count > 0 else "empty"
+            log_fn = LOGGER.info if row_count > 0 else LOGGER.warning
+            log_fn(
+                "competition_pipeline_check_result step=%d table=%s row_count=%d status=%s",
+                idx,
+                table,
+                row_count,
+                status,
+            )
+
+
 def run_competition_pipeline(
     week: str | None,
     marketplace_id: str,
@@ -630,6 +675,7 @@ def run_competition_pipeline(
             chunk_size=chunk_size,
         )
         LOGGER.info("competition_pipeline_traffic_written rows=%d", traffic_written)
+        _run_post_write_checks(engine, marketplace_id, resolved_week)
 
     return results
 
@@ -727,6 +773,7 @@ __all__ = [
     "_latest_week_with_data",
     "_prune_traffic_columns",
     "_prune_to_table",
+    "_run_post_write_checks",
     "_load_table_columns",
     "TRAFFIC_ONLY_COLUMNS",
     "ENTITIES_TABLE",

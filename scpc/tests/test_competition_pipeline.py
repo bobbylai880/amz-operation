@@ -21,6 +21,7 @@ from scpc.etl.competition_pipeline import (
     _prepare_traffic_entities,
     _prune_traffic_columns,
     _prune_to_table,
+    _run_post_write_checks,
     TRAFFIC_ONLY_COLUMNS,
 )
 from scpc.tests.data.competition_samples import (
@@ -251,4 +252,62 @@ def test_latest_week_with_data_raises_when_missing_snapshot() -> None:
 
     with pytest.raises(RuntimeError):
         _latest_week_with_data(engine, "US")
+
+
+def test_run_post_write_checks_logs_commands_and_results(caplog) -> None:
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE bi_amz_comp_entities_clean (
+                    marketplace_id TEXT,
+                    week TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE bi_amz_comp_traffic_entities_weekly (
+                    marketplace_id TEXT,
+                    week TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO bi_amz_comp_entities_clean VALUES (:mk, :week)"
+            ),
+            {"mk": "US", "week": "2025W10"},
+        )
+
+    caplog.set_level("INFO", logger="scpc.etl.competition_pipeline")
+    _run_post_write_checks(engine, "US", "2025W10")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "competition_pipeline_check_step" in message
+        and "table=bi_amz_comp_entities_clean" in message
+        for message in messages
+    )
+    assert any(
+        "competition_pipeline_check_step" in message
+        and "table=bi_amz_comp_traffic_entities_weekly" in message
+        for message in messages
+    )
+    assert any(
+        "competition_pipeline_check_result" in message
+        and "table=bi_amz_comp_entities_clean" in message
+        and "status=ok" in message
+        for message in messages
+    )
+    assert any(
+        "competition_pipeline_check_result" in message
+        and "table=bi_amz_comp_traffic_entities_weekly" in message
+        and "status=empty" in message
+        for message in messages
+    )
 
