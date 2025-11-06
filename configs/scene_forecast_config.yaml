@@ -37,6 +37,7 @@ scene_forecast:
     pct_digits: 2              # 百分比保留小数位
     vol_digits: 2              # 数量保留小数位
     wow_digits: 4              # WoW中位数精度
+    max_top_keywords: 3        # TopN 关键词上限（>=1）
 
   # -------------------------------
   # 六、日志与重试策略
