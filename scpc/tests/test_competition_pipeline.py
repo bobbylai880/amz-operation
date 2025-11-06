@@ -22,10 +22,17 @@ from scpc.tests.data.competition_samples import (
 )
 
 
-def test_iso_week_to_dates_returns_monday_sunday() -> None:
-    monday, sunday = _iso_week_to_dates("2025W10")
+@pytest.mark.parametrize("label", ["2025W10", "2025-W10"])
+def test_iso_week_to_dates_returns_monday_sunday(label: str) -> None:
+    monday, sunday = _iso_week_to_dates(label)
     assert monday == date(2025, 3, 3)
     assert sunday == date(2025, 3, 9)
+
+
+@pytest.mark.parametrize("label", ["", "2025-XX", "2025W60"])
+def test_iso_week_to_dates_rejects_invalid_inputs(label: str) -> None:
+    with pytest.raises(ValueError):
+        _iso_week_to_dates(label)
 
 
 def test_prepare_traffic_entities_merges_scene_and_parent() -> None:

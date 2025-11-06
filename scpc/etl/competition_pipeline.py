@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -73,14 +74,19 @@ WHERE is_active = 1
 def _iso_week_to_dates(week: str) -> tuple[date, date]:
     """Return the Monday and Sunday for an ISO formatted ``YYYYWww`` label."""
 
-    if not week or len(week) < 7 or "W" not in week:
+    if not week:
         raise ValueError(f"Invalid ISO week label: {week}")
-    year_part, week_part = week.split("W", 1)
-    try:
-        year = int(year_part)
-        week_num = int(week_part)
-    except ValueError as exc:  # pragma: no cover - defensive guard
-        raise ValueError(f"Invalid ISO week label: {week}") from exc
+
+    normalized = week.strip()
+    match = re.fullmatch(r"(\d{4})-?W(\d{1,2})", normalized)
+    if not match:
+        raise ValueError(f"Invalid ISO week label: {week}")
+
+    year = int(match.group(1))
+    week_num = int(match.group(2))
+    if week_num < 1 or week_num > 53:
+        raise ValueError(f"Invalid ISO week label: {week}")
+
     monday = date.fromisocalendar(year, week_num, 1)
     sunday = monday + timedelta(days=6)
     return monday, sunday
