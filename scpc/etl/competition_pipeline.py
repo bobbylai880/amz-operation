@@ -54,7 +54,7 @@ SELECT asin, marketplace_id, week, sunday,
        ad_ratio, nf_ratio, recommend_ratio,
        sp_ratio, sbv_ratio, sb_ratio
 FROM vw_sif_asin_flow_overview_weekly_std
-WHERE marketplace_id = :mk AND week = :week
+WHERE marketplace_id = :mk AND sunday = :sunday
 """
 
 KEYWORD_SQL = """
@@ -322,7 +322,9 @@ def run_competition_pipeline(
         )
 
     flow_df = _read_dataframe(
-        engine, FLOW_SQL, {"mk": marketplace_id, "week": resolved_week}
+        engine,
+        FLOW_SQL,
+        {"mk": marketplace_id, "sunday": sunday},
     )
     LOGGER.info(
         "competition_pipeline_flow_fetched week=%s rows=%d",
