@@ -226,3 +226,50 @@ def test_build_tables_and_compute_competition_features() -> None:
     assert not traffic_primary.empty
     leader_traffic_each = traffic_primary.iloc[0]
     assert leader_traffic_each["t_pressure"] is not None
+
+
+def test_competition_pipeline_two_level_judgement() -> None:
+    snapshots = build_competition_snapshot_sample().drop(columns=["scene_tag", "base_scene", "morphology"])
+    scene_tags = build_scene_tag_sample()
+    rules = build_scoring_rules_sample()
+    traffic, *_ = _build_traffic_features()
+
+    tables = build_competition_tables(
+        snapshots,
+        week="2025W10",
+        previous_week="2025W09",
+        my_asins=MY_ASINS_SAMPLE,
+        scene_tags=scene_tags,
+        scoring_rules=rules,
+        traffic=traffic,
+    )
+
+    result = compute_competition_features(
+        entities=tables.entities,
+        traffic_entities=tables.traffic_entities,
+        pairs=tables.pairs,
+        traffic_pairs=tables.traffic_pairs,
+        pairs_each=tables.pairs_each,
+        traffic_pairs_each=tables.traffic_pairs_each,
+        deltas=tables.delta,
+        week="2025W10",
+        previous_week="2025W09",
+    )
+
+    payload = result.as_dict()
+    assert len(payload["pairs"]) == 2
+
+    leader_pair = next(pair for pair in payload["pairs"] if pair["opp_type"] == "leader")
+    assert leader_pair["current_gap"]["price_gap_leader"] is not None
+    assert leader_pair["score_components"]["score_price"] is not None
+    assert leader_pair["traffic"]["gap"]["mix"]["ad_ratio_gap"] is not None
+    assert leader_pair["traffic"]["scores"]["pressure"] is not None
+    assert leader_pair["traffic"]["confidence"]["overall"] is not None
+    assert leader_pair["my_snapshot"]["ad_ratio"] is not None
+    assert leader_pair["opp_snapshot"]["ad_ratio"] is not None
+    assert leader_pair["primary_competitor"]["traffic_scores"]["pressure"] is not None
+
+    summary = payload["summary"]
+    assert summary["avg_scores"]["score_price"] is not None
+    assert summary["traffic"]["lagging_pairs"] >= 0
+    assert payload["top_opponents"]

@@ -77,42 +77,43 @@ python -m scpc.etl.scene_pipeline \
 中构造的“浴室架”场景样例（关键词：shower caddy / shower bag，周度事实来自 Doris 视图快照），可模拟缺失周、长缺口
 与 WoW 正负驱动，确保关键逻辑在无真实数据库时也能复现。
 
-## Competition 模块：竞对特征工程
-`scpc/etl/competition_features.py` 将竞争分析扩展为“事实→特征→对比→规则→LLM”的端到端流水线：从 Doris 周度快照抽取实体特征，拼接广告/自然/推荐流量与关键词结构，再生成主配对与逐对配对，衍生环比、场景汇总、落后洞察与根因证据包，为 LLM 判因提供统一事实底座。
+## Competition 模块：第二层页面 + 流量竞对
+`scpc/etl/competition_features.py` 将竞争分析拆解为“页面事实 + 流量事实”的双轨特征工程。整个第二层竞争对比遵循 **事实表 → 特征 → 对比 → 规则 → LLM** 的主逻辑，先以页面与流量维度形成量化结论，再由 LLM 补充结构化洞察与文本总结。
+
+### 主逻辑：事实 → 特征 → 对比 → 规则 → LLM
+1. **事实表（Facts）**
+   - 页面侧：`bi_amz_asin_product_snapshot` 与 `bi_amz_asin_scene_tag` 提供 ASIN 周级快照、场景映射、我方标记。
+   - 流量侧：`vw_sif_asin_flow_overview_weekly_std`、`vw_sif_keyword_daily_std`、`bi_amz_comp_kw_tag` 提供广告/自然/推荐流量与 7 天关键词结构。
+2. **特征生成（Features）**
+   - `clean_competition_entities()` 衍生净价、排名、内容/社交得分，并融合 `build_traffic_features()` 产出的广告结构、关键词集中度等流量特征，落地到 `bi_amz_comp_entities_clean`/`bi_amz_comp_traffic_entities_weekly`。
+3. **对比构建（Compare）**
+   - 页面主配对：`build_competition_pairs()` 计算我方对 Leader/Median 的价差、排名、内容、社交、徽章差距及对应得分；
+   - 流量主配对：同函数返回的 `traffic_pairs` 描述广告结构与关键词缺口；
+   - 逐对配对与环比：`build_competition_pairs_each()`、`build_competition_delta()`、`summarise_competition_scene()` 分别刻画具体竞品、WoW 变化及场景周报指标。
+4. **规则判定（Rules）**
+   - 评分参数取自 `configs/competition_scoring.yaml` 与 `default_traffic`，在主配对与逐对配对中计算 `score_*`、`t_score_*`、`pressure`、`t_pressure` 等结构化分值，形成页面 + 流量两条判断链；
+   - 若接入自定义规则，可进一步将结果写入 `bi_amz_comp_lag_insights` 用于自动落后判定。
+5. **LLM 二次判断（LLM）**
+   - `compute_competition_features()` 将对比结果、评分、环比与 Top 对手整合为 `CompetitionFeatureResult`，供 LLM 第二层判因使用；
+   - `pairs` 中的 `score_components`（页面规则结论）与 `traffic.scores/confidence`（流量规则结论）同时暴露给 LLM，实现页面 + 流量双维度复核；
+   - 后续可按需要扩展到 `assemble_llm_packets()`、`create_llm_overview()` 等接口，为 LLM 提供落后洞察与证据包。
 
 ### 数据契约
-- **输入事实层**：
-  - `bi_amz_asin_product_snapshot`：ASIN 页面周级快照（含锚点/补录、价格、排名、素材、优惠等原子字段）。
-  - `bi_amz_asin_scene_tag`：场景形态标签映射，补齐 `scene_tag/base_scene/morphology/hyy_asin`。
-- **输入流量层（可选）**：
-  - `vw_sif_asin_flow_overview_weekly_std`：ASIN×周的广告/自然/推荐流量占比，统一到周日锚点并提供广告内部配比。
-  - `vw_sif_keyword_daily_std` + `bi_amz_comp_kw_tag`：关键词日表与类型词典，构造 7D 均值的熵值、HHI、TopK 占比与品牌/竞品等份额。
-- **流量特征写入**：`build_traffic_features()` 可直接消化上述视图输出，生成 `bi_amz_comp_traffic_entities_weekly` 对齐的字段集合，供页面快照在实体层融合。
-- **特征与对比层输出**：
-  1. `clean_competition_entities()` → `bi_amz_comp_entities_clean`：计算净价、排名、内容/社交得分并融合流量结构、关键词集中度，区分我方与竞品实体。
-  2. `build_competition_pairs()` → `bi_amz_comp_pairs`：按 Leader/Median 口径输出主配对差异、流量 gap/score、压力带与置信度。
-  3. `build_competition_pairs_each()` → `bi_amz_comp_pairs_each`：沉淀我方 ASIN 与每个竞品的逐对差异、流量缺口与对手证据。
-  4. `build_competition_delta()` → `bi_amz_comp_delta`：严格 7D 环比窗口，追踪价差、压力、流量得分的 WoW 变化。
-  5. `summarise_competition_scene()` → `bi_amz_comp_scene_week_metrics`：场景级周汇总，统计压力分位、流量压力/覆盖率与关键动作。
-- **规则与 LLM 层输出**：
-  6. `score_lag_signals()` → `bi_amz_comp_lag_insights`：匹配 `bi_amz_comp_lag_rule`，识别页面/流量落后类型、严重度与 Top 竞品。
-  7. `assemble_llm_packets()` → `bi_amz_comp_llm_packet`：按 lag_type 打包根因证据 JSON 与 Prompt Hint，涵盖流量证据包。
-  8. `create_llm_overview()` → `vw_amz_comp_llm_overview`：供 LLM 快速判定 lag_type 的概览视图（含 `traffic_mix`/`keyword` 信号）。
+- **输入事实层**：页面与场景标签 (`bi_amz_asin_product_snapshot`、`bi_amz_asin_scene_tag`)；
+- **输入流量层（可选）**：流量周视图与关键词日视图 (`vw_sif_asin_flow_overview_weekly_std`、`vw_sif_keyword_daily_std`、`bi_amz_comp_kw_tag`)；
+- **特征/对比输出**：
+  1. `clean_competition_entities()` → `bi_amz_comp_entities_clean`
+  2. `build_traffic_features()` → `bi_amz_comp_traffic_entities_weekly`
+  3. `build_competition_pairs()`/`build_competition_pairs_each()` → 页面与流量主配对、逐对配对
+  4. `build_competition_delta()`、`summarise_competition_scene()` → WoW 变化与场景周报指标
+  5. `build_competition_tables()`、`compute_competition_features()` → LLM 消费的结构化事实
 
 ### 处理流程
-1. **流量标准化**：`build_traffic_features` 合并流量周视图与关键词日表，输出广告结构、关键词集中度与类型占比，自动处理 7D 覆盖率与分母保护（`eps`）。
-2. **事实→特征**：`clean_competition_entities` 在页面快照的基础上融合流量特征，补齐我方标记并衍生 `price_net/rank_score/social_proof/content_score` 等指标，结果写入 `bi_amz_comp_entities_clean`。
-3. **特征→对比（周内）**：
-   - `build_competition_pairs` 选取 Leader/Median 竞品，与我方比较价差、排名、内容、社交、徽章及流量结构差异，依据 `configs/competition_scoring.yaml` 和 `default_traffic` 策略计算多维得分与压力带；
-   - `build_competition_pairs_each` 输出我方 × 所有竞品的逐对配对，用于落后洞察、Top 对手识别与 LLM 证据复用。
-4. **对比→环比/汇总**：
-   - `build_competition_delta` 结合上一周主配对与实体特征，计算 WoW 差异、流量 gap 变化与压力变化；
-   - `summarise_competition_scene` 汇聚主配对与环比，生成场景周报级指标、动作计数，以及流量压力/覆盖率分位。
-5. **规则→洞察**：`score_lag_signals` 根据 `bi_amz_comp_lag_rule` 与 `default_traffic` 规则，对主/逐对配对执行落后判定，产出 `lag_type/opp_type/severity`、流量落后类型与 Top 对手列表。
-6. **LLM 判因**：
-   - `create_llm_overview` 汇总核心指标（价差、排名、内容、流量得分、置信度等）供 LLM 第一层级判定问题所在；
-   - `assemble_llm_packets` 为每种 lag_type 准备根因证据包（我方/竞品/差异/Top 对手/提示语），包含流量 gap、关键词类型缺口等关键信息。
-7. **一键编排**：`build_competition_tables` 返回实体、主配对、逐对配对、环比、场景汇总五张 DataFrame；`compute_competition_features` 在此基础上构造 LLM Facts（概览 + 落后洞察 + 证据包），并附带 `traffic_gap/traffic_scores/traffic_confidence` 字段。
+1. **流量标准化**：`build_traffic_features` 合并流量周视图与关键词日表，输出广告结构、关键词集中度与类型占比（含覆盖率与分母保护）。
+2. **事实→特征**：`clean_competition_entities` 将页面快照与场景映射、流量特征拼接，计算净价、排名、内容/社交/流量得分，区分我方与竞品。
+3. **特征→对比**：`build_competition_pairs` / `build_competition_pairs_each` 依据评分规则生成 Leader/Median 与逐对差异，同时产出流量缺口、压力与置信度；
+4. **对比→环比/汇总**：`build_competition_delta`、`summarise_competition_scene` 追踪 WoW 变化、竞品动作与场景级压力带；
+5. **规则→LLM**：`compute_competition_features` 汇总页面得分 (`score_components`) 与流量得分 (`traffic.scores`)，连同环比、Top 对手、动作指标，形成 LLM 第二层判因输入。
 
 ### 使用示例
 ```python
@@ -159,8 +160,11 @@ result = compute_competition_features(
 `tables` 可直接写入 Doris，`result.as_dict()` 则用于 LLM 消费与 JSON Schema 校验。
 
 ### 模块测试
+安装依赖：`pip install -r requirements-dev.txt`
+
 `pytest scpc/tests/test_competition_features.py`
-覆盖实体清洗、竞品配对、环比计算与 LLM Facts 组装全链路，并基于 `scpc/tests/data/competition_samples.py` 提供的两周样例数据验证 Sigmoid 打分、压力分档、流量缺口与动作识别逻辑。
+
+测试用例通过 `scpc/tests/data/competition_samples.py` 构造页面与流量事实表，覆盖 `build_traffic_features`、`clean_competition_entities`、主/逐对配对、环比汇总以及 `compute_competition_features` 生成的页面 + 流量双维度判断链，确保第二层竞争主逻辑顺畅运行。
 
 ## 目录结构
 ```

@@ -1961,6 +1961,9 @@ def _compute_traffic_metrics(
         "t_pressure": t_pressure,
         "t_intensity_band": t_band,
         "t_confidence": t_confidence,
+        "t_mix_confidence": mix_confidence,
+        "t_keyword_confidence": keyword_confidence,
+        "t_coverage_ratio": coverage_ratio,
     }
 def _compute_pair_each_row(
     my_row: Mapping[str, Any],
@@ -2020,6 +2023,27 @@ def _compute_pair_each_row(
         traffic_median=traffic_median,
         context=traffic_context,
     )
+    traffic_gap = _extract_traffic_gap(traffic_metrics)
+    traffic_scores = _extract_traffic_scores(traffic_metrics, traffic_context)
+    traffic_confidence = _extract_traffic_confidence(
+        traffic_metrics,
+        my_row,
+        opp_row,
+        traffic_context,
+    )
+    mix_components = (
+        traffic_scores.get("mix_components")
+        if isinstance(traffic_scores, Mapping)
+        else {}
+    )
+    keyword_components = (
+        traffic_scores.get("keyword_components")
+        if isinstance(traffic_scores, Mapping)
+        else {}
+    )
+    mix_confidence = _clean_float(traffic_confidence.get("mix")) if isinstance(traffic_confidence, Mapping) else None
+    keyword_confidence = _clean_float(traffic_confidence.get("keyword")) if isinstance(traffic_confidence, Mapping) else None
+    coverage_ratio = _clean_float(traffic_confidence.get("coverage")) if isinstance(traffic_confidence, Mapping) else None
 
     record = {
         "scene_tag": my_row.get("scene_tag"),
@@ -2060,6 +2084,31 @@ def _compute_pair_each_row(
         "traffic_gap": traffic_gap,
         "traffic_scores": traffic_scores,
         "traffic_confidence": traffic_confidence,
+        "ad_ratio_gap": _clean_float(traffic_metrics.get("ad_ratio_gap_leader")),
+        "ad_ratio_index_med": _clean_float(traffic_metrics.get("ad_ratio_index_med")),
+        "ad_to_natural_gap": _clean_float(traffic_metrics.get("ad_to_natural_gap")),
+        "sp_share_in_ad_gap": _clean_float(traffic_metrics.get("sp_share_in_ad_gap")),
+        "sbv_share_in_ad_gap": _clean_float(traffic_metrics.get("sbv_share_in_ad_gap")),
+        "sb_share_in_ad_gap": _clean_float(traffic_metrics.get("sb_share_in_ad_gap")),
+        "kw_entropy_gap": _clean_float(traffic_metrics.get("kw_entropy_gap")),
+        "kw_hhi_gap": _clean_float(traffic_metrics.get("kw_hhi_gap")),
+        "kw_top1_share_gap": _clean_float(traffic_metrics.get("kw_top1_share_gap")),
+        "kw_top3_share_gap": _clean_float(traffic_metrics.get("kw_top3_share_gap")),
+        "kw_top10_share_gap": _clean_float(traffic_metrics.get("kw_top10_share_gap")),
+        "kw_brand_share_gap": _clean_float(traffic_metrics.get("kw_brand_share_gap")),
+        "kw_competitor_share_gap": _clean_float(traffic_metrics.get("kw_competitor_share_gap")),
+        "kw_generic_share_gap": _clean_float(traffic_metrics.get("kw_generic_share_gap")),
+        "kw_attribute_share_gap": _clean_float(traffic_metrics.get("kw_attribute_share_gap")),
+        "t_score_mix": _clean_float(traffic_metrics.get("t_score_mix")),
+        "t_score_kw": _clean_float(traffic_metrics.get("t_score_kw")),
+        "t_pressure": _clean_float(traffic_metrics.get("t_pressure")),
+        "t_intensity_band": traffic_metrics.get("t_intensity_band"),
+        "t_mix_confidence": mix_confidence,
+        "t_keyword_confidence": keyword_confidence,
+        "t_coverage_ratio": coverage_ratio,
+        "t_confidence": _clean_float(traffic_metrics.get("t_confidence")),
+        "t_mix_scores": mix_components,
+        "t_keyword_scores": keyword_components,
     }
     return record, traffic_metrics
 
@@ -2112,6 +2161,27 @@ def _compute_pair_row(
         traffic_median=traffic_median,
         context=traffic_context,
     )
+    traffic_gap = _extract_traffic_gap(traffic_metrics)
+    traffic_scores = _extract_traffic_scores(traffic_metrics, traffic_context)
+    traffic_confidence = _extract_traffic_confidence(
+        traffic_metrics,
+        my_row,
+        opp_row,
+        traffic_context,
+    )
+    mix_components = (
+        traffic_scores.get("mix_components")
+        if isinstance(traffic_scores, Mapping)
+        else {}
+    )
+    keyword_components = (
+        traffic_scores.get("keyword_components")
+        if isinstance(traffic_scores, Mapping)
+        else {}
+    )
+    mix_confidence = _clean_float(traffic_confidence.get("mix")) if isinstance(traffic_confidence, Mapping) else None
+    keyword_confidence = _clean_float(traffic_confidence.get("keyword")) if isinstance(traffic_confidence, Mapping) else None
+    coverage_ratio = _clean_float(traffic_confidence.get("coverage")) if isinstance(traffic_confidence, Mapping) else None
 
     record = {
         "scene_tag": my_row.get("scene_tag"),
@@ -2144,6 +2214,31 @@ def _compute_pair_row(
         "traffic_gap": traffic_gap,
         "traffic_scores": traffic_scores,
         "traffic_confidence": traffic_confidence,
+        "ad_ratio_gap": _clean_float(traffic_metrics.get("ad_ratio_gap_leader")),
+        "ad_ratio_index_med": _clean_float(traffic_metrics.get("ad_ratio_index_med")),
+        "ad_to_natural_gap": _clean_float(traffic_metrics.get("ad_to_natural_gap")),
+        "sp_share_in_ad_gap": _clean_float(traffic_metrics.get("sp_share_in_ad_gap")),
+        "sbv_share_in_ad_gap": _clean_float(traffic_metrics.get("sbv_share_in_ad_gap")),
+        "sb_share_in_ad_gap": _clean_float(traffic_metrics.get("sb_share_in_ad_gap")),
+        "kw_entropy_gap": _clean_float(traffic_metrics.get("kw_entropy_gap")),
+        "kw_hhi_gap": _clean_float(traffic_metrics.get("kw_hhi_gap")),
+        "kw_top1_share_gap": _clean_float(traffic_metrics.get("kw_top1_share_gap")),
+        "kw_top3_share_gap": _clean_float(traffic_metrics.get("kw_top3_share_gap")),
+        "kw_top10_share_gap": _clean_float(traffic_metrics.get("kw_top10_share_gap")),
+        "kw_brand_share_gap": _clean_float(traffic_metrics.get("kw_brand_share_gap")),
+        "kw_competitor_share_gap": _clean_float(traffic_metrics.get("kw_competitor_share_gap")),
+        "kw_generic_share_gap": _clean_float(traffic_metrics.get("kw_generic_share_gap")),
+        "kw_attribute_share_gap": _clean_float(traffic_metrics.get("kw_attribute_share_gap")),
+        "t_score_mix": _clean_float(traffic_metrics.get("t_score_mix")),
+        "t_score_kw": _clean_float(traffic_metrics.get("t_score_kw")),
+        "t_pressure": _clean_float(traffic_metrics.get("t_pressure")),
+        "t_intensity_band": traffic_metrics.get("t_intensity_band"),
+        "t_mix_confidence": mix_confidence,
+        "t_keyword_confidence": keyword_confidence,
+        "t_coverage_ratio": coverage_ratio,
+        "t_confidence": _clean_float(traffic_metrics.get("t_confidence")),
+        "t_mix_scores": mix_components,
+        "t_keyword_scores": keyword_components,
     }
     return record, traffic_metrics
 
@@ -2728,7 +2823,7 @@ def _build_pair_feature(
     previous_gap = _extract_gap(prev_row) if prev_row else None
     delta_gap = _extract_delta_gap(delta_row, row._asdict(), prev_row)
     traffic_gap = _extract_traffic_gap(traffic_row)
-    traffic_delta = _extract_traffic_delta(traffic_row, traffic_prev_row)
+    traffic_delta = _extract_traffic_delta(None, traffic_row, traffic_prev_row)
     traffic_scores = _extract_traffic_scores(traffic_row, traffic_context)
     traffic_confidence = _extract_traffic_confidence(
         traffic_row,
@@ -2804,7 +2899,7 @@ def _extract_pair_each_metrics(
     traffic_gap = _extract_traffic_gap(traffic_data)
     traffic_scores = _extract_traffic_scores(traffic_data, traffic_context)
     traffic_confidence = _extract_traffic_confidence(traffic_data, None, None, traffic_context)
-    traffic_delta = _extract_traffic_delta(traffic_data, traffic_prev)
+    traffic_delta = _extract_traffic_delta(None, traffic_data, traffic_prev)
 
     fields_float = (
         "my_price_net",
@@ -2984,44 +3079,6 @@ def _extract_traffic_confidence(
     }
 
 
-def _extract_traffic_delta(
-    current_row: Mapping[str, Any] | None,
-    previous_row: Mapping[str, Any] | None,
-) -> dict[str, dict[str, float | None]]:
-    if current_row is None or previous_row is None:
-        return {"mix": {}, "keyword": {}, "scores": {}}
-
-    def _diff(field: str) -> float | None:
-        return _diff_float(current_row.get(field), previous_row.get(field))
-
-    mix_delta = {
-        "ad_ratio_gap": _diff("ad_ratio_gap_leader"),
-        "ad_ratio_index_med": _diff("ad_ratio_index_med"),
-        "ad_to_natural_gap": _diff("ad_to_natural_gap"),
-        "sp_share_in_ad_gap": _diff("sp_share_in_ad_gap"),
-        "sbv_share_in_ad_gap": _diff("sbv_share_in_ad_gap"),
-        "sb_share_in_ad_gap": _diff("sb_share_in_ad_gap"),
-    }
-    keyword_delta = {
-        "kw_entropy_gap": _diff("kw_entropy_gap"),
-        "kw_hhi_gap": _diff("kw_hhi_gap"),
-        "kw_top1_share_gap": _diff("kw_top1_share_gap"),
-        "kw_top3_share_gap": _diff("kw_top3_share_gap"),
-        "kw_top10_share_gap": _diff("kw_top10_share_gap"),
-        "kw_brand_share_gap": _diff("kw_brand_share_gap"),
-        "kw_competitor_share_gap": _diff("kw_competitor_share_gap"),
-        "kw_generic_share_gap": _diff("kw_generic_share_gap"),
-        "kw_attribute_share_gap": _diff("kw_attribute_share_gap"),
-    }
-    score_delta = {
-        "t_score_mix": _diff("t_score_mix"),
-        "t_score_kw": _diff("t_score_kw"),
-        "t_pressure": _diff("t_pressure"),
-        "t_confidence": _diff("t_confidence"),
-    }
-    return {"mix": mix_delta, "keyword": keyword_delta, "scores": score_delta}
-
-
 def _extract_delta_gap(
     delta_row: dict[str, Any] | None,
     current_row: dict[str, Any],
@@ -3050,6 +3107,19 @@ def _extract_traffic_delta(
     current_row: dict[str, Any],
     previous_row: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    if isinstance(current_row, pd.Series):
+        current_map = current_row.to_dict()
+    else:
+        current_map = current_row or {}
+    if isinstance(previous_row, pd.Series):
+        previous_map = previous_row.to_dict()
+    else:
+        previous_map = previous_row or {}
+    if isinstance(delta_row, pd.Series):
+        delta_map = delta_row.to_dict()
+    else:
+        delta_map = delta_row or {}
+
     mix_fields = (
         "ad_ratio_gap",
         "ad_ratio_index_med",
@@ -3069,32 +3139,34 @@ def _extract_traffic_delta(
         "kw_generic_share_gap",
         "kw_attribute_share_gap",
     )
-    if delta_row:
+    if delta_map:
         mix = {
-            field: _clean_float(delta_row.get(f"d_{field}")) for field in mix_fields
+            field: _clean_float(delta_map.get(f"d_{field}")) for field in mix_fields
         }
         keyword = {
-            field: _clean_float(delta_row.get(f"d_{field}")) for field in keyword_fields
+            field: _clean_float(delta_map.get(f"d_{field}")) for field in keyword_fields
         }
         scores = {
-            "mix": _clean_float(delta_row.get("d_t_score_mix")),
-            "keyword": _clean_float(delta_row.get("d_t_score_kw")),
-            "pressure": _clean_float(delta_row.get("d_t_pressure")),
-            "confidence": _clean_float(delta_row.get("d_t_confidence")),
+            "mix": _clean_float(delta_map.get("d_t_score_mix")),
+            "keyword": _clean_float(delta_map.get("d_t_score_kw")),
+            "pressure": _clean_float(delta_map.get("d_t_pressure")),
+            "confidence": _clean_float(delta_map.get("d_t_confidence")),
         }
         return {"mix": mix, "keyword": keyword, "scores": scores}
-    if previous_row:
+    if previous_map:
         mix = {
-            field: _diff_float(current_row.get(field), previous_row.get(field)) for field in mix_fields
+            field: _diff_float(current_map.get(field), previous_map.get(field))
+            for field in mix_fields
         }
         keyword = {
-            field: _diff_float(current_row.get(field), previous_row.get(field)) for field in keyword_fields
+            field: _diff_float(current_map.get(field), previous_map.get(field))
+            for field in keyword_fields
         }
         scores = {
-            "mix": _diff_float(current_row.get("t_score_mix"), previous_row.get("t_score_mix")),
-            "keyword": _diff_float(current_row.get("t_score_kw"), previous_row.get("t_score_kw")),
-            "pressure": _diff_float(current_row.get("t_pressure"), previous_row.get("t_pressure")),
-            "confidence": _diff_float(current_row.get("t_confidence"), previous_row.get("t_confidence")),
+            "mix": _diff_float(current_map.get("t_score_mix"), previous_map.get("t_score_mix")),
+            "keyword": _diff_float(current_map.get("t_score_kw"), previous_map.get("t_score_kw")),
+            "pressure": _diff_float(current_map.get("t_pressure"), previous_map.get("t_pressure")),
+            "confidence": _diff_float(current_map.get("t_confidence"), previous_map.get("t_confidence")),
         }
         return {"mix": mix, "keyword": keyword, "scores": scores}
     return {
@@ -3260,6 +3332,11 @@ def _build_summary(
         if not traffic_pairs_current.empty
         else pd.Series(dtype=float)
     )
+    coverage_raw = traffic_pairs_current.get("t_coverage_ratio") if not traffic_pairs_current.empty else None
+    if isinstance(coverage_raw, pd.Series):
+        traffic_coverage_series = pd.to_numeric(coverage_raw, errors="coerce")
+    else:
+        traffic_coverage_series = pd.Series(dtype=float)
     mix_gap_series = (
         pd.to_numeric(traffic_pairs_current.get("ad_ratio_gap_leader"), errors="coerce")
         if not traffic_pairs_current.empty
@@ -3292,14 +3369,6 @@ def _build_summary(
             "avg_mix_gap": _nanmean(mix_gap_series),
             "avg_keyword_gap": _nanmean(keyword_gap_series),
         },
-    }
-    summary["traffic"] = {
-        "pressure_p50": traffic_pressure_p50,
-        "pressure_p90": traffic_pressure_p90,
-        "confidence_p50": _quantile(traffic_confidence_series, 0.5),
-        "lagging_pairs": lagging_pairs,
-        "avg_mix_gap": _nanmean(mix_gap_series),
-        "avg_keyword_gap": _nanmean(keyword_gap_series),
     }
     return summary
 
