@@ -29,19 +29,25 @@ logger = logging.getLogger(__name__)
 logger = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = """你是一位资深亚马逊跨境电商总监，负责场景级预测。\n严格遵守：\n1. 仅基于输入 JSON，禁止引入额外数据或假设。\n2. 引用任意时间必须同时包含 year、week_num、start_date（周日）。\n3. 输出必须使用中文，并严格匹配 response_schema。\n4. 在 analysis_summary 中，用不超过400字的中文总结场景与主要关键词未来趋势及驱动原因，并引用至少两个具体指标数值作为依据（例如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）。\n5. 预测规则：\n   • 本年最近4周 WoW 中位数 = 短期趋势项 r。\n   • 去年“过去4周 + 未来4周”体量计算季节先验：s[h] = (LY_future_4w[h].vol / LY_pivot.vol) - 1。\n   • 组合增速：w[h] = α * r + (1-α) * s[h]，默认 α=0.6，可由 blend_weights 覆盖。\n   • 逐周滚动：pred[0] = 当前最后一周 vol；pred[h] = pred[h-1] * (1 + w[h])。\n   • 方向阈值：pct_change ≥ +1% → up；≤ −1% → down；其余 flat，pct_change 对“最后观测周”计算并保留1位小数。\n   • 关键词预测与场景同法、独立计算。\n6. 数据不足或缺行 → insufficient_data=true，并在 notes 说明原因。\n"""
+SYSTEM_PROMPT_TEMPLATE = """你是一位资深亚马逊跨境电商总监，负责场景级预测。\n严格遵守：\n1. 仅基于输入 JSON，禁止引入额外数据或假设。\n2. 引用任意时间必须同时包含 year、week_num、start_date（周日）。\n3. 输出必须使用中文，并严格匹配 response_schema。\n4. 在 analysis_summary 中，用不超过400字的中文总结场景与主要关键词未来趋势及驱动原因，并引用至少两个具体指标数值作为依据（例如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）。\n5. 预测规则：\n   • 本年最近{history_window}周 WoW 中位数 = 短期趋势项 r。\n   • 去年“过去{history_window}周 + 未来{history_window}周”体量计算季节先验：s[h] = (LY_future_window[h].vol / LY_pivot.vol) - 1。\n   • 组合增速：w[h] = α * r + (1-α) * s[h]，默认 α=0.6，可由 blend_weights 覆盖。\n   • 逐周滚动：pred[0] = 当前最后一周 vol；pred[h] = pred[h-1] * (1 + w[h])。\n   • 方向阈值：pct_change ≥ +1% → up；≤ −1% → down；其余 flat，pct_change 对“最后观测周”计算并保留1位小数。\n   • 关键词预测与场景同法、独立计算。\n6. 数据不足或缺行 → insufficient_data=true，并在 notes 说明原因。\n"""
 
 
-def _build_output_instructions(limit: int) -> list[str]:
+def _build_system_prompt(history_window: int) -> str:
+    window = max(1, int(history_window))
+    return SYSTEM_PROMPT_TEMPLATE.format(history_window=window)
+
+
+def _build_output_instructions(limit: int, horizon: int) -> list[str]:
     limit = max(1, int(limit))
+    horizon = max(1, int(horizon))
     instructions = [
         "仅返回一个 JSON 对象，UTF-8 编码，无额外解释或 Markdown。",
         "必须包含字段 scene_forecast、top_keywords_forecast、confidence、insufficient_data、analysis_summary；可选 notes（为空请输出 null）。",
-        "scene_forecast.weeks 与 top_keywords_forecast[*].weeks 均需列出未来4周的 direction、projected_vol、pct_change（百分号字符串，保留两位小数）",
+        f"scene_forecast.weeks 与 top_keywords_forecast[*].weeks 均需列出未来{horizon}周的 direction、projected_vol、pct_change（百分号字符串，保留两位小数）",
         "scene_forecast.weeks[*].pct_change 同时需要提供 pct_change_value（小数形式，便于系统后续计算）。",
         f"top_keywords_forecast 数量不超过 {limit}，且需覆盖输入 facts.top_keywords 中的全部关键词（若不足{limit}个则全部输出）。",
         "analysis_summary 需以中文总结场景与主要关键词的趋势及主因，长度不超过400字。",
-        "若提供 bounds.p10/p90，则第4周累计相对变化需落在该区间，越界时取边界值。",
+        "若提供 bounds.p10/p90，则最后一周累计相对变化需落在该区间，越界时取边界值。",
         "若 facts.forecast_guidance.scene.forecast_weeks 非空，则 scene_forecast 的 direction、projected_vol、pct_change_value 必须与之保持一致，pct_change 需为 pct_change_value×100 后按四舍五入保留两位小数并追加%符号。",
         "若 facts.forecast_guidance.keywords[*].forecast_weeks 非空，则对应 keyword 的 direction、projected_vol、pct_change_value 需与之保持一致，pct_change 同样需输出百分号字符串。",
         "analysis_summary 必须引用 facts.analysis_evidence 中至少两个具体指标值（如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）作为结论依据。",
@@ -333,10 +339,13 @@ class SceneWindows:
     last_observed: dict[str, object] | None
 
 
-def _derive_scene_windows(features: pd.DataFrame, *, horizon: int) -> SceneWindows:
+def _derive_scene_windows(
+    features: pd.DataFrame, *, horizon: int, history_window: int
+) -> SceneWindows:
     ordered = features.sort_values("start_date")
     horizon = max(1, int(horizon))
-    recent_rows = ordered.tail(horizon)
+    history_window = max(1, int(history_window))
+    recent_rows = ordered.tail(history_window)
     recent_dates = [row.start_date for row in recent_rows.itertuples(index=False)]
     recent = [_row_to_scene_record(row) for _, row in recent_rows.iterrows()]
     last_year_past_dates = [dt - timedelta(days=364) for dt in recent_dates]
@@ -344,7 +353,8 @@ def _derive_scene_windows(features: pd.DataFrame, *, horizon: int) -> SceneWindo
     if last_year_past_dates:
         pivot = last_year_past_dates[-1]
         last_year_future_dates = [
-            pivot + timedelta(days=7 * offset) for offset in range(1, horizon + 1)
+            pivot + timedelta(days=7 * offset)
+            for offset in range(1, history_window + 1)
         ]
     last_year_past = _dates_to_scene_records(ordered, last_year_past_dates)
     last_year_future = _dates_to_scene_records(ordered, last_year_future_dates)
@@ -682,8 +692,10 @@ def _build_forecast_guidance(
     pct_digits: int,
     wow_digits: int,
     clamp_on_fourth_week: bool,
+    history_window: int,
 ) -> Mapping[str, Any]:
     flat_band = abs(float(thresholds.get("flat_band_pct", 0.01)))
+    history_window_weeks = max(1, int(history_window))
     scene_recent_changes = _week_over_week_changes(windows.recent)
     scene_median = _median_change(scene_recent_changes)
     scene_seasonal = _seasonal_prior(windows.last_year_past, windows.last_year_future)
@@ -701,6 +713,8 @@ def _build_forecast_guidance(
         wow_digits=wow_digits,
         clamp_on_fourth_week=clamp_on_fourth_week,
     )
+    scene_guidance = dict(scene_guidance)
+    scene_guidance["history_window_weeks"] = history_window_weeks
     keyword_guidance: list[Mapping[str, Any]] = []
     for entry in keyword_payload:
         recent_records = entry.get("recent_4w", [])
@@ -727,8 +741,13 @@ def _build_forecast_guidance(
         kw_guidance["latest_contrib"] = _clean_float(
             _to_volume(entry.get("latest_contrib")), digits=4
         )
+        kw_guidance["history_window_weeks"] = history_window_weeks
         keyword_guidance.append(kw_guidance)
-    return {"scene": scene_guidance, "keywords": keyword_guidance}
+    return {
+        "scene": scene_guidance,
+        "keywords": keyword_guidance,
+        "history_window_weeks": history_window_weeks,
+    }
 
 
 def _build_analysis_evidence(
@@ -836,6 +855,8 @@ def _build_scene_summary_payload(
     keyword_payload: list[dict[str, object]],
     *,
     top_keywords_limit: int,
+    forecast_horizon: int,
+    history_window: int,
     blend_weights: Mapping[str, float],
     thresholds: Mapping[str, float],
     data_quality: Mapping[str, Any],
@@ -849,6 +870,8 @@ def _build_scene_summary_payload(
         "scene": scene,
         "marketplace_id": marketplace_id,
         "latest_observed_week": windows.last_observed,
+        "forecast_horizon_weeks": int(max(1, forecast_horizon)),
+        "history_window_weeks": int(max(1, history_window)),
         "scene_recent_4w": windows.recent,
         "scene_last_year_past_4w": windows.last_year_past,
         "scene_last_year_future_4w": windows.last_year_future,
@@ -864,11 +887,12 @@ def _build_scene_summary_payload(
     }
     if quality_notes:
         facts["quality_notes"] = quality_notes
+    system_prompt = _build_system_prompt(history_window)
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": json.dumps(facts, ensure_ascii=False)},
     ]
-    instructions = _build_output_instructions(top_keywords_limit)
+    instructions = _build_output_instructions(top_keywords_limit, forecast_horizon)
     return SceneSummaryPayload(
         messages=messages,
         raw=facts,
@@ -989,6 +1013,7 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
     bounds_config = _config_section("bounds")
 
     forecast_horizon = _as_int(output_config.get("forecast_horizon_weeks"), 4, minimum=1)
+    history_window = _as_int(output_config.get("history_window_weeks"), 4, minimum=1)
     vol_digits = _as_int(output_config.get("vol_digits"), 2, minimum=0)
     pct_digits = _as_int(output_config.get("pct_digits"), 2, minimum=0)
     wow_digits = _as_int(output_config.get("wow_digits"), 4, minimum=0)
@@ -1021,7 +1046,11 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
             conn,
             params={"scene": scene, "mk": mk, "yearweek": yearweek},
         )
-        windows = _derive_scene_windows(features, horizon=forecast_horizon)
+        windows = _derive_scene_windows(
+            features,
+            horizon=forecast_horizon,
+            history_window=history_window,
+        )
         top_keywords = _select_top_keywords(drivers, effective_topn)
         keyword_dates: list[date] = []
         keyword_dates.extend(windows.recent_dates)
@@ -1122,6 +1151,7 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
         pct_digits=pct_digits,
         wow_digits=wow_digits,
         clamp_on_fourth_week=clamp_on_fourth_week,
+        history_window=history_window,
     )
     analysis_evidence = _build_analysis_evidence(
         windows,
@@ -1137,6 +1167,8 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
         windows,
         keyword_payload,
         top_keywords_limit=effective_topn,
+        forecast_horizon=forecast_horizon,
+        history_window=history_window,
         blend_weights=blend_weights,
         thresholds=thresholds,
         data_quality=data_quality,
@@ -1146,6 +1178,7 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
         analysis_evidence=analysis_evidence,
         quality_notes=quality_notes,
     )
+    system_prompt = payload.messages[0]["content"] if payload.messages else _build_system_prompt(history_window)
     schema = _load_schema(max_top_keywords=effective_topn)
     settings = get_deepseek_settings()
     client = create_client_from_env(settings=settings)
@@ -1175,12 +1208,12 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
                 scene,
                 mk,
                 attempt,
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 facts=content,
             )
             try:
                 response = client.generate(
-                    prompt=SYSTEM_PROMPT,
+                    prompt=system_prompt,
                     facts=content,
                     model=model_name,
                     temperature=temperature,
