@@ -4,13 +4,16 @@ from scpc.utils.dependencies import ensure_packages
 
 ensure_packages(["sqlalchemy", "pandas", "numpy"])
 
+import pandas as pd
 import pytest
 from sqlalchemy import create_engine, text
 
 from scpc.etl.competition_features import build_traffic_features
+
 from scpc.etl.competition_pipeline import (
     _iso_week_to_dates,
     _latest_week_with_data,
+    _normalise_flow_dataframe,
     _prepare_traffic_entities,
 )
 from scpc.tests.data.competition_samples import (
@@ -89,6 +92,44 @@ def test_prepare_traffic_entities_merges_scene_and_parent() -> None:
     assert my_row["parent_asin"] == "PARENT-1"
     assert my_row["hyy_asin"] == 1
     assert 0 <= my_row["kw_coverage_ratio"] <= 1
+
+
+def test_normalise_flow_dataframe_adds_calendar_fields() -> None:
+    raw = pd.DataFrame(
+        [
+            {
+                "asin": "A1",
+                "marketplace_id": "US",
+                "monday": "2025-03-03",
+                "广告流量占比": "0.25",
+                "自然流量占比": 0.50,
+                "推荐流量占比": 0.25,
+                "SP广告流量占比": 0.10,
+                "视频广告流量占比": 0.05,
+                "品牌广告流量占比": 0.02,
+            }
+        ]
+    )
+
+    normalised = _normalise_flow_dataframe(raw)
+
+    for column in [
+        "asin",
+        "marketplace_id",
+        "monday",
+        "广告流量占比",
+        "自然流量占比",
+        "推荐流量占比",
+        "SP广告流量占比",
+        "视频广告流量占比",
+        "品牌广告流量占比",
+        "sunday",
+        "week",
+    ]:
+        assert column in normalised.columns
+    assert normalised.loc[0, "monday"] == date(2025, 3, 3)
+    assert normalised.loc[0, "sunday"] == date(2025, 3, 9)
+    assert normalised.loc[0, "week"] == "2025W10"
 
 
 def test_latest_week_with_data_returns_latest_label() -> None:
