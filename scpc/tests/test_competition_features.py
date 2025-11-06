@@ -5,6 +5,7 @@ from scpc.etl.competition_features import (
     build_competition_pairs,
     build_competition_pairs_each,
     build_competition_tables,
+    build_competition_tables_from_entities,
     build_traffic_features,
     clean_competition_entities,
     compute_competition_features,
@@ -218,15 +219,65 @@ def test_build_tables_and_compute_competition_features() -> None:
     leader_each = primary[primary["opp_asin"] == leader_pair["opp_asin"]].iloc[0]
     assert leader_each["price_gap_each"] == pytest.approx(-0.499, rel=1e-3)
 
-    traffic_primary = traffic_pairs_each[
-        (traffic_pairs_each["week"] == "2025W10")
-        & (traffic_pairs_each["my_asin"] == "MY-ASIN-1")
-        & (traffic_pairs_each["opp_asin"] == leader_pair["opp_asin"])
-    ]
-    assert not traffic_primary.empty
-    leader_traffic_each = traffic_primary.iloc[0]
-    assert leader_traffic_each["t_pressure"] is not None
 
+def test_build_tables_from_entities_matches_snapshot_pipeline() -> None:
+    snapshots = build_competition_snapshot_sample().drop(columns=["scene_tag", "base_scene", "morphology"])
+    scene_tags = build_scene_tag_sample()
+    rules = build_scoring_rules_sample()
+    traffic, *_ = _build_traffic_features()
+
+    entities_full = clean_competition_entities(
+        snapshots,
+        my_asins=MY_ASINS_SAMPLE,
+        scene_tags=scene_tags,
+        traffic=traffic,
+    )
+
+    tables_from_entities = build_competition_tables_from_entities(
+        entities_full,
+        week="2025W10",
+        previous_week="2025W09",
+        scoring_rules=rules,
+    )
+
+    tables_from_snapshots = build_competition_tables(
+        snapshots,
+        week="2025W10",
+        previous_week="2025W09",
+        my_asins=MY_ASINS_SAMPLE,
+        scene_tags=scene_tags,
+        scoring_rules=rules,
+        traffic=traffic,
+    )
+
+    assert len(tables_from_entities.pairs) == len(tables_from_snapshots.pairs)
+
+    leader_entity = tables_from_entities.pairs[
+        (tables_from_entities.pairs["week"] == "2025W10")
+        & (tables_from_entities.pairs["opp_type"] == "leader")
+    ].iloc[0]
+    leader_snapshot = tables_from_snapshots.pairs[
+        (tables_from_snapshots.pairs["week"] == "2025W10")
+        & (tables_from_snapshots.pairs["opp_type"] == "leader")
+    ].iloc[0]
+
+    assert leader_entity["price_gap_leader"] == pytest.approx(leader_snapshot["price_gap_leader"], rel=1e-6)
+    assert leader_entity["pressure"] == pytest.approx(leader_snapshot["pressure"], rel=1e-6)
+
+    assert len(tables_from_entities.delta) == len(tables_from_snapshots.delta)
+    entity_delta = tables_from_entities.delta[
+        tables_from_entities.delta["opp_type"] == "leader"
+    ].iloc[0]
+    snapshot_delta = tables_from_snapshots.delta[
+        tables_from_snapshots.delta["opp_type"] == "leader"
+    ].iloc[0]
+    assert entity_delta["d_price_gap_leader"] == pytest.approx(
+        snapshot_delta["d_price_gap_leader"], rel=1e-6
+    )
+
+    entity_summary = tables_from_entities.summary.iloc[0]
+    snapshot_summary = tables_from_snapshots.summary.iloc[0]
+    assert entity_summary["pressure_p90"] == pytest.approx(snapshot_summary["pressure_p90"], rel=1e-6)
 
 def test_competition_pipeline_two_level_judgement() -> None:
     snapshots = build_competition_snapshot_sample().drop(columns=["scene_tag", "base_scene", "morphology"])

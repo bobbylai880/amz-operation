@@ -8,12 +8,13 @@ import os
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from scpc.utils.dependencies import ensure_packages
 
 ensure_packages(["pandas", "numpy", "sqlalchemy"])
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
@@ -21,7 +22,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from scpc.db.engine import create_doris_engine
 from scpc.db.io import replace_into
-from scpc.etl.competition_features import build_traffic_features, clean_competition_entities
+from scpc.etl.competition_features import (
+    build_competition_tables_from_entities,
+    build_traffic_features,
+    clean_competition_entities,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -94,6 +99,20 @@ TRAFFIC_ONLY_COLUMNS: set[str] = {
 
 ENTITIES_TABLE = "bi_amz_comp_entities_clean"
 TRAFFIC_TABLE = "bi_amz_comp_traffic_entities_weekly"
+PAIRS_TABLE = "bi_amz_comp_pairs"
+TRAFFIC_PAIRS_TABLE = "bi_amz_comp_traffic_pairs"
+PAIRS_EACH_TABLE = "bi_amz_comp_pairs_each"
+TRAFFIC_PAIRS_EACH_TABLE = "bi_amz_comp_traffic_pairs_each"
+DELTA_TABLE = "bi_amz_comp_delta"
+SCENE_WEEK_TABLE = "bi_amz_comp_scene_week_metrics"
+
+ENTITIES_SELECT_SQL = f"SELECT * FROM {ENTITIES_TABLE} WHERE marketplace_id = :mk AND week = :week"
+TRAFFIC_SELECT_SQL = f"SELECT * FROM {TRAFFIC_TABLE} WHERE marketplace_id = :mk AND week = :week"
+
+PAIRS_SELECT_SQL = (
+    f"SELECT week, sunday FROM {PAIRS_TABLE} "
+    "WHERE marketplace_id = :mk ORDER BY sunday DESC LIMIT 1"
+)
 
 KEYWORD_SQL = """
 SELECT asin, marketplace_id, keyword, snapshot_date, ratio_score
@@ -128,6 +147,17 @@ def _iso_week_to_dates(week: str) -> tuple[date, date]:
     monday = date.fromisocalendar(year, week_num, 1)
     sunday = monday + timedelta(days=6)
     return monday, sunday
+
+
+def _previous_week_label(week: str) -> str:
+    """Return the ISO label for the week preceding ``week``."""
+
+    monday, _ = _iso_week_to_dates(week)
+    previous_monday = monday - timedelta(days=7)
+    iso = previous_monday.isocalendar()
+    return f"{iso.year}W{iso.week:02d}"
+
+
 def _configure_logging() -> None:
     level = os.getenv("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -416,6 +446,239 @@ def _prune_to_table(
     return pruned, drop_cols, missing
 
 
+def _merge_entities_with_traffic(
+    entities: pd.DataFrame,
+    traffic: pd.DataFrame,
+) -> pd.DataFrame:
+    """Combine page and traffic feature tables into a single entity frame."""
+
+    if entities.empty:
+        return entities.copy()
+
+    if traffic.empty:
+        merged = entities.copy()
+        for column in TRAFFIC_ONLY_COLUMNS:
+            if column not in merged.columns:
+                merged[column] = np.nan
+        return merged
+
+    join_candidates = [
+        "scene_tag",
+        "base_scene",
+        "morphology",
+        "marketplace_id",
+        "week",
+        "sunday",
+        "asin",
+        "parent_asin",
+        "hyy_asin",
+    ]
+    join_keys = [col for col in join_candidates if col in entities.columns and col in traffic.columns]
+    if not join_keys:
+        join_keys = [
+            col
+            for col in ("asin", "marketplace_id", "week")
+            if col in entities.columns and col in traffic.columns
+        ]
+
+    traffic_dedup = traffic.drop_duplicates(subset=join_keys) if join_keys else traffic
+    merged = entities.merge(
+        traffic_dedup,
+        how="left",
+        on=join_keys,
+        suffixes=("", "_traffic"),
+    )
+
+    for column in list(merged.columns):
+        if column.endswith("_traffic"):
+            base = column[:-8]
+            if base in merged.columns:
+                merged.drop(columns=[column], inplace=True)
+            else:
+                merged.rename(columns={column: base}, inplace=True)
+
+    for column in TRAFFIC_ONLY_COLUMNS:
+        if column not in merged.columns:
+            merged[column] = np.nan
+
+    return merged
+
+
+def _latest_week_with_pairs(engine: Engine, marketplace_id: str) -> str | None:
+    """Return the most recent week present in competition pair tables."""
+
+    with engine.connect() as conn:
+        result = conn.execute(text(PAIRS_SELECT_SQL), {"mk": marketplace_id})
+        row = result.fetchone()
+    if not row:
+        return None
+    try:
+        week_value = row["week"]
+    except (TypeError, KeyError):  # pragma: no cover - compatibility fallback
+        week_value = row[0] if row else None
+    return str(week_value) if week_value else None
+
+
+def _load_feature_slice(
+    engine: Engine,
+    *,
+    marketplace_id: str,
+    week: str,
+    scene_filters: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """Fetch page and traffic features for ``week`` from Doris and merge them."""
+
+    if not week:
+        return pd.DataFrame()
+
+    entity_sql, scene_params = _augment_scene_filters(ENTITIES_SELECT_SQL, scene_filters)
+    traffic_sql, traffic_params = _augment_scene_filters(TRAFFIC_SELECT_SQL, scene_filters)
+
+    params = {"mk": marketplace_id, "week": week}
+    entities = _read_dataframe(engine, entity_sql, {**params, **scene_params})
+    traffic = _read_dataframe(engine, traffic_sql, {**params, **traffic_params})
+
+    if entities.empty and traffic.empty:
+        return entities
+
+    merged = _merge_entities_with_traffic(entities, traffic)
+    if "week" in merged.columns:
+        merged["week"] = merged["week"].astype(str)
+    return merged
+
+
+def _collect_compare_entities(
+    engine: Engine,
+    *,
+    marketplace_id: str,
+    weeks: Iterable[str],
+    scene_filters: Sequence[str] | None = None,
+    current_entities: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Gather entity rows for comparison across ``weeks``."""
+
+    frames: list[pd.DataFrame] = []
+    seen_weeks: set[str] = set()
+
+    if current_entities is not None and not current_entities.empty:
+        frames.append(current_entities.copy())
+        seen_weeks.update(str(w) for w in current_entities.get("week", []) if pd.notna(w))
+
+    for week in weeks:
+        if not week:
+            continue
+        if week in seen_weeks:
+            continue
+        loaded = _load_feature_slice(
+            engine,
+            marketplace_id=marketplace_id,
+            week=week,
+            scene_filters=scene_filters,
+        )
+        if loaded.empty:
+            LOGGER.warning(
+                "competition_compare_missing_features week=%s mk=%s filters=%s",
+                week,
+                marketplace_id,
+                scene_filters,
+            )
+            continue
+        frames.append(loaded)
+        seen_weeks.add(week)
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    combined = combined.drop_duplicates(
+        subset=[
+            col
+            for col in ("scene_tag", "marketplace_id", "week", "asin", "parent_asin", "hyy_asin")
+            if col in combined.columns
+        ],
+        keep="last",
+    )
+    return combined
+
+
+def _run_compare_checks(
+    engine: Engine,
+    marketplace_id: str,
+    week: str,
+    previous_week: str | None = None,
+) -> None:
+    """Verify that compare tables contain rows for the requested weeks."""
+
+    weeks = {week}
+    if previous_week:
+        weeks.add(previous_week)
+
+    commands = [
+        (
+            PAIRS_TABLE,
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {PAIRS_TABLE} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            ),
+        ),
+        (
+            TRAFFIC_PAIRS_TABLE,
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {TRAFFIC_PAIRS_TABLE} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            ),
+        ),
+        (
+            PAIRS_EACH_TABLE,
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {PAIRS_EACH_TABLE} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            ),
+        ),
+        (
+            TRAFFIC_PAIRS_EACH_TABLE,
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {TRAFFIC_PAIRS_EACH_TABLE} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            ),
+        ),
+        (
+            DELTA_TABLE,
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {DELTA_TABLE} "
+                "WHERE marketplace_id = :mk AND week_w0 = :week"
+            ),
+        ),
+        (
+            SCENE_WEEK_TABLE,
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {SCENE_WEEK_TABLE} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            ),
+        ),
+    ]
+
+    with engine.connect() as conn:
+        for target_week in weeks:
+            for table, stmt in commands:
+                preview = str(stmt)
+                LOGGER.info(
+                    "competition_compare_check table=%s week=%s command=%s",
+                    table,
+                    target_week,
+                    preview,
+                )
+                result = conn.execute(stmt, {"mk": marketplace_id, "week": target_week})
+                row_count = result.scalar() or 0
+                status = "ok" if row_count > 0 else "empty"
+                log_fn = LOGGER.info if row_count > 0 else LOGGER.warning
+                log_fn(
+                    "competition_compare_check_result table=%s week=%s rows=%d status=%s",
+                    table,
+                    target_week,
+                    row_count,
+                    status,
+                )
 def _run_post_write_checks(engine: Engine, marketplace_id: str, week: str) -> None:
     """Execute verification queries to confirm rows exist for the target slice."""
 
@@ -597,13 +860,14 @@ def run_competition_pipeline(
             marketplace_id,
         )
 
-    entities = clean_competition_entities(
+    entities_full = clean_competition_entities(
         snapshot_df,
         my_asins=my_asins,
         scene_tags=scene_df,
         traffic=traffic_features,
     )
 
+    entities = entities_full.copy()
     entities, dropped_columns = _prune_traffic_columns(entities)
     if dropped_columns:
         LOGGER.info(
@@ -656,7 +920,9 @@ def run_competition_pipeline(
         "scene_tags": scene_df,
         "traffic_raw": traffic_features,
         "entities": entities,
+        "entities_full": entities_full,
         "traffic": traffic_entities,
+        "resolved_week": resolved_week,
     }
 
     LOGGER.info(
@@ -680,6 +946,112 @@ def run_competition_pipeline(
     return results
 
 
+def run_competition_compare_pipeline(
+    marketplace_id: str,
+    *,
+    week: str,
+    previous_week: str | None = None,
+    scene_filters: Sequence[str] | None = None,
+    engine: Engine | None = None,
+    current_entities: pd.DataFrame | None = None,
+    scoring_rules: pd.DataFrame | dict[str, Any] | None = None,
+    rule_name: str = "default",
+    traffic_scoring: Mapping[str, Any] | None = None,
+    traffic_rule_name: str = "default_traffic",
+    write: bool = False,
+    chunk_size: int = 500,
+) -> dict[str, pd.DataFrame]:
+    """Build competition compare tables from precomputed features and optionally persist them."""
+
+    engine = engine or create_doris_engine()
+
+    target_weeks: set[str] = {week}
+    if previous_week:
+        target_weeks.add(previous_week)
+
+    combined_entities = _collect_compare_entities(
+        engine,
+        marketplace_id=marketplace_id,
+        weeks=target_weeks,
+        scene_filters=scene_filters,
+        current_entities=current_entities,
+    )
+
+    if combined_entities.empty:
+        LOGGER.warning(
+            "competition_compare_no_entities week=%s previous=%s mk=%s filters=%s",
+            week,
+            previous_week,
+            marketplace_id,
+            scene_filters,
+        )
+
+    tables = build_competition_tables_from_entities(
+        combined_entities,
+        week=week,
+        previous_week=previous_week,
+        scoring_rules=scoring_rules,
+        rule_name=rule_name,
+        traffic_scoring=traffic_scoring,
+        traffic_rule_name=traffic_rule_name,
+    )
+
+    LOGGER.info(
+        "competition_compare_rows pairs=%d traffic_pairs=%d pairs_each=%d traffic_pairs_each=%d delta=%d summary=%d",
+        len(tables.pairs),
+        len(tables.traffic_pairs),
+        len(tables.pairs_each),
+        len(tables.traffic_pairs_each),
+        len(tables.delta),
+        len(tables.summary),
+    )
+
+    if write:
+        table_map = {
+            PAIRS_TABLE: tables.pairs,
+            TRAFFIC_PAIRS_TABLE: tables.traffic_pairs,
+            PAIRS_EACH_TABLE: tables.pairs_each,
+            TRAFFIC_PAIRS_EACH_TABLE: tables.traffic_pairs_each,
+            DELTA_TABLE: tables.delta,
+            SCENE_WEEK_TABLE: tables.summary,
+        }
+
+        for table_name, df in table_map.items():
+            table_columns = _load_table_columns(engine, table_name)
+            aligned, dropped, missing = _prune_to_table(df, table_columns)
+            if dropped:
+                LOGGER.info(
+                    "competition_compare_prune table=%s dropped_cols=%s",
+                    table_name,
+                    sorted(dropped),
+                )
+            if missing:
+                LOGGER.warning(
+                    "competition_compare_missing_columns table=%s missing=%s",
+                    table_name,
+                    sorted(missing),
+                )
+            written = replace_into(engine, table_name, aligned, chunk_size=chunk_size)
+            LOGGER.info(
+                "competition_compare_written table=%s rows=%d",
+                table_name,
+                written,
+            )
+
+        _run_compare_checks(engine, marketplace_id, week, previous_week=previous_week)
+
+    return {
+        "entities": tables.entities,
+        "traffic_entities": tables.traffic_entities,
+        "pairs": tables.pairs,
+        "traffic_pairs": tables.traffic_pairs,
+        "pairs_each": tables.pairs_each,
+        "traffic_pairs_each": tables.traffic_pairs_each,
+        "delta": tables.delta,
+        "summary": tables.summary,
+    }
+
+
 def _latest_week_with_data(engine: Engine, marketplace_id: str) -> str:
     with engine.connect() as conn:
         result = conn.execute(text(LATEST_SNAPSHOT_WEEK_SQL), {"mk": marketplace_id})
@@ -700,11 +1072,19 @@ def _latest_week_with_data(engine: Engine, marketplace_id: str) -> str:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Competition ETL runner (clean + features)")
+    parser = argparse.ArgumentParser(
+        description="Competition ETL runner (features + compare)"
+    )
     parser.add_argument(
         "--week",
         required=False,
         help="ISO week label, e.g. 2025W10. If omitted the latest week with data is used.",
+    )
+    parser.add_argument(
+        "--previous-week",
+        dest="previous_week",
+        required=False,
+        help="Baseline ISO week for WoW delta. Defaults to the week preceding --week.",
     )
     parser.add_argument("--mk", required=True, help="Marketplace identifier (US/JP/DE...)")
     parser.add_argument(
@@ -714,6 +1094,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Restrict to specific scene_tag (repeatable)",
     )
     parser.add_argument("--write", action="store_true", help="Persist features to Doris")
+    parser.add_argument(
+        "--with-compare",
+        action="store_true",
+        help="Compute compare tables in addition to feature ingestion",
+    )
+    parser.add_argument(
+        "--compare-only",
+        action="store_true",
+        help="Skip feature ingestion and only compute compare tables",
+    )
+    parser.add_argument(
+        "--write-compare",
+        action="store_true",
+        help="Persist compare tables (pairs/deltas/scene summary) to Doris",
+    )
+    parser.add_argument(
+        "--rule-name",
+        default="default",
+        help="Scoring rule name for page-side comparisons (default: default)",
+    )
+    parser.add_argument(
+        "--traffic-rule-name",
+        default="default_traffic",
+        help="Traffic scoring rule name (default: default_traffic)",
+    )
     parser.add_argument(
         "--chunk-size",
         type=int,
@@ -738,14 +1143,70 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     try:
         engine = create_doris_engine()
-        run_competition_pipeline(
-            args.week,
-            args.mk,
-            scene_filters=args.scene_tags,
-            engine=engine,
-            write=args.write,
-            chunk_size=args.chunk_size,
-        )
+        resolved_week = args.week
+        compare_only = args.compare_only
+        with_compare = args.with_compare or compare_only
+
+        if not resolved_week:
+            if compare_only:
+                resolved_week = _latest_week_with_pairs(engine, args.mk)
+                if resolved_week:
+                    LOGGER.info(
+                        "competition_pipeline_week_auto_pairs marketplace=%s week=%s",
+                        args.mk,
+                        resolved_week,
+                    )
+            if not resolved_week:
+                resolved_week = _latest_week_with_data(engine, args.mk)
+                LOGGER.info(
+                    "competition_pipeline_week_auto_features marketplace=%s week=%s",
+                    args.mk,
+                    resolved_week,
+                )
+
+        previous_week = args.previous_week
+        if with_compare and not previous_week:
+            try:
+                previous_week = _previous_week_label(resolved_week)
+                LOGGER.info(
+                    "competition_pipeline_previous_week_auto week=%s previous=%s",
+                    resolved_week,
+                    previous_week,
+                )
+            except ValueError:
+                previous_week = None
+                LOGGER.warning(
+                    "competition_pipeline_previous_week_unavailable week=%s",
+                    resolved_week,
+                )
+
+        feature_results: dict[str, pd.DataFrame] | None = None
+        if not compare_only:
+            feature_results = run_competition_pipeline(
+                resolved_week,
+                args.mk,
+                scene_filters=args.scene_tags,
+                engine=engine,
+                write=args.write,
+                chunk_size=args.chunk_size,
+            )
+
+        if with_compare:
+            current_entities = None
+            if feature_results is not None:
+                current_entities = feature_results.get("entities_full")
+            run_competition_compare_pipeline(
+                args.mk,
+                week=resolved_week,
+                previous_week=previous_week,
+                scene_filters=args.scene_tags,
+                engine=engine,
+                current_entities=current_entities,
+                rule_name=args.rule_name,
+                traffic_rule_name=args.traffic_rule_name,
+                write=args.write_compare,
+                chunk_size=args.chunk_size,
+            )
     except Exception as exc:  # pragma: no cover - CLI level safeguard
         LOGGER.exception(
             "competition_pipeline_failed week=%s mk=%s error=%s",
@@ -767,15 +1228,28 @@ __all__ = [
     "main",
     "parse_args",
     "run_competition_pipeline",
+    "run_competition_compare_pipeline",
     "_prepare_traffic_entities",
     "_normalise_flow_dataframe",
     "_iso_week_to_dates",
+    "_previous_week_label",
     "_latest_week_with_data",
+    "_latest_week_with_pairs",
     "_prune_traffic_columns",
     "_prune_to_table",
+    "_merge_entities_with_traffic",
+    "_load_feature_slice",
+    "_collect_compare_entities",
     "_run_post_write_checks",
+    "_run_compare_checks",
     "_load_table_columns",
     "TRAFFIC_ONLY_COLUMNS",
     "ENTITIES_TABLE",
     "TRAFFIC_TABLE",
+    "PAIRS_TABLE",
+    "TRAFFIC_PAIRS_TABLE",
+    "PAIRS_EACH_TABLE",
+    "TRAFFIC_PAIRS_EACH_TABLE",
+    "DELTA_TABLE",
+    "SCENE_WEEK_TABLE",
 ]

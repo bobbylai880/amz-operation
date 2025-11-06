@@ -16,6 +16,8 @@ from scpc.etl.competition_features import (
 from scpc.etl.competition_pipeline import (
     _augment_in_clause,
     _iso_week_to_dates,
+    _merge_entities_with_traffic,
+    _previous_week_label,
     _latest_week_with_data,
     _normalise_flow_dataframe,
     _prepare_traffic_entities,
@@ -44,6 +46,10 @@ def test_iso_week_to_dates_returns_monday_sunday(label: str) -> None:
 def test_iso_week_to_dates_rejects_invalid_inputs(label: str) -> None:
     with pytest.raises(ValueError):
         _iso_week_to_dates(label)
+
+
+def test_previous_week_label_rolls_back_one_week() -> None:
+    assert _previous_week_label("2025W10") == "2025W09"
 
 
 def test_prepare_traffic_entities_merges_scene_and_parent() -> None:
@@ -196,6 +202,53 @@ def test_augment_in_clause_appends_tokens() -> None:
 
     assert sql.endswith("AND asin IN (:asin_0, :asin_1)")
     assert params == {"asin_0": "A1", "asin_1": "A2"}
+
+
+def test_merge_entities_with_traffic_adds_missing_columns() -> None:
+    entities = pd.DataFrame(
+        [
+            {
+                "scene_tag": "SCN-USBAG-01",
+                "base_scene": "USBAG",
+                "morphology": "TD",
+                "marketplace_id": "US",
+                "week": "2025W10",
+                "sunday": date(2025, 3, 9),
+                "asin": "MY-ASIN-1",
+                "parent_asin": "PARENT-1",
+                "hyy_asin": 1,
+                "price_current": 19.99,
+            }
+        ]
+    )
+    traffic = pd.DataFrame(
+        [
+            {
+                "scene_tag": "SCN-USBAG-01",
+                "base_scene": "USBAG",
+                "morphology": "TD",
+                "marketplace_id": "US",
+                "week": "2025W10",
+                "sunday": date(2025, 3, 9),
+                "asin": "MY-ASIN-1",
+                "parent_asin": "PARENT-1",
+                "hyy_asin": 1,
+                "ad_ratio": 0.55,
+                "kw_top3_share_7d_avg": 0.75,
+            }
+        ]
+    )
+
+    merged = _merge_entities_with_traffic(entities, traffic)
+
+    assert "ad_ratio" in merged.columns
+    assert merged.loc[0, "ad_ratio"] == pytest.approx(0.55, rel=1e-6)
+    assert "kw_top3_share_7d_avg" in merged.columns
+    assert merged.loc[0, "kw_top3_share_7d_avg"] == pytest.approx(0.75, rel=1e-6)
+
+    merged_without_traffic = _merge_entities_with_traffic(entities, traffic.iloc[0:0])
+    assert "ad_ratio" in merged_without_traffic.columns
+    assert merged_without_traffic["ad_ratio"].isna().all()
 
 
 def test_augment_in_clause_no_values_returns_base_sql() -> None:

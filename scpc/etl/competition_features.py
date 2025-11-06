@@ -1387,27 +1387,16 @@ def summarise_competition_scene(
     return pd.DataFrame([row], columns=_summary_columns())
 
 
-def build_competition_tables(
-    snapshots: pd.DataFrame,
+def _derive_competition_tables(
+    entities: pd.DataFrame,
     *,
     week: str,
     previous_week: str | None,
-    my_asins: Iterable[str],
-    scene_tags: pd.DataFrame | None = None,
     scoring_rules: pd.DataFrame | dict[str, Any] | None = None,
     rule_name: str = "default",
-    traffic: pd.DataFrame | None = None,
     traffic_scoring: Mapping[str, Any] | None = None,
     traffic_rule_name: str = "default_traffic",
 ) -> CompetitionTables:
-    """Produce Doris-aligned tables from snapshots, including scene tagging when provided."""
-
-    entities = clean_competition_entities(
-        snapshots,
-        my_asins=my_asins,
-        scene_tags=scene_tags,
-        traffic=traffic,
-    )
     traffic_entity_cols = [col for col in _traffic_entity_columns() if col in entities.columns]
     traffic_entities = (
         entities.loc[:, traffic_entity_cols].copy()
@@ -1491,6 +1480,77 @@ def build_competition_tables(
         traffic_pairs_each=traffic_pairs_each_subset,
         delta=deltas,
         summary=summary,
+    )
+
+
+def build_competition_tables(
+    snapshots: pd.DataFrame,
+    *,
+    week: str,
+    previous_week: str | None,
+    my_asins: Iterable[str],
+    scene_tags: pd.DataFrame | None = None,
+    scoring_rules: pd.DataFrame | dict[str, Any] | None = None,
+    rule_name: str = "default",
+    traffic: pd.DataFrame | None = None,
+    traffic_scoring: Mapping[str, Any] | None = None,
+    traffic_rule_name: str = "default_traffic",
+) -> CompetitionTables:
+    """Produce Doris-aligned tables from snapshots, including scene tagging when provided."""
+
+    entities = clean_competition_entities(
+        snapshots,
+        my_asins=my_asins,
+        scene_tags=scene_tags,
+        traffic=traffic,
+    )
+
+    return _derive_competition_tables(
+        entities,
+        week=week,
+        previous_week=previous_week,
+        scoring_rules=scoring_rules,
+        rule_name=rule_name,
+        traffic_scoring=traffic_scoring,
+        traffic_rule_name=traffic_rule_name,
+    )
+
+
+def build_competition_tables_from_entities(
+    entities: pd.DataFrame,
+    *,
+    week: str,
+    previous_week: str | None = None,
+    scoring_rules: pd.DataFrame | dict[str, Any] | None = None,
+    rule_name: str = "default",
+    traffic_scoring: Mapping[str, Any] | None = None,
+    traffic_rule_name: str = "default_traffic",
+) -> CompetitionTables:
+    """Reuse cleaned entity features to generate competition comparison tables."""
+
+    if entities is None:
+        entities = pd.DataFrame()
+
+    if entities.empty:
+        return CompetitionTables(
+            entities=entities,
+            traffic_entities=entities.iloc[0:0],
+            pairs=pd.DataFrame(columns=_pair_columns()),
+            traffic_pairs=pd.DataFrame(columns=_traffic_pair_columns()),
+            pairs_each=pd.DataFrame(columns=_pair_each_columns()),
+            traffic_pairs_each=pd.DataFrame(columns=_traffic_pair_each_columns()),
+            delta=pd.DataFrame(columns=_delta_columns()),
+            summary=pd.DataFrame(columns=_summary_columns()),
+        )
+
+    return _derive_competition_tables(
+        entities,
+        week=week,
+        previous_week=previous_week,
+        scoring_rules=scoring_rules,
+        rule_name=rule_name,
+        traffic_scoring=traffic_scoring,
+        traffic_rule_name=traffic_rule_name,
     )
 
 
@@ -3614,6 +3674,7 @@ __all__ = [
     "CompetitionFeatureResult",
     "CompetitionTables",
     "build_competition_tables",
+    "build_competition_tables_from_entities",
     "build_competition_pairs",
     "build_competition_delta",
     "clean_competition_entities",
