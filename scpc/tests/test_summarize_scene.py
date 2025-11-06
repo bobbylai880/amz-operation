@@ -1,13 +1,15 @@
 import json
+import textwrap
 from datetime import date, timedelta
 from types import SimpleNamespace
 
 import pytest
 
+pd = pytest.importorskip("pandas")
+
+import scpc.llm.summarize_scene as summarize_scene_module
 from scpc.llm.deepseek_client import DeepSeekResponse
 from scpc.llm.summarize_scene import SceneSummarizationError, summarize_scene
-
-pd = pytest.importorskip("pandas")
 
 
 class DummyEngine:
@@ -267,6 +269,140 @@ def test_summarize_scene_retries_on_schema_error(
     assert stored["marketplace_id"] == "US"
     assert isinstance(stored["facts"], dict)
     assert stored["facts"]["scene"] == "X"
+
+
+def test_top_keyword_limit_respects_config(
+    monkeypatch, tmp_path, sample_features, sample_drivers, sample_keyword_volumes
+):
+    config_text = textwrap.dedent(
+        """
+        scene_forecast:
+          output:
+            forecast_horizon_weeks: 4
+            pct_digits: 2
+            vol_digits: 2
+            wow_digits: 4
+            max_top_keywords: 2
+          blend_weights:
+            recent_wow: 0.6
+            seasonal: 0.4
+            dynamic: true
+          thresholds:
+            flat_band_pct: 0.01
+            low_conf_flat_band: 0.02
+          quality:
+            min_non_missing: 2
+            quality_notes_template: ""
+          bounds:
+            enabled: true
+            use_columns: [forecast_p10, forecast_p50, forecast_p90]
+            clamp_on_4th_week: true
+          prompt_log_dir: storage/prompt_logs
+          max_attempts: 2
+          temperature: 0.1
+          model: deepseek-chat
+        """
+    ).strip()
+    config_path = tmp_path / "scene_forecast_config.yaml"
+    config_path.write_text(config_text + "\n", encoding="utf-8")
+    monkeypatch.setattr("scpc.llm.summarize_scene.CONFIG_PATH", config_path)
+    summarize_scene_module._scene_forecast_config.cache_clear()
+
+    def fake_read_sql(query, _conn, params):
+        text_query = str(query)
+        if "bi_amz_scene_features" in text_query:
+            return sample_features
+        if "bi_amz_scene_drivers" in text_query:
+            return sample_drivers
+        if "bi_amz_vw_kw_week" in text_query:
+            return sample_keyword_volumes
+        raise AssertionError(f"Unexpected query: {query}")
+
+    calls = []
+
+    class StubClient:
+        def generate(self, **_kwargs):
+            payload = json.loads(_kwargs["facts"])
+            calls.append(payload)
+            response = {
+                "scene_forecast": {
+                    "weeks": [
+                        {
+                            "year": 2025,
+                            "week_num": 13,
+                            "start_date": "2025-03-30",
+                            "direction": "up",
+                            "projected_vol": 260.0,
+                            "pct_change": "1.20%",
+                            "pct_change_value": 0.012,
+                        }
+                    ]
+                },
+                "top_keywords_forecast": [
+                    {
+                        "keyword": "alpha",
+                        "weeks": [
+                            {
+                                "year": 2025,
+                                "week_num": 13,
+                                "start_date": "2025-03-30",
+                                "direction": "up",
+                                "projected_vol": 340.0,
+                                "pct_change": "1.10%",
+                                "pct_change_value": 0.011,
+                            }
+                        ],
+                    },
+                    {
+                        "keyword": "beta",
+                        "weeks": [
+                            {
+                                "year": 2025,
+                                "week_num": 13,
+                                "start_date": "2025-03-30",
+                                "direction": "up",
+                                "projected_vol": 312.0,
+                                "pct_change": "0.80%",
+                                "pct_change_value": 0.008,
+                            }
+                        ],
+                    },
+                ],
+                "confidence": 0.8,
+                "insufficient_data": False,
+                "analysis_summary": "场景两周内稳定增长，关键词alpha贡献最大。",
+                "notes": None,
+            }
+            return DeepSeekResponse(content=json.dumps(response), usage={})
+
+        def close(self):
+            pass
+
+    settings = SimpleNamespace(
+        base_url="https://api.deepseek.com", model="deepseek", api_key="key", timeout=1
+    )
+
+    monkeypatch.setattr("scpc.llm.summarize_scene.pd.read_sql_query", fake_read_sql)
+    monkeypatch.setattr(
+        "scpc.llm.summarize_scene.create_client_from_env", lambda settings: StubClient()
+    )
+    monkeypatch.setattr("scpc.llm.summarize_scene.get_deepseek_settings", lambda: settings)
+    prompt_dir = tmp_path / "logs"
+    monkeypatch.setenv("SCPC_PROMPT_LOG_DIR", str(prompt_dir))
+
+    result = summarize_scene(engine=DummyEngine(), scene="X", mk="US", topn=5)
+
+    assert len(result.get("top_keywords_forecast", [])) == 2
+    assert calls, "expected DeepSeek to be invoked"
+    first_call = calls[0]
+    assert len(first_call["top_keywords"]) == 2
+    instructions = first_call["output_instructions"]
+    assert any("数量不超过 2" in item for item in instructions)
+    schema = first_call["response_schema"]
+    assert (
+        schema["properties"]["top_keywords_forecast"]["maxItems"] == 2
+    ), "schema maxItems should match config limit"
+    summarize_scene_module._scene_forecast_config.cache_clear()
 
 
 def test_summarize_scene_raises_after_two_schema_errors(

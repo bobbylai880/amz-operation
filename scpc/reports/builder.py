@@ -26,7 +26,10 @@ def build_report(
         if isinstance(first_week, Mapping):
             direction = first_week.get("direction", "未知")
             pct = _format_pct(first_week.get("pct_change"))
-            lines.append(f"状态：未来趋势 {direction}（{pct}）\n")
+            projected_vol = _format_number(first_week.get("projected_vol"))
+            lines.append(
+                f"状态：未来趋势 {direction}（{pct}，预测流量 {projected_vol}）\n"
+            )
         else:
             lines.append("状态：未来趋势未知\n")
     else:
@@ -71,6 +74,22 @@ def _format_pct(value: object) -> str:
     return f"{number:.1f}%"
 
 
+def _format_number(value: object) -> str:
+    if value is None:
+        return "?"
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        try:
+            number = float(str(value).strip())
+        except (TypeError, ValueError):
+            return "?"
+    if number.is_integer():
+        return f"{int(number):,}"
+    formatted = f"{number:,.2f}".rstrip("0").rstrip(".")
+    return formatted
+
+
 def build_scene_markdown(summary: Mapping[str, object]) -> str:
     """Render a concise Markdown section for a single scene summary."""
 
@@ -101,11 +120,14 @@ def build_scene_markdown(summary: Mapping[str, object]) -> str:
             start_date = week.get("start_date", "?")
             direction = week.get("direction", "?")
             pct = _format_pct(week.get("pct_change"))
+            projected_vol = _format_number(week.get("projected_vol"))
             if isinstance(week_num, int):
                 label = f"{year}W{week_num:02d}"
             else:
                 label = f"{year}W{week_num}"
-            lines.append(f"- {label} ({start_date}): {direction} ({pct})")
+            lines.append(
+                f"- {label} ({start_date}): {direction} ({pct}，预测流量 {projected_vol})"
+            )
         lines.append("")
 
     keyword_forecast = summary.get("top_keywords_forecast", []) or []
@@ -123,11 +145,14 @@ def build_scene_markdown(summary: Mapping[str, object]) -> str:
                 week_num = week.get("week_num")
                 direction = week.get("direction", "?")
                 pct = _format_pct(week.get("pct_change"))
+                projected_vol = _format_number(week.get("projected_vol"))
                 if isinstance(week_num, int):
                     label = f"{year}W{week_num:02d}"
                 else:
                     label = f"{year}W{week_num}"
-                lines.append(f"  - {label}: {direction} ({pct})")
+                lines.append(
+                    f"  - {label}: {direction} ({pct}，预测流量 {projected_vol})"
+                )
         lines.append("")
 
     if summary.get("insufficient_data"):
