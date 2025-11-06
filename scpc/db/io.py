@@ -1,13 +1,20 @@
 """Read/write helpers for Doris using SQLAlchemy."""
 from __future__ import annotations
 
+import json
 import logging
 import re
 import warnings
 from itertools import islice
 from typing import Iterable, Mapping, Sequence
 
+try:  # pragma: no cover - numpy is an optional dependency at runtime
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None  # type: ignore[assignment]
+
 import pandas as pd
+from pandas.api.types import is_scalar
 from sqlalchemy import Column, MetaData, Table, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SAWarning
@@ -48,11 +55,36 @@ def _normalise_records(records: Iterable[Mapping[str, object]]) -> list[dict[str
         converted: dict[str, object] = {}
         for key, value in row.items():
             if isinstance(value, pd.Timestamp):
-                converted[key] = value.to_pydatetime()
-            elif pd.isna(value):  # type: ignore[arg-type]
+                normalised_value: object = value.to_pydatetime()
+            else:
+                normalised_value = value
+
+                # Convert NumPy scalars to native Python values early so that
+                # downstream ``pd.isna`` checks operate on standard types and we
+                # do not leak ``np.generic`` instances into the SQL parameters.
+                if np is not None and isinstance(normalised_value, np.generic):
+                    normalised_value = normalised_value.item()
+
+                # Serialise complex containers to JSON strings to avoid Doris
+                # rendering empty lists as ``()`` in VALUES clauses.
+                if isinstance(normalised_value, dict):
+                    normalised_value = json.dumps(normalised_value, ensure_ascii=False)
+                elif isinstance(normalised_value, (list, tuple)):
+                    normalised_value = json.dumps(normalised_value, ensure_ascii=False)
+                elif np is not None and isinstance(normalised_value, np.ndarray):
+                    normalised_value = json.dumps(
+                        normalised_value.tolist(), ensure_ascii=False
+                    )
+
+            if normalised_value is None:
+                converted[key] = None
+            # Only call ``pd.isna`` for scalar values. Applying it to sequences
+            # yields boolean arrays, which are invalid in truthy contexts and
+            # previously surfaced as ``ValueError``.
+            elif is_scalar(normalised_value) and pd.isna(normalised_value):  # type: ignore[arg-type]
                 converted[key] = None
             else:
-                converted[key] = value
+                converted[key] = normalised_value
         normalised.append(converted)
     return normalised
 
