@@ -27,7 +27,7 @@ LOGGER = logging.getLogger(__name__)
 
 SNAPSHOT_SQL = """
 SELECT asin, marketplace_id, week, sunday, parent_asin,
-       price_current, price_list, coupon_pct, discount_rate,
+       price_current, price_list, coupon_pct,
        rank_root, rank_leaf, rating, reviews,
        image_cnt, video_cnt, bullet_cnt, title_len,
        aplus_flag, badge_json
@@ -273,6 +273,8 @@ def run_competition_pipeline(
     snapshot_df = _read_dataframe(
         engine, SNAPSHOT_SQL, {"mk": marketplace_id, "week": resolved_week}
     )
+    if "discount_rate" not in snapshot_df.columns:
+        snapshot_df["discount_rate"] = pd.NA
     LOGGER.info(
         "competition_pipeline_snapshots_fetched week=%s rows=%d",
         resolved_week,
