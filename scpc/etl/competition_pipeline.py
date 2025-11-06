@@ -49,11 +49,11 @@ FROM bi_amz_asin_scene_tag
 WHERE marketplace_id = :mk
 """
 
-# Doris fails to push predicates that reference computed expressions inside the
-# view ``vw_sif_asin_flow_overview_weekly_std`` because it rewrites them into
-# invalid ``days_sub`` calls. Query the base weekly table instead, filter on the
-# stored ``monday`` column, and derive the calendar fields in Python.
-FLOW_SQL = """
+# Doris 2.1 rewrites ``monday = ?`` predicates on the weekly flow table into
+# invalid expressions when pushing them down to the daily source. Avoid the
+# rewrite by removing the ``monday`` predicate from the SQL and performing the
+# date filter client-side.
+FLOW_SQL_BASE = """
 SELECT asin,
        marketplace_id,
        monday,
@@ -64,7 +64,7 @@ SELECT asin,
        `视频广告流量占比` AS sbv_ratio,
        `品牌广告流量占比` AS sb_ratio
 FROM hyy.bi_sif_asin_flow_overview_weekly
-WHERE marketplace_id = :mk AND monday = :monday
+WHERE marketplace_id = :mk
 """
 
 KEYWORD_SQL = """
@@ -100,16 +100,6 @@ def _iso_week_to_dates(week: str) -> tuple[date, date]:
     monday = date.fromisocalendar(year, week_num, 1)
     sunday = monday + timedelta(days=6)
     return monday, sunday
-
-
-def _format_monday_for_weekly_query(monday: date) -> str:
-    """Return the string representation Doris expects for weekly flow ``monday``."""
-
-    if not isinstance(monday, date):
-        raise TypeError("monday must be a date object")
-    return monday.strftime("%Y%m%d")
-
-
 def _configure_logging() -> None:
     level = os.getenv("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -178,6 +168,29 @@ def _normalise_flow_dataframe(flow: pd.DataFrame) -> pd.DataFrame:
     columns = [col for col in preferred_order if col in df.columns]
     extra_columns = [col for col in df.columns if col not in columns]
     return df.loc[:, columns + extra_columns]
+
+
+def _augment_in_clause(
+    base_sql: str,
+    column: str,
+    values: Sequence[object],
+    prefix: str,
+) -> tuple[str, dict[str, object]]:
+    """Append an ``IN`` clause with bound parameters when ``values`` is not empty."""
+
+    if not values:
+        return base_sql, {}
+
+    tokens: list[str] = []
+    params: dict[str, object] = {}
+    for idx, value in enumerate(values):
+        key = f"{prefix}_{idx}"
+        tokens.append(f":{key}")
+        params[key] = value
+
+    clause = ", ".join(tokens)
+    sql = base_sql + f" AND {column} IN ({clause})"
+    return sql, params
 
 
 def _augment_scene_filters(base_sql: str, filters: Sequence[str] | None) -> tuple[str, dict[str, object]]:
@@ -391,19 +404,26 @@ def run_competition_pipeline(
             "No scene_tag rows match provided filters after aligning with snapshots"
         )
 
-    flow_df = _read_dataframe(
-        engine,
-        FLOW_SQL,
-        {"mk": marketplace_id, "monday": _format_monday_for_weekly_query(monday)},
+    flow_sql, flow_params_extra = _augment_in_clause(
+        FLOW_SQL_BASE,
+        "asin",
+        relevant_asins,
+        "asin",
     )
+    flow_params = {"mk": marketplace_id, **flow_params_extra}
+    flow_df = _read_dataframe(engine, flow_sql, flow_params)
     flow_df = _normalise_flow_dataframe(flow_df)
     LOGGER.info(
-        "competition_pipeline_flow_fetched week=%s rows=%d",
-        resolved_week,
+        "competition_pipeline_flow_raw rows=%d",
         len(flow_df),
     )
     if not flow_df.empty:
-        flow_df = flow_df.loc[flow_df["asin"].isin(relevant_asins)].copy()
+        flow_df = flow_df.loc[flow_df["monday"] == monday].copy()
+    LOGGER.info(
+        "competition_pipeline_flow_filtered rows=%d monday=%s",
+        len(flow_df),
+        monday,
+    )
 
     keyword_df = _read_dataframe(engine, KEYWORD_SQL, {
         "mk": marketplace_id,

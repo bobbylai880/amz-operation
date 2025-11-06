@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, text
 from scpc.etl.competition_features import build_traffic_features
 
 from scpc.etl.competition_pipeline import (
-    _format_monday_for_weekly_query,
+    _augment_in_clause,
     _iso_week_to_dates,
     _latest_week_with_data,
     _normalise_flow_dataframe,
@@ -133,13 +133,20 @@ def test_normalise_flow_dataframe_adds_calendar_fields() -> None:
     assert normalised.loc[0, "week"] == "2025W10"
 
 
-def test_format_monday_for_weekly_query_returns_compact_string() -> None:
-    assert _format_monday_for_weekly_query(date(2025, 3, 3)) == "20250303"
+def test_augment_in_clause_appends_tokens() -> None:
+    base_sql = "SELECT * FROM demo WHERE marketplace_id = :mk"
+    sql, params = _augment_in_clause(base_sql, "asin", ["A1", "A2"], "asin")
+
+    assert sql.endswith("AND asin IN (:asin_0, :asin_1)")
+    assert params == {"asin_0": "A1", "asin_1": "A2"}
 
 
-def test_format_monday_for_weekly_query_rejects_non_date() -> None:
-    with pytest.raises(TypeError):
-        _format_monday_for_weekly_query("20250303")
+def test_augment_in_clause_no_values_returns_base_sql() -> None:
+    base_sql = "SELECT * FROM demo WHERE marketplace_id = :mk"
+    sql, params = _augment_in_clause(base_sql, "asin", [], "asin")
+
+    assert sql == base_sql
+    assert params == {}
 
 
 def test_latest_week_with_data_returns_latest_label() -> None:
