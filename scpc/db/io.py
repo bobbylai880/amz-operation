@@ -7,7 +7,13 @@ import warnings
 from itertools import islice
 from typing import Iterable, Mapping, Sequence
 
+try:  # pragma: no cover - numpy is an optional dependency at runtime
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None  # type: ignore[assignment]
+
 import pandas as pd
+from pandas.api.types import is_scalar
 from sqlalchemy import Column, MetaData, Table, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SAWarning
@@ -49,7 +55,15 @@ def _normalise_records(records: Iterable[Mapping[str, object]]) -> list[dict[str
         for key, value in row.items():
             if isinstance(value, pd.Timestamp):
                 converted[key] = value.to_pydatetime()
-            elif pd.isna(value):  # type: ignore[arg-type]
+            elif value is None:
+                converted[key] = None
+            # Only call ``pd.isna`` for scalars; when applied to sequences it
+            # returns an array which would trigger ``ValueError`` in boolean
+            # contexts (e.g. downstream ``if`` statements).
+            elif (
+                is_scalar(value)
+                or (np is not None and isinstance(value, np.generic))
+            ) and pd.isna(value):  # type: ignore[arg-type]
                 converted[key] = None
             else:
                 converted[key] = value
