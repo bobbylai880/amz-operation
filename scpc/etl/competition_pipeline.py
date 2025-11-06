@@ -67,6 +67,30 @@ FROM hyy.bi_sif_asin_flow_overview_weekly
 WHERE marketplace_id = :mk
 """
 
+TRAFFIC_ONLY_COLUMNS: set[str] = {
+    "ad_ratio",
+    "nf_ratio",
+    "recommend_ratio",
+    "sp_ratio",
+    "sbv_ratio",
+    "sb_ratio",
+    "sp_share_in_ad",
+    "sbv_share_in_ad",
+    "sb_share_in_ad",
+    "ad_to_natural",
+    "kw_entropy_7d_avg",
+    "kw_hhi_7d_avg",
+    "kw_top1_share_7d_avg",
+    "kw_top3_share_7d_avg",
+    "kw_top10_share_7d_avg",
+    "kw_brand_share_7d_avg",
+    "kw_competitor_share_7d_avg",
+    "kw_generic_share_7d_avg",
+    "kw_attribute_share_7d_avg",
+    "kw_days_covered",
+    "kw_coverage_ratio",
+}
+
 KEYWORD_SQL = """
 SELECT asin, marketplace_id, keyword, snapshot_date, ratio_score
 FROM vw_sif_keyword_daily_std
@@ -322,6 +346,19 @@ def _filter_scene_tags(scene_tags: pd.DataFrame, allowed: Iterable[str]) -> pd.D
     return scene_tags.loc[scene_tags["scene_tag"].isin(allowed_set)].copy()
 
 
+def _prune_traffic_columns(
+    entities: pd.DataFrame,
+) -> tuple[pd.DataFrame, set[str]]:
+    """Remove traffic-only feature columns from entity records."""
+
+    drop_cols = {column for column in TRAFFIC_ONLY_COLUMNS if column in entities.columns}
+    if not drop_cols:
+        return entities, set()
+
+    pruned = entities.drop(columns=sorted(drop_cols))
+    return pruned, drop_cols
+
+
 def run_competition_pipeline(
     week: str | None,
     marketplace_id: str,
@@ -465,6 +502,13 @@ def run_competition_pipeline(
         traffic=traffic_features,
     )
 
+    entities, dropped_columns = _prune_traffic_columns(entities)
+    if dropped_columns:
+        LOGGER.info(
+            "competition_pipeline_entities_pruned columns=%s",
+            sorted(dropped_columns),
+        )
+
     traffic_entities = _prepare_traffic_entities(traffic_features, scene_df, snapshot_df)
 
     results = {
@@ -586,4 +630,6 @@ __all__ = [
     "_normalise_flow_dataframe",
     "_iso_week_to_dates",
     "_latest_week_with_data",
+    "_prune_traffic_columns",
+    "TRAFFIC_ONLY_COLUMNS",
 ]

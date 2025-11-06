@@ -8,7 +8,10 @@ import pandas as pd
 import pytest
 from sqlalchemy import create_engine, text
 
-from scpc.etl.competition_features import build_traffic_features
+from scpc.etl.competition_features import (
+    build_traffic_features,
+    clean_competition_entities,
+)
 
 from scpc.etl.competition_pipeline import (
     _augment_in_clause,
@@ -16,6 +19,8 @@ from scpc.etl.competition_pipeline import (
     _latest_week_with_data,
     _normalise_flow_dataframe,
     _prepare_traffic_entities,
+    _prune_traffic_columns,
+    TRAFFIC_ONLY_COLUMNS,
 )
 from scpc.tests.data.competition_samples import (
     build_competition_snapshot_sample,
@@ -93,6 +98,36 @@ def test_prepare_traffic_entities_merges_scene_and_parent() -> None:
     assert my_row["parent_asin"] == "PARENT-1"
     assert my_row["hyy_asin"] == 1
     assert 0 <= my_row["kw_coverage_ratio"] <= 1
+
+
+def test_prune_traffic_columns_removes_flow_metrics() -> None:
+    snapshots = build_competition_snapshot_sample()
+    snapshots = snapshots.loc[snapshots["week"] == "2025W10"].reset_index(drop=True)
+    scene_tags = build_scene_tag_sample()
+
+    traffic_features = build_traffic_features(
+        build_traffic_flow_sample(),
+        build_keyword_daily_sample(),
+        build_keyword_tag_sample(),
+    )
+    traffic_features = traffic_features.loc[
+        traffic_features["week"] == "2025W10"
+    ].reset_index(drop=True)
+
+    entities = clean_competition_entities(
+        snapshots,
+        my_asins={"MY-ASIN-1"},
+        scene_tags=scene_tags,
+        traffic=traffic_features,
+    )
+    pruned, dropped = _prune_traffic_columns(entities)
+
+    expected_dropped = {col for col in TRAFFIC_ONLY_COLUMNS if col in entities.columns}
+    assert dropped == expected_dropped
+    for column in expected_dropped:
+        assert column not in pruned.columns
+
+    assert {"scene_tag", "price_current", "asin"}.issubset(pruned.columns)
 
 
 def test_normalise_flow_dataframe_adds_calendar_fields() -> None:
