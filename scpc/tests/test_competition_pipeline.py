@@ -20,6 +20,7 @@ from scpc.etl.competition_pipeline import (
     _normalise_flow_dataframe,
     _prepare_traffic_entities,
     _prune_traffic_columns,
+    _prune_to_table,
     TRAFFIC_ONLY_COLUMNS,
 )
 from scpc.tests.data.competition_samples import (
@@ -128,6 +129,26 @@ def test_prune_traffic_columns_removes_flow_metrics() -> None:
         assert column not in pruned.columns
 
     assert {"scene_tag", "price_current", "asin"}.issubset(pruned.columns)
+
+
+def test_prune_to_table_aligns_with_table_schema() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "asin": "A1",
+                "scene_tag": "SCN-USBAG-01",
+                "price_current": 19.99,
+                "unexpected": "value",
+            }
+        ]
+    )
+
+    table_columns = ["asin", "scene_tag", "price_current", "coupon_pct"]
+    pruned, dropped, missing = _prune_to_table(df, table_columns)
+
+    assert list(pruned.columns) == ["asin", "scene_tag", "price_current"]
+    assert dropped == {"unexpected"}
+    assert missing == {"coupon_pct"}
 
 
 def test_normalise_flow_dataframe_adds_calendar_fields() -> None:

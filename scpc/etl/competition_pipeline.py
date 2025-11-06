@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 import os
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -15,8 +15,9 @@ from scpc.utils.dependencies import ensure_packages
 ensure_packages(["pandas", "numpy", "sqlalchemy"])
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from scpc.db.engine import create_doris_engine
 from scpc.db.io import replace_into
@@ -90,6 +91,9 @@ TRAFFIC_ONLY_COLUMNS: set[str] = {
     "kw_days_covered",
     "kw_coverage_ratio",
 }
+
+ENTITIES_TABLE = "bi_amz_comp_entities_clean"
+TRAFFIC_TABLE = "bi_amz_comp_traffic_entities_weekly"
 
 KEYWORD_SQL = """
 SELECT asin, marketplace_id, keyword, snapshot_date, ratio_score
@@ -359,6 +363,59 @@ def _prune_traffic_columns(
     return pruned, drop_cols
 
 
+def _load_table_columns(engine: Engine, table: str) -> list[str]:
+    """Return the column names for ``table`` in declaration order."""
+
+    try:
+        inspector = inspect(engine)
+        columns = inspector.get_columns(table)
+    except SQLAlchemyError as exc:  # pragma: no cover - database connectivity guard
+        LOGGER.warning(
+            "competition_pipeline_table_columns_failed table=%s error=%s",
+            table,
+            exc,
+        )
+        return []
+    except Exception as exc:  # pragma: no cover - fallback for non-SQLAlchemy errors
+        LOGGER.warning(
+            "competition_pipeline_table_columns_failed table=%s error=%s",
+            table,
+            exc,
+        )
+        return []
+
+    ordered = []
+    for column in columns:
+        name = column.get("name")
+        if name:
+            ordered.append(name)
+    return ordered
+
+
+def _prune_to_table(
+    df: pd.DataFrame,
+    table_columns: Sequence[str] | None,
+) -> tuple[pd.DataFrame, set[str], set[str]]:
+    """Align ``df`` with ``table_columns`` by dropping extras and preserving order."""
+
+    if df.empty or not table_columns:
+        return df, set(), set()
+
+    allowed = [column for column in table_columns if column]
+    allowed_set = set(allowed)
+
+    drop_cols = {column for column in df.columns if column not in allowed_set}
+    pruned = df.drop(columns=sorted(drop_cols)) if drop_cols else df
+
+    # Reindex columns to match the table declaration order.
+    ordered_columns = [column for column in allowed if column in pruned.columns]
+    if ordered_columns:
+        pruned = pruned.loc[:, ordered_columns]
+
+    missing = {column for column in allowed if column not in pruned.columns}
+    return pruned, drop_cols, missing
+
+
 def run_competition_pipeline(
     week: str | None,
     marketplace_id: str,
@@ -511,6 +568,44 @@ def run_competition_pipeline(
 
     traffic_entities = _prepare_traffic_entities(traffic_features, scene_df, snapshot_df)
 
+    if write:
+        entity_table_columns = _load_table_columns(engine, ENTITIES_TABLE)
+        traffic_table_columns = _load_table_columns(engine, TRAFFIC_TABLE)
+
+        entities, dropped_entity_table, missing_entity_table = _prune_to_table(
+            entities,
+            entity_table_columns,
+        )
+        if dropped_entity_table:
+            LOGGER.info(
+                "competition_pipeline_prune_to_table table=%s dropped_cols=%s",
+                ENTITIES_TABLE,
+                sorted(dropped_entity_table),
+            )
+        if missing_entity_table:
+            LOGGER.warning(
+                "competition_pipeline_table_missing_columns table=%s missing=%s",
+                ENTITIES_TABLE,
+                sorted(missing_entity_table),
+            )
+
+        traffic_entities, dropped_traffic_table, missing_traffic_table = _prune_to_table(
+            traffic_entities,
+            traffic_table_columns,
+        )
+        if dropped_traffic_table:
+            LOGGER.info(
+                "competition_pipeline_prune_to_table table=%s dropped_cols=%s",
+                TRAFFIC_TABLE,
+                sorted(dropped_traffic_table),
+            )
+        if missing_traffic_table:
+            LOGGER.warning(
+                "competition_pipeline_table_missing_columns table=%s missing=%s",
+                TRAFFIC_TABLE,
+                sorted(missing_traffic_table),
+            )
+
     results = {
         "snapshots": snapshot_df,
         "scene_tags": scene_df,
@@ -526,11 +621,11 @@ def run_competition_pipeline(
     )
 
     if write:
-        ent_written = replace_into(engine, "bi_amz_comp_entities_clean", entities, chunk_size=chunk_size)
+        ent_written = replace_into(engine, ENTITIES_TABLE, entities, chunk_size=chunk_size)
         LOGGER.info("competition_pipeline_entities_written rows=%d", ent_written)
         traffic_written = replace_into(
             engine,
-            "bi_amz_comp_traffic_entities_weekly",
+            TRAFFIC_TABLE,
             traffic_entities,
             chunk_size=chunk_size,
         )
@@ -631,5 +726,9 @@ __all__ = [
     "_iso_week_to_dates",
     "_latest_week_with_data",
     "_prune_traffic_columns",
+    "_prune_to_table",
+    "_load_table_columns",
     "TRAFFIC_ONLY_COLUMNS",
+    "ENTITIES_TABLE",
+    "TRAFFIC_TABLE",
 ]
