@@ -87,9 +87,9 @@ python -m scpc.etl.scene_pipeline \
 2. **特征生成（Features）**
    - `clean_competition_entities()` 衍生净价、排名、内容/社交得分，并融合 `build_traffic_features()` 产出的广告结构、关键词集中度等流量特征，落地到 `bi_amz_comp_entities_clean`/`bi_amz_comp_traffic_entities_weekly`。
 3. **对比构建（Compare）**
-   - 页面主配对：`build_competition_pairs()` 计算我方对 Leader/Median 的价差、排名、内容、社交、徽章差距及对应得分；
-   - 流量主配对：同函数返回的 `traffic_pairs` 描述广告结构与关键词缺口；
-   - 逐对配对与环比：`build_competition_pairs_each()`、`build_competition_delta()`、`summarise_competition_scene()` 分别刻画具体竞品、WoW 变化及场景周报指标。
+   - 页面主配对：`build_competition_pairs()` 计算我方对 Leader/Median 的价差、排名、内容、社交、徽章差距及对应得分，入库至 `bi_amz_comp_pairs`；
+   - 流量主配对：同函数返回的 `traffic_pairs` 描述广告结构与关键词缺口，入库至 `bi_amz_comp_traffic_pairs`；
+   - 逐对配对与环比：`build_competition_pairs_each()`、`build_competition_delta()`、`summarise_competition_scene()` 分别刻画具体竞品、WoW 变化及场景周报指标，对应 `bi_amz_comp_pairs_each`、`bi_amz_comp_traffic_pairs_each`、`bi_amz_comp_delta`、`bi_amz_comp_scene_week_metrics`。
 4. **规则判定（Rules）**
    - 评分参数取自 `configs/competition_scoring.yaml` 与 `default_traffic`，在主配对与逐对配对中计算 `score_*`、`t_score_*`、`pressure`、`t_pressure` 等结构化分值，形成页面 + 流量两条判断链；
    - 若接入自定义规则，可进一步将结果写入 `bi_amz_comp_lag_insights` 用于自动落后判定。
@@ -159,7 +159,7 @@ result = compute_competition_features(
 ```
 `tables` 可直接写入 Doris，`result.as_dict()` 则用于 LLM 消费与 JSON Schema 校验。
 
-### 运行命令（数据清洗 + 特征入库）
+### 运行命令（数据清洗 + 特征 / Compare 入库）
 ```bash
 python -m scpc.etl.competition_pipeline \
   --mk US \
@@ -173,6 +173,35 @@ python -m scpc.etl.competition_pipeline \
 - 当快照、场景映射或筛选条件缺失时会直接报错并在日志中指出缺失原因，方便快速补齐数据后重跑。
 - 若启用 `--write`，流水线会在 UPSERT 成功后额外输出 Doris 侧的验证命令及行数判定，便于立即确认指定周度是否落库成功。
 
+若要同步生成对比结果，可启用 Compare：
+
+```bash
+python -m scpc.etl.competition_pipeline \
+  --mk US \
+  --scene-tag SCN-USBAG-01 \
+  --with-compare \
+  --write \
+  --write-compare
+```
+
+- `--with-compare` 会在特征计算完成后进一步构建 `bi_amz_comp_pairs/bi_amz_comp_pairs_each/bi_amz_comp_delta` 以及流量侧配对表；
+- `--write-compare` 控制 Compare 结果是否 UPSERT 至 Doris，未传入时仅返回行数摘要；
+- `--previous-week` 可手动指定对比基准周（默认回推 `--week` 的上一周）；
+- `--rule-name`/`--traffic-rule-name` 支持切换页面/流量评分规则；
+- `--compare-only` 在特征已入库时跳过清洗阶段，仅执行 Compare，可搭配 `--week`+`--previous-week` 重算 WoW。
+
+示例：特征已存在，仅重算 2025W10 vs 2025W09 的 Compare 并落库：
+
+```bash
+python -m scpc.etl.competition_pipeline \
+  --mk US \
+  --week 2025W10 \
+  --previous-week 2025W09 \
+  --with-compare \
+  --compare-only \
+  --write-compare
+```
+
 ### 写库后校验
 当 `--write` 执行完成后，日志会打印 Doris SQL 验证命令，可直接在 MySQL/Doris 客户端运行以下语句，确认实体与流量表是否存在目标周数据（示例：美国站 2025W44）：
 
@@ -183,6 +212,22 @@ WHERE marketplace_id = 'US' AND week = '2025W44';
 
 SELECT COUNT(*) AS row_count
 FROM bi_amz_comp_traffic_entities_weekly
+WHERE marketplace_id = 'US' AND week = '2025W44';
+
+SELECT COUNT(*) AS row_count
+FROM bi_amz_comp_pairs
+WHERE marketplace_id = 'US' AND week = '2025W44';
+
+SELECT COUNT(*) AS row_count
+FROM bi_amz_comp_pairs_each
+WHERE marketplace_id = 'US' AND week = '2025W44';
+
+SELECT COUNT(*) AS row_count
+FROM bi_amz_comp_delta
+WHERE marketplace_id = 'US' AND week_w0 = '2025W44';
+
+SELECT COUNT(*) AS row_count
+FROM bi_amz_comp_scene_week_metrics
 WHERE marketplace_id = 'US' AND week = '2025W44';
 ```
 
