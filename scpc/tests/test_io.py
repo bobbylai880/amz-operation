@@ -10,7 +10,9 @@ pytest.importorskip("sqlalchemy")
 pytest.importorskip("pandas")
 import pandas as pd
 
-from scpc.db.io import _get_doris_version, replace_into
+np = pytest.importorskip("numpy")
+
+from scpc.db.io import _get_doris_version, _normalise_records, replace_into
 
 
 class _MockResult:
@@ -186,3 +188,25 @@ def test_version_detection_5799_maps_to_doris_mysql_layer() -> None:
     version = _get_doris_version(_Conn())
 
     assert version == "Doris 2.x (mysql-compatible)"
+
+
+def test_normalise_records_preserves_sequences_and_handles_empty_arrays() -> None:
+    records = [
+        {
+            "ts": pd.Timestamp("2025-11-06 12:00:00"),
+            "none_value": None,
+            "nan_scalar": float("nan"),
+            "numpy_scalar": np.float64(np.nan),
+            "list_value": [],
+            "ndarray_value": np.array([], dtype=float),
+        }
+    ]
+
+    normalised = _normalise_records(records)
+
+    assert normalised[0]["ts"].isoformat() == "2025-11-06T12:00:00"
+    assert normalised[0]["none_value"] is None
+    assert normalised[0]["nan_scalar"] is None
+    assert normalised[0]["numpy_scalar"] is None
+    assert normalised[0]["list_value"] == []
+    assert normalised[0]["ndarray_value"].shape == (0,)
