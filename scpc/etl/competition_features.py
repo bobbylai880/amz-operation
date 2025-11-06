@@ -9,6 +9,10 @@ import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from scpc.utils.dependencies import ensure_packages
+
+ensure_packages(["numpy", "pandas", ("yaml", "PyYAML")])
+
 import numpy as np
 import pandas as pd
 import yaml

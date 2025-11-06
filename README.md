@@ -159,10 +159,23 @@ result = compute_competition_features(
 ```
 `tables` 可直接写入 Doris，`result.as_dict()` 则用于 LLM 消费与 JSON Schema 校验。
 
+### 运行命令（数据清洗 + 特征入库）
+```bash
+python -m scpc.etl.competition_pipeline \
+  --mk US \
+  --scene-tag SCN-USBAG-01 \
+  --write
+```
+该命令对齐 Scene 模块的 CLI 体验：
+- `--week` 指定周日口径的 ISO 周；若省略则自动选择目标站点最近一周的快照；`--mk` 指定站点；可重复传入 `--scene-tag` 仅处理目标场景；
+- 默认仅打印清洗与特征产出的行数，追加 `--write` 后会将页面与流量特征分别 UPSERT 到 `bi_amz_comp_entities_clean`、`bi_amz_comp_traffic_entities_weekly`；
+- `--chunk-size` 可调节 Doris UPSERT 批次大小（默认 500），所有步骤会输出详细日志，结果同时写入 `SCPC_LOG_DIR`（默认 `storage/logs`）。
+- 当快照、场景映射或筛选条件缺失时会直接报错并在日志中指出缺失原因，方便快速补齐数据后重跑。
+
 ### 模块测试
 安装依赖：`pip install -r requirements-dev.txt`
 
-`pytest scpc/tests/test_competition_features.py`
+`pytest scpc/tests/test_competition_features.py scpc/tests/test_competition_pipeline.py`
 
 测试用例通过 `scpc/tests/data/competition_samples.py` 构造页面与流量事实表，覆盖 `build_traffic_features`、`clean_competition_entities`、主/逐对配对、环比汇总以及 `compute_competition_features` 生成的页面 + 流量双维度判断链，确保第二层竞争主逻辑顺畅运行。
 
