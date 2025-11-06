@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Callable
 
@@ -190,7 +191,7 @@ def test_version_detection_5799_maps_to_doris_mysql_layer() -> None:
     assert version == "Doris 2.x (mysql-compatible)"
 
 
-def test_normalise_records_preserves_sequences_and_handles_empty_arrays() -> None:
+def test_normalise_records_serialises_containers_and_handles_empty_arrays() -> None:
     records = [
         {
             "ts": pd.Timestamp("2025-11-06 12:00:00"),
@@ -198,6 +199,8 @@ def test_normalise_records_preserves_sequences_and_handles_empty_arrays() -> Non
             "nan_scalar": float("nan"),
             "numpy_scalar": np.float64(np.nan),
             "list_value": [],
+            "tuple_value": ("a", 1),
+            "dict_value": {"badge": "New"},
             "ndarray_value": np.array([], dtype=float),
         }
     ]
@@ -208,5 +211,11 @@ def test_normalise_records_preserves_sequences_and_handles_empty_arrays() -> Non
     assert normalised[0]["none_value"] is None
     assert normalised[0]["nan_scalar"] is None
     assert normalised[0]["numpy_scalar"] is None
-    assert normalised[0]["list_value"] == []
-    assert normalised[0]["ndarray_value"].shape == (0,)
+    assert isinstance(normalised[0]["list_value"], str)
+    assert isinstance(normalised[0]["tuple_value"], str)
+    assert isinstance(normalised[0]["dict_value"], str)
+    assert isinstance(normalised[0]["ndarray_value"], str)
+    assert json.loads(normalised[0]["list_value"]) == []
+    assert json.loads(normalised[0]["tuple_value"]) == ["a", 1]
+    assert json.loads(normalised[0]["dict_value"]) == {"badge": "New"}
+    assert json.loads(normalised[0]["ndarray_value"]) == []
