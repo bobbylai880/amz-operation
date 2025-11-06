@@ -78,7 +78,7 @@ python -m scpc.etl.scene_pipeline \
 与 WoW 正负驱动，确保关键逻辑在无真实数据库时也能复现。
 
 ## Competition 模块：第二层页面 + 流量竞对
-`scpc/etl/competition_features.py` 将竞争分析拆解为“页面事实 + 流量事实”的双轨特征工程。整个第二层竞争对比遵循 **事实表 → 特征 → 对比 → 规则 → LLM** 的主逻辑，先以页面与流量维度形成量化结论，再由 LLM 补充结构化洞察与文本总结。
+`scpc/etl/competition_features.py` 将竞争分析拆解为“页面事实 + 流量事实”的双轨特征工程。整个第二层竞争对比遵循 **事实表 → 特征 → 对比 → 规则 → LLM** 的主逻辑，先以页面与流量维度形成量化结论，再由 LLM 补充结构化洞察与文本总结。自 Doris 2.1 兼容优化后，竞争流水线还在写库前执行字段裁剪与表结构对齐，确保与 `bi_amz_comp_entities_clean`、`bi_amz_comp_traffic_entities_weekly` 的定义一致。
 
 ### 主逻辑：事实 → 特征 → 对比 → 规则 → LLM
 1. **事实表（Facts）**
@@ -168,9 +168,25 @@ python -m scpc.etl.competition_pipeline \
 ```
 该命令对齐 Scene 模块的 CLI 体验：
 - `--week` 指定周日口径的 ISO 周；若省略则自动选择目标站点最近一周的快照；`--mk` 指定站点；可重复传入 `--scene-tag` 仅处理目标场景；
-- 默认仅打印清洗与特征产出的行数，追加 `--write` 后会将页面与流量特征分别 UPSERT 到 `bi_amz_comp_entities_clean`、`bi_amz_comp_traffic_entities_weekly`；
+- 默认仅打印清洗与特征产出的行数，追加 `--write` 后会将页面与流量特征分别 UPSERT 到 `bi_amz_comp_entities_clean`、`bi_amz_comp_traffic_entities_weekly`，写入前会自动剔除流量专属字段并按 Doris 表结构重排列顺序；
 - `--chunk-size` 可调节 Doris UPSERT 批次大小（默认 500），所有步骤会输出详细日志，结果同时写入 `SCPC_LOG_DIR`（默认 `storage/logs`）。
 - 当快照、场景映射或筛选条件缺失时会直接报错并在日志中指出缺失原因，方便快速补齐数据后重跑。
+- 若启用 `--write`，流水线会在 UPSERT 成功后额外输出 Doris 侧的验证命令及行数判定，便于立即确认指定周度是否落库成功。
+
+### 写库后校验
+当 `--write` 执行完成后，日志会打印 Doris SQL 验证命令，可直接在 MySQL/Doris 客户端运行以下语句，确认实体与流量表是否存在目标周数据（示例：美国站 2025W44）：
+
+```sql
+SELECT COUNT(*) AS row_count
+FROM bi_amz_comp_entities_clean
+WHERE marketplace_id = 'US' AND week = '2025W44';
+
+SELECT COUNT(*) AS row_count
+FROM bi_amz_comp_traffic_entities_weekly
+WHERE marketplace_id = 'US' AND week = '2025W44';
+```
+
+若返回 `row_count > 0`，说明入库成功；否则需回查日志中的 dropped_cols、missing_cols 等诊断信息，确认字段裁剪或 Doris 表结构是否需要调整。
 
 ### 模块测试
 安装依赖：`pip install -r requirements-dev.txt`

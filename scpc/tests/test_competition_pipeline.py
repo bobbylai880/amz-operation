@@ -4,14 +4,25 @@ from scpc.utils.dependencies import ensure_packages
 
 ensure_packages(["sqlalchemy", "pandas", "numpy"])
 
+import pandas as pd
 import pytest
 from sqlalchemy import create_engine, text
 
-from scpc.etl.competition_features import build_traffic_features
+from scpc.etl.competition_features import (
+    build_traffic_features,
+    clean_competition_entities,
+)
+
 from scpc.etl.competition_pipeline import (
+    _augment_in_clause,
     _iso_week_to_dates,
     _latest_week_with_data,
+    _normalise_flow_dataframe,
     _prepare_traffic_entities,
+    _prune_traffic_columns,
+    _prune_to_table,
+    _run_post_write_checks,
+    TRAFFIC_ONLY_COLUMNS,
 )
 from scpc.tests.data.competition_samples import (
     build_competition_snapshot_sample,
@@ -91,6 +102,110 @@ def test_prepare_traffic_entities_merges_scene_and_parent() -> None:
     assert 0 <= my_row["kw_coverage_ratio"] <= 1
 
 
+def test_prune_traffic_columns_removes_flow_metrics() -> None:
+    snapshots = build_competition_snapshot_sample()
+    snapshots = snapshots.loc[snapshots["week"] == "2025W10"].reset_index(drop=True)
+    scene_tags = build_scene_tag_sample()
+
+    traffic_features = build_traffic_features(
+        build_traffic_flow_sample(),
+        build_keyword_daily_sample(),
+        build_keyword_tag_sample(),
+    )
+    traffic_features = traffic_features.loc[
+        traffic_features["week"] == "2025W10"
+    ].reset_index(drop=True)
+
+    entities = clean_competition_entities(
+        snapshots,
+        my_asins={"MY-ASIN-1"},
+        scene_tags=scene_tags,
+        traffic=traffic_features,
+    )
+    pruned, dropped = _prune_traffic_columns(entities)
+
+    expected_dropped = {col for col in TRAFFIC_ONLY_COLUMNS if col in entities.columns}
+    assert dropped == expected_dropped
+    for column in expected_dropped:
+        assert column not in pruned.columns
+
+    assert {"scene_tag", "price_current", "asin"}.issubset(pruned.columns)
+
+
+def test_prune_to_table_aligns_with_table_schema() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "asin": "A1",
+                "scene_tag": "SCN-USBAG-01",
+                "price_current": 19.99,
+                "unexpected": "value",
+            }
+        ]
+    )
+
+    table_columns = ["asin", "scene_tag", "price_current", "coupon_pct"]
+    pruned, dropped, missing = _prune_to_table(df, table_columns)
+
+    assert list(pruned.columns) == ["asin", "scene_tag", "price_current"]
+    assert dropped == {"unexpected"}
+    assert missing == {"coupon_pct"}
+
+
+def test_normalise_flow_dataframe_adds_calendar_fields() -> None:
+    raw = pd.DataFrame(
+        [
+            {
+                "asin": "A1",
+                "marketplace_id": "US",
+                "monday": "20250303",
+                "广告流量占比": "0.25",
+                "自然流量占比": 0.50,
+                "推荐流量占比": 0.25,
+                "SP广告流量占比": 0.10,
+                "视频广告流量占比": 0.05,
+                "品牌广告流量占比": 0.02,
+            }
+        ]
+    )
+
+    normalised = _normalise_flow_dataframe(raw)
+
+    for column in [
+        "asin",
+        "marketplace_id",
+        "monday",
+        "广告流量占比",
+        "自然流量占比",
+        "推荐流量占比",
+        "SP广告流量占比",
+        "视频广告流量占比",
+        "品牌广告流量占比",
+        "sunday",
+        "week",
+    ]:
+        assert column in normalised.columns
+    assert normalised.loc[0, "monday"] == date(2025, 3, 3)
+    assert normalised.loc[0, "sunday"] == date(2025, 3, 9)
+    assert normalised.loc[0, "week"] == "2025W10"
+
+
+def test_augment_in_clause_appends_tokens() -> None:
+    base_sql = "SELECT * FROM demo WHERE marketplace_id = :mk"
+    sql, params = _augment_in_clause(base_sql, "asin", ["A1", "A2"], "asin")
+
+    assert sql.endswith("AND asin IN (:asin_0, :asin_1)")
+    assert params == {"asin_0": "A1", "asin_1": "A2"}
+
+
+def test_augment_in_clause_no_values_returns_base_sql() -> None:
+    base_sql = "SELECT * FROM demo WHERE marketplace_id = :mk"
+    sql, params = _augment_in_clause(base_sql, "asin", [], "asin")
+
+    assert sql == base_sql
+    assert params == {}
+
+
 def test_latest_week_with_data_returns_latest_label() -> None:
     engine = create_engine("sqlite://")
     with engine.begin() as conn:
@@ -137,4 +252,62 @@ def test_latest_week_with_data_raises_when_missing_snapshot() -> None:
 
     with pytest.raises(RuntimeError):
         _latest_week_with_data(engine, "US")
+
+
+def test_run_post_write_checks_logs_commands_and_results(caplog) -> None:
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE bi_amz_comp_entities_clean (
+                    marketplace_id TEXT,
+                    week TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE bi_amz_comp_traffic_entities_weekly (
+                    marketplace_id TEXT,
+                    week TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO bi_amz_comp_entities_clean VALUES (:mk, :week)"
+            ),
+            {"mk": "US", "week": "2025W10"},
+        )
+
+    caplog.set_level("INFO", logger="scpc.etl.competition_pipeline")
+    _run_post_write_checks(engine, "US", "2025W10")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "competition_pipeline_check_step" in message
+        and "table=bi_amz_comp_entities_clean" in message
+        for message in messages
+    )
+    assert any(
+        "competition_pipeline_check_step" in message
+        and "table=bi_amz_comp_traffic_entities_weekly" in message
+        for message in messages
+    )
+    assert any(
+        "competition_pipeline_check_result" in message
+        and "table=bi_amz_comp_entities_clean" in message
+        and "status=ok" in message
+        for message in messages
+    )
+    assert any(
+        "competition_pipeline_check_result" in message
+        and "table=bi_amz_comp_traffic_entities_weekly" in message
+        and "status=empty" in message
+        for message in messages
+    )
 

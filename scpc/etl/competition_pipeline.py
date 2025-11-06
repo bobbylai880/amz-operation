@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 import os
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -15,8 +15,9 @@ from scpc.utils.dependencies import ensure_packages
 ensure_packages(["pandas", "numpy", "sqlalchemy"])
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from scpc.db.engine import create_doris_engine
 from scpc.db.io import replace_into
@@ -49,13 +50,50 @@ FROM bi_amz_asin_scene_tag
 WHERE marketplace_id = :mk
 """
 
-FLOW_SQL = """
-SELECT asin, marketplace_id, week, sunday,
-       ad_ratio, nf_ratio, recommend_ratio,
-       sp_ratio, sbv_ratio, sb_ratio
-FROM vw_sif_asin_flow_overview_weekly_std
-WHERE marketplace_id = :mk AND week = :week
+# Doris 2.1 rewrites ``monday = ?`` predicates on the weekly flow table into
+# invalid expressions when pushing them down to the daily source. Avoid the
+# rewrite by removing the ``monday`` predicate from the SQL and performing the
+# date filter client-side.
+FLOW_SQL_BASE = """
+SELECT asin,
+       marketplace_id,
+       monday,
+       `广告流量占比` AS ad_ratio,
+       `自然流量占比` AS nf_ratio,
+       `推荐流量占比` AS recommend_ratio,
+       `SP广告流量占比` AS sp_ratio,
+       `视频广告流量占比` AS sbv_ratio,
+       `品牌广告流量占比` AS sb_ratio
+FROM hyy.bi_sif_asin_flow_overview_weekly
+WHERE marketplace_id = :mk
 """
+
+TRAFFIC_ONLY_COLUMNS: set[str] = {
+    "ad_ratio",
+    "nf_ratio",
+    "recommend_ratio",
+    "sp_ratio",
+    "sbv_ratio",
+    "sb_ratio",
+    "sp_share_in_ad",
+    "sbv_share_in_ad",
+    "sb_share_in_ad",
+    "ad_to_natural",
+    "kw_entropy_7d_avg",
+    "kw_hhi_7d_avg",
+    "kw_top1_share_7d_avg",
+    "kw_top3_share_7d_avg",
+    "kw_top10_share_7d_avg",
+    "kw_brand_share_7d_avg",
+    "kw_competitor_share_7d_avg",
+    "kw_generic_share_7d_avg",
+    "kw_attribute_share_7d_avg",
+    "kw_days_covered",
+    "kw_coverage_ratio",
+}
+
+ENTITIES_TABLE = "bi_amz_comp_entities_clean"
+TRAFFIC_TABLE = "bi_amz_comp_traffic_entities_weekly"
 
 KEYWORD_SQL = """
 SELECT asin, marketplace_id, keyword, snapshot_date, ratio_score
@@ -90,8 +128,6 @@ def _iso_week_to_dates(week: str) -> tuple[date, date]:
     monday = date.fromisocalendar(year, week_num, 1)
     sunday = monday + timedelta(days=6)
     return monday, sunday
-
-
 def _configure_logging() -> None:
     level = os.getenv("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -108,6 +144,81 @@ def _read_dataframe(engine: Engine, sql: str, params: Mapping[str, object]) -> p
         if not rows:
             return pd.DataFrame(columns=result.keys())
         return pd.DataFrame(rows, columns=result.keys())
+
+
+def _normalise_flow_dataframe(flow: pd.DataFrame) -> pd.DataFrame:
+    """Add calendar fields to weekly flow rows without touching the SQL layer."""
+
+    if flow.empty:
+        columns = [
+            "asin",
+            "marketplace_id",
+            "monday",
+            "ad_ratio",
+            "nf_ratio",
+            "recommend_ratio",
+            "sp_ratio",
+            "sbv_ratio",
+            "sb_ratio",
+            "sunday",
+            "week",
+        ]
+        return pd.DataFrame(columns=columns)
+
+    df = flow.copy()
+    monday_ts = pd.to_datetime(df.get("monday"), errors="coerce")
+    df["monday"] = monday_ts.dt.date
+
+    sunday_ts = monday_ts + pd.Timedelta(days=6)
+    df["sunday"] = sunday_ts.dt.date
+
+    iso = monday_ts.dt.isocalendar()
+    df["week"] = iso["year"].astype(str) + "W" + iso["week"].astype(str).str.zfill(2)
+
+    missing_mask = monday_ts.isna()
+    if missing_mask.any():
+        df.loc[missing_mask, "week"] = pd.NA
+        df.loc[missing_mask, "sunday"] = pd.NA
+
+    preferred_order = [
+        "asin",
+        "marketplace_id",
+        "monday",
+        "ad_ratio",
+        "nf_ratio",
+        "recommend_ratio",
+        "sp_ratio",
+        "sbv_ratio",
+        "sb_ratio",
+        "sunday",
+        "week",
+    ]
+    columns = [col for col in preferred_order if col in df.columns]
+    extra_columns = [col for col in df.columns if col not in columns]
+    return df.loc[:, columns + extra_columns]
+
+
+def _augment_in_clause(
+    base_sql: str,
+    column: str,
+    values: Sequence[object],
+    prefix: str,
+) -> tuple[str, dict[str, object]]:
+    """Append an ``IN`` clause with bound parameters when ``values`` is not empty."""
+
+    if not values:
+        return base_sql, {}
+
+    tokens: list[str] = []
+    params: dict[str, object] = {}
+    for idx, value in enumerate(values):
+        key = f"{prefix}_{idx}"
+        tokens.append(f":{key}")
+        params[key] = value
+
+    clause = ", ".join(tokens)
+    sql = base_sql + f" AND {column} IN ({clause})"
+    return sql, params
 
 
 def _augment_scene_filters(base_sql: str, filters: Sequence[str] | None) -> tuple[str, dict[str, object]]:
@@ -239,6 +350,117 @@ def _filter_scene_tags(scene_tags: pd.DataFrame, allowed: Iterable[str]) -> pd.D
     return scene_tags.loc[scene_tags["scene_tag"].isin(allowed_set)].copy()
 
 
+def _prune_traffic_columns(
+    entities: pd.DataFrame,
+) -> tuple[pd.DataFrame, set[str]]:
+    """Remove traffic-only feature columns from entity records."""
+
+    drop_cols = {column for column in TRAFFIC_ONLY_COLUMNS if column in entities.columns}
+    if not drop_cols:
+        return entities, set()
+
+    pruned = entities.drop(columns=sorted(drop_cols))
+    return pruned, drop_cols
+
+
+def _load_table_columns(engine: Engine, table: str) -> list[str]:
+    """Return the column names for ``table`` in declaration order."""
+
+    try:
+        inspector = inspect(engine)
+        columns = inspector.get_columns(table)
+    except SQLAlchemyError as exc:  # pragma: no cover - database connectivity guard
+        LOGGER.warning(
+            "competition_pipeline_table_columns_failed table=%s error=%s",
+            table,
+            exc,
+        )
+        return []
+    except Exception as exc:  # pragma: no cover - fallback for non-SQLAlchemy errors
+        LOGGER.warning(
+            "competition_pipeline_table_columns_failed table=%s error=%s",
+            table,
+            exc,
+        )
+        return []
+
+    ordered = []
+    for column in columns:
+        name = column.get("name")
+        if name:
+            ordered.append(name)
+    return ordered
+
+
+def _prune_to_table(
+    df: pd.DataFrame,
+    table_columns: Sequence[str] | None,
+) -> tuple[pd.DataFrame, set[str], set[str]]:
+    """Align ``df`` with ``table_columns`` by dropping extras and preserving order."""
+
+    if df.empty or not table_columns:
+        return df, set(), set()
+
+    allowed = [column for column in table_columns if column]
+    allowed_set = set(allowed)
+
+    drop_cols = {column for column in df.columns if column not in allowed_set}
+    pruned = df.drop(columns=sorted(drop_cols)) if drop_cols else df
+
+    # Reindex columns to match the table declaration order.
+    ordered_columns = [column for column in allowed if column in pruned.columns]
+    if ordered_columns:
+        pruned = pruned.loc[:, ordered_columns]
+
+    missing = {column for column in allowed if column not in pruned.columns}
+    return pruned, drop_cols, missing
+
+
+def _run_post_write_checks(engine: Engine, marketplace_id: str, week: str) -> None:
+    """Execute verification queries to confirm rows exist for the target slice."""
+
+    commands = [
+        (
+            ENTITIES_TABLE,
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {ENTITIES_TABLE} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            ),
+        ),
+        (
+            TRAFFIC_TABLE,
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {TRAFFIC_TABLE} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            ),
+        ),
+    ]
+
+    with engine.connect() as conn:
+        for idx, (table, stmt) in enumerate(commands, start=1):
+            command_preview = (
+                f"SELECT COUNT(*) AS row_count FROM {table} "
+                "WHERE marketplace_id = :mk AND week = :week"
+            )
+            LOGGER.info(
+                "competition_pipeline_check_step step=%d table=%s command=%s",
+                idx,
+                table,
+                command_preview,
+            )
+            result = conn.execute(stmt, {"mk": marketplace_id, "week": week})
+            row_count = result.scalar() or 0
+            status = "ok" if row_count > 0 else "empty"
+            log_fn = LOGGER.info if row_count > 0 else LOGGER.warning
+            log_fn(
+                "competition_pipeline_check_result step=%d table=%s row_count=%d status=%s",
+                idx,
+                table,
+                row_count,
+                status,
+            )
+
+
 def run_competition_pipeline(
     week: str | None,
     marketplace_id: str,
@@ -321,16 +543,26 @@ def run_competition_pipeline(
             "No scene_tag rows match provided filters after aligning with snapshots"
         )
 
-    flow_df = _read_dataframe(
-        engine, FLOW_SQL, {"mk": marketplace_id, "week": resolved_week}
+    flow_sql, flow_params_extra = _augment_in_clause(
+        FLOW_SQL_BASE,
+        "asin",
+        relevant_asins,
+        "asin",
     )
+    flow_params = {"mk": marketplace_id, **flow_params_extra}
+    flow_df = _read_dataframe(engine, flow_sql, flow_params)
+    flow_df = _normalise_flow_dataframe(flow_df)
     LOGGER.info(
-        "competition_pipeline_flow_fetched week=%s rows=%d",
-        resolved_week,
+        "competition_pipeline_flow_raw rows=%d",
         len(flow_df),
     )
     if not flow_df.empty:
-        flow_df = flow_df.loc[flow_df["asin"].isin(relevant_asins)].copy()
+        flow_df = flow_df.loc[flow_df["monday"] == monday].copy()
+    LOGGER.info(
+        "competition_pipeline_flow_filtered rows=%d monday=%s",
+        len(flow_df),
+        monday,
+    )
 
     keyword_df = _read_dataframe(engine, KEYWORD_SQL, {
         "mk": marketplace_id,
@@ -372,7 +604,52 @@ def run_competition_pipeline(
         traffic=traffic_features,
     )
 
+    entities, dropped_columns = _prune_traffic_columns(entities)
+    if dropped_columns:
+        LOGGER.info(
+            "competition_pipeline_entities_pruned columns=%s",
+            sorted(dropped_columns),
+        )
+
     traffic_entities = _prepare_traffic_entities(traffic_features, scene_df, snapshot_df)
+
+    if write:
+        entity_table_columns = _load_table_columns(engine, ENTITIES_TABLE)
+        traffic_table_columns = _load_table_columns(engine, TRAFFIC_TABLE)
+
+        entities, dropped_entity_table, missing_entity_table = _prune_to_table(
+            entities,
+            entity_table_columns,
+        )
+        if dropped_entity_table:
+            LOGGER.info(
+                "competition_pipeline_prune_to_table table=%s dropped_cols=%s",
+                ENTITIES_TABLE,
+                sorted(dropped_entity_table),
+            )
+        if missing_entity_table:
+            LOGGER.warning(
+                "competition_pipeline_table_missing_columns table=%s missing=%s",
+                ENTITIES_TABLE,
+                sorted(missing_entity_table),
+            )
+
+        traffic_entities, dropped_traffic_table, missing_traffic_table = _prune_to_table(
+            traffic_entities,
+            traffic_table_columns,
+        )
+        if dropped_traffic_table:
+            LOGGER.info(
+                "competition_pipeline_prune_to_table table=%s dropped_cols=%s",
+                TRAFFIC_TABLE,
+                sorted(dropped_traffic_table),
+            )
+        if missing_traffic_table:
+            LOGGER.warning(
+                "competition_pipeline_table_missing_columns table=%s missing=%s",
+                TRAFFIC_TABLE,
+                sorted(missing_traffic_table),
+            )
 
     results = {
         "snapshots": snapshot_df,
@@ -389,15 +666,16 @@ def run_competition_pipeline(
     )
 
     if write:
-        ent_written = replace_into(engine, "bi_amz_comp_entities_clean", entities, chunk_size=chunk_size)
+        ent_written = replace_into(engine, ENTITIES_TABLE, entities, chunk_size=chunk_size)
         LOGGER.info("competition_pipeline_entities_written rows=%d", ent_written)
         traffic_written = replace_into(
             engine,
-            "bi_amz_comp_traffic_entities_weekly",
+            TRAFFIC_TABLE,
             traffic_entities,
             chunk_size=chunk_size,
         )
         LOGGER.info("competition_pipeline_traffic_written rows=%d", traffic_written)
+        _run_post_write_checks(engine, marketplace_id, resolved_week)
 
     return results
 
@@ -490,6 +768,14 @@ __all__ = [
     "parse_args",
     "run_competition_pipeline",
     "_prepare_traffic_entities",
+    "_normalise_flow_dataframe",
     "_iso_week_to_dates",
     "_latest_week_with_data",
+    "_prune_traffic_columns",
+    "_prune_to_table",
+    "_run_post_write_checks",
+    "_load_table_columns",
+    "TRAFFIC_ONLY_COLUMNS",
+    "ENTITIES_TABLE",
+    "TRAFFIC_TABLE",
 ]
