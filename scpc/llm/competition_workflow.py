@@ -141,7 +141,11 @@ class CompetitionLLMOrchestrator:
         """Execute Stage-1 and Stage-2 for the provided week."""
 
         target_week = self._resolve_week(week, marketplace_id)
-        LOGGER.info("competition_llm.start", week=target_week, marketplace_id=marketplace_id)
+        LOGGER.info(
+            "competition_llm.start week=%s marketplace_id=%s",
+            target_week,
+            marketplace_id,
+        )
 
         stage1_inputs = self._collect_stage1_inputs(target_week, marketplace_id)
         stage1_outputs = self._execute_stage1(stage1_inputs)
@@ -157,17 +161,17 @@ class CompetitionLLMOrchestrator:
                 storage_paths.append(self._write_stage2_output(item))
         else:
             LOGGER.info(
-                "competition_llm.stage2_skipped",
-                enabled=self._config.stage_2.enabled,
-                candidate_count=len(stage2_candidates),
+                "competition_llm.stage2_skipped enabled=%s candidate_count=%s",
+                self._config.stage_2.enabled,
+                len(stage2_candidates),
             )
 
         LOGGER.info(
-            "competition_llm.end",
-            week=target_week,
-            stage1=len(stage1_outputs),
-            stage2_candidates=len(stage2_candidates),
-            stage2=len(stage2_outputs),
+            "competition_llm.end week=%s stage1=%s stage2_candidates=%s stage2=%s",
+            target_week,
+            len(stage1_outputs),
+            len(stage2_candidates),
+            len(stage2_outputs),
         )
         return CompetitionRunResult(
             week=target_week,
@@ -206,7 +210,7 @@ class CompetitionLLMOrchestrator:
             overview = tuple(bucket.get("overview_rows", ()))
             traffic = tuple(bucket.get("traffic_rows", ()))
             if not overview and not traffic:
-                LOGGER.debug("competition_llm.skip_empty_rows", context=context)
+                LOGGER.debug("competition_llm.skip_empty_rows context=%s", context)
                 continue
             inputs.append((context, overview, traffic))
         return inputs
@@ -281,7 +285,11 @@ class CompetitionLLMOrchestrator:
         for context, dimension in candidates:
             packet = self._fetch_stage2_packet(context, dimension)
             if packet is None:
-                LOGGER.warning("competition_llm.missing_packet", context=context, dimension=dimension)
+                LOGGER.warning(
+                    "competition_llm.missing_packet context=%s dimension=%s",
+                    context,
+                    dimension,
+                )
                 continue
             lag_insight = self._fetch_optional_lag_insight(context, dimension)
             facts = {
@@ -348,7 +356,14 @@ class CompetitionLLMOrchestrator:
         row = self._fetch_one(sql, params)
         if not row:
             raise ValueError("Unable to determine latest week for Stage-1 inputs")
-        return str(row.get("week"))
+        resolved_week = str(row.get("week"))
+        LOGGER.info(
+            "competition_llm.latest_week_resolved week=%s sunday=%s marketplace_id=%s",
+            resolved_week,
+            row.get("sunday"),
+            marketplace_id,
+        )
+        return resolved_week
 
     def _query_stage1_table(self, sql_base: str, week: str, marketplace_id: str | None) -> Sequence[Mapping[str, Any]]:
         sql = sql_base
@@ -369,7 +384,7 @@ class CompetitionLLMOrchestrator:
             try:
                 packet["evidence_json"] = json.loads(evidence)
             except json.JSONDecodeError:
-                LOGGER.warning("competition_llm.bad_evidence_json", context=context)
+                LOGGER.warning("competition_llm.bad_evidence_json context=%s", context)
                 return None
         return packet
 
@@ -453,10 +468,10 @@ class CompetitionLLMOrchestrator:
             except Exception as exc:  # pragma: no cover - aggregated error handling
                 last_error = exc
                 LOGGER.warning(
-                    "competition_llm.llm_retry",
-                    attempt=attempts,
-                    max_attempts=max_attempts,
-                    error=str(exc),
+                    "competition_llm.llm_retry attempt=%s max_attempts=%s error=%s",
+                    attempts,
+                    max_attempts,
+                    exc,
                 )
                 if attempts >= max_attempts:
                     break

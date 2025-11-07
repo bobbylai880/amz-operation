@@ -1262,12 +1262,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     marketplace_id=args.mk,
                 )
                 LOGGER.info(
-                    "competition_pipeline_llm_completed",
-                    week=result.week,
-                    stage1=result.stage1_processed,
-                    stage2_candidates=result.stage2_candidates,
-                    stage2=result.stage2_processed,
-                    storage=[str(path) for path in result.storage_paths],
+                    "competition_pipeline_llm_completed week=%s stage1=%s stage2_candidates=%s stage2=%s storage=%s",
+                    result.week,
+                    result.stage1_processed,
+                    result.stage2_candidates,
+                    result.stage2_processed,
+                    [str(path) for path in result.storage_paths],
                 )
             finally:
                 client.close()
