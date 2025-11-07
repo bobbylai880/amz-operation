@@ -1,0 +1,113 @@
+"""Configuration objects for the competition LLM orchestrator."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import yaml
+
+
+@dataclass(slots=True)
+class StageOneConfig:
+    thresholds: Mapping[str, float]
+    conf_min: float
+    band_weight: float
+    opp_weight: float
+    max_retries: int = 2
+
+
+@dataclass(slots=True)
+class StageTwoConfig:
+    enabled: bool
+    max_retries: int
+    allowed_action_codes: Sequence[str]
+    allowed_root_cause_codes: Sequence[str]
+    trigger_status: Sequence[str]
+
+
+@dataclass(slots=True)
+class LLMRuntimeConfig:
+    model: str
+    temperature: float
+    top_p: float
+    response_format: str
+    max_retries: int
+    timeout: float
+
+
+@dataclass(slots=True)
+class CompetitionLLMConfig:
+    stage_1: StageOneConfig
+    stage_2: StageTwoConfig
+    llm: LLMRuntimeConfig
+
+
+def _load_yaml(path: Path) -> Mapping[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Competition LLM config not found: {path}")
+    with path.open(encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+    if not isinstance(data, Mapping):
+        raise ValueError("Competition LLM config must be a mapping")
+    return data
+
+
+def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
+    """Read ``competition_llm.yaml`` and materialise dataclass wrappers."""
+
+    resolved = Path(path)
+    raw = _load_yaml(resolved)
+
+    stage1_raw = raw.get("stage_1", {})
+    stage2_raw = raw.get("stage_2", {})
+    llm_raw = raw.get("llm", {})
+
+    stage1 = StageOneConfig(
+        thresholds=stage1_raw.get("thresholds", {}),
+        conf_min=float(stage1_raw.get("conf_min", 0.6)),
+        band_weight=float(stage1_raw.get("band_weight", 0.5)),
+        opp_weight=float(stage1_raw.get("opp_weight", 0.5)),
+        max_retries=int(stage1_raw.get("max_retries", 2)),
+    )
+
+    trigger_status_raw = stage2_raw.get("trigger_status")
+    if trigger_status_raw is None:
+        trigger_status = ("lag",)
+    elif isinstance(trigger_status_raw, (list, tuple)):
+        trigger_status = tuple(str(status).lower() for status in trigger_status_raw if str(status).strip())
+    else:
+        raise ValueError("stage_2.trigger_status must be a list of statuses when provided")
+    if not trigger_status:
+        trigger_status = ("lag",)
+
+    stage2 = StageTwoConfig(
+        enabled=bool(stage2_raw.get("enabled", True)),
+        max_retries=int(stage2_raw.get("max_retries", 2)),
+        allowed_action_codes=tuple(stage2_raw.get("allowed_action_codes", [])),
+        allowed_root_cause_codes=tuple(stage2_raw.get("allowed_root_cause_codes", [])),
+        trigger_status=trigger_status,
+    )
+
+    if not llm_raw.get("model"):
+        raise ValueError("llm.model must be configured")
+
+    llm = LLMRuntimeConfig(
+        model=str(llm_raw["model"]),
+        temperature=float(llm_raw.get("temperature", 0.1)),
+        top_p=float(llm_raw.get("top_p", 0.9)),
+        response_format=str(llm_raw.get("response_format", "json_object")),
+        max_retries=int(llm_raw.get("max_retries", 2)),
+        timeout=float(llm_raw.get("timeout", 30)),
+    )
+
+    return CompetitionLLMConfig(stage_1=stage1, stage_2=stage2, llm=llm)
+
+
+__all__ = [
+    "CompetitionLLMConfig",
+    "LLMRuntimeConfig",
+    "StageOneConfig",
+    "StageTwoConfig",
+    "load_competition_llm_config",
+]
