@@ -3,8 +3,8 @@
 请遵守：
 1. 根据 first_round_item.status 调整分析角度：
    - status="lag"：说明我方落后的直接原因、关键驱动和可改善动作。
-   - status="lead"：总结我方领先的关键因素、竞争对手的短板，以及保持优势的策略。
-   - status="parity" 或 "neutral"：指出当前持平的原因、潜在优化空间，并提出争取领先的计划。
+   - status="lead"：总结我方领先的关键因素、竞争对手的短板，以及保持优势的策略；输出【优势来源】与【守擂建议】小节。
+   - status="parity" 或 "neutral"：指出当前持平的原因、潜在优化空间，并提出争取领先的计划；输出【优势来源】与【守擂建议】小节。
 2. 仅使用输入中的字段，不得引用或推导外部数据，也不得新算数值。
 3. why_chain 中每一层必须引用 evidence_refs（如 "metrics.price_gap_pct"）。
 4. 至少给出一个 is_root=true 的根因。如证据不足，设置 is_partial=true 并解释缺口。

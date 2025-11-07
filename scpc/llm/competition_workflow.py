@@ -95,6 +95,24 @@ _REQUIRED_CONTEXT_FIELDS = (
 )
 
 
+def _normalize_lag_type(value: object) -> str:
+    v = str(value or "").strip().lower()
+    mapping = {
+        "pricing": "price",
+        "price": "price",
+        "ranking": "rank",
+        "rank": "rank",
+        "content": "content",
+        "social": "social",
+        "badge": "badge",
+        "traffic": "traffic_mix",
+        "traffic_mix": "traffic_mix",
+        "keyword": "keyword",
+        "confidence": "confidence",
+    }
+    return mapping.get(v, v)
+
+
 @dataclass(slots=True)
 class StageOneLLMResult:
     context: Mapping[str, Any]
@@ -281,6 +299,9 @@ class CompetitionLLMOrchestrator:
         allowed_set = set(allowed_statuses)
         for result in stage1_results:
             for dimension in result.dimensions:
+                if isinstance(dimension, Mapping) and "lag_type" in dimension:
+                    dimension = dict(dimension)
+                    dimension["lag_type"] = _normalize_lag_type(dimension.get("lag_type"))
                 raw_status = str(dimension.get("status", "")).lower()
                 status_aliases = {raw_status}
                 if raw_status == "parity":
@@ -313,7 +334,7 @@ class CompetitionLLMOrchestrator:
             packet = self._fetch_stage2_packet(context, dimension)
             if packet is None:
                 LOGGER.warning(
-                    "competition_llm.missing_packet context=%s dimension=%s",
+                    "competition_llm.missing_stage2_evidence context=%s dimension=%s",
                     context,
                     dimension,
                 )
@@ -422,18 +443,37 @@ class CompetitionLLMOrchestrator:
 
     def _fetch_stage2_packet(self, context: Mapping[str, Any], dimension: Mapping[str, Any]) -> Mapping[str, Any] | None:
         params = self._build_stage2_params(context, dimension)
-        row = self._fetch_one(_STAGE2_PACKET_SQL, params)
-        if not row:
+        lag_type = params.get("lag_type")
+        opp_type = str(params.get("opp_type"))
+        common = {
+            **params,
+            "my_parent_asin": context.get("my_parent_asin"),
+        }
+
+        if lag_type in ("price", "rank", "content", "social", "badge", "confidence"):
+            evidence = self._build_page_evidence(common, lag_type, opp_type)
+        elif lag_type in ("traffic_mix", "keyword"):
+            evidence = self._build_traffic_evidence(common, lag_type, opp_type)
+        else:
+            LOGGER.warning(
+                "competition_llm.unsupported_lag_type lag_type=%s context=%s",
+                lag_type,
+                context,
+            )
             return None
-        packet = dict(row)
-        evidence = packet.get("evidence_json")
-        if isinstance(evidence, str):
-            try:
-                packet["evidence_json"] = json.loads(evidence)
-            except json.JSONDecodeError:
-                LOGGER.warning("competition_llm.bad_evidence_json context=%s", context)
-                return None
-        return packet
+
+        if not evidence:
+            return None
+
+        return {
+            **common,
+            "reason_code": evidence.get("reason_code", f"{lag_type}_auto"),
+            "severity": evidence.get("severity"),
+            "evidence_json": evidence,
+            "prompt_hint": evidence.get(
+                "prompt_hint", "仅使用 evidence_json 中已给出的指标，不要自行重算。"
+            ),
+        }
 
     def _fetch_optional_lag_insight(
         self, context: Mapping[str, Any], dimension: Mapping[str, Any]
@@ -451,13 +491,130 @@ class CompetitionLLMOrchestrator:
             "week": context.get("week"),
             "sunday": context.get("sunday"),
             "my_asin": context.get("my_asin"),
-            "lag_type": dimension.get("lag_type"),
+            "lag_type": _normalize_lag_type(dimension.get("lag_type")),
             "opp_type": context.get("opp_type"),
         }
         missing = [key for key, value in params.items() if value is None]
         if missing:
             raise ValueError(f"Stage-2 parameter missing required fields: {missing}")
         return params
+
+    def _build_page_evidence(
+        self, ctx: Mapping[str, Any], lag_type: str, opp_type: str
+    ) -> Mapping[str, Any] | None:
+        sql_overview = """
+          SELECT price_index_med, price_gap_leader, price_z,
+                 rank_pos_pct, content_gap, social_gap,
+                 badge_diff, badge_delta_sum, pressure, intensity_band, confidence
+          FROM bi_amz_comp_pairs
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin AND opp_type=:opp_type
+          LIMIT 1
+        """
+        overview = self._fetch_one(sql_overview, ctx)
+        if not overview:
+            return None
+
+        metric_map = {
+            "price": ("price_gap_each", "score_price"),
+            "rank": ("rank_pos_delta", "score_rank"),
+            "content": ("content_gap_each", "score_cont"),
+            "social": ("social_gap_each", "score_soc"),
+            "badge": ("badge_delta_sum", "score_badge"),
+            "confidence": ("confidence", "confidence"),
+        }
+        metric_col, score_col = metric_map.get(lag_type, ("pressure", "pressure"))
+
+        sql_each = f"""
+          SELECT opp_asin, opp_parent_asin,
+                 price_gap_each, price_ratio_each, rank_pos_delta,
+                 content_gap_each, social_gap_each, badge_delta_sum,
+                 {score_col} AS score
+          FROM bi_amz_comp_pairs_each
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin
+          ORDER BY ABS({metric_col}) DESC NULLS LAST
+          LIMIT 8
+        """
+        top_each = self._fetch_all(sql_each, ctx)
+
+        return {
+            "channel": "page",
+            "lag_type": lag_type,
+            "opp_type": opp_type,
+            "overview": overview,
+            "top_opps": top_each,
+            "top_opp_asins_csv": ",".join(
+                [row.get("opp_asin") for row in top_each if row.get("opp_asin")][:8]
+            ),
+            "reason_code": f"{lag_type}_by_pairs",
+            "prompt_hint": "优先解释 overview 与 top_opps 中的差异来源；引用已给字段名即可；不要推导新指标。",
+        }
+
+    def _build_traffic_evidence(
+        self, ctx: Mapping[str, Any], lag_type: str, opp_type: str
+    ) -> Mapping[str, Any] | None:
+        sql_overview = """
+          SELECT ad_ratio_gap_leader, ad_ratio_index_med, ad_to_natural_gap,
+                 sp_share_in_ad_gap, sbv_share_in_ad_gap, sb_share_in_ad_gap,
+                 kw_entropy_gap, kw_hhi_gap, kw_top3_share_gap,
+                 kw_brand_share_gap, kw_competitor_share_gap,
+                 t_pressure, t_intensity_band, t_confidence
+          FROM bi_amz_comp_traffic_pairs
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin AND opp_type=:opp_type
+          LIMIT 1
+        """
+        overview = self._fetch_one(sql_overview, ctx)
+        if not overview:
+            return None
+
+        if lag_type == "traffic_mix":
+            order_metric = "ABS(ad_to_natural_gap_each)"
+        else:
+            order_metric = "ABS(my_kw_top3_share_7d_avg - opp_kw_top3_share_7d_avg)"
+
+        sql_each = f"""
+          SELECT opp_asin, opp_parent_asin,
+                 my_ad_ratio, opp_ad_ratio, my_nf_ratio, opp_nf_ratio,
+                 my_recommend_ratio, opp_recommend_ratio,
+                 ad_ratio_gap_each, ad_to_natural_gap_each,
+                 my_kw_top3_share_7d_avg, opp_kw_top3_share_7d_avg,
+                 my_kw_brand_share_7d_avg, opp_kw_brand_share_7d_avg,
+                 my_kw_competitor_share_7d_avg, opp_kw_competitor_share_7d_avg,
+                 t_score_mix, t_score_kw, t_pressure
+          FROM bi_amz_comp_traffic_pairs_each
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin
+          ORDER BY {order_metric} DESC NULLS LAST
+          LIMIT 8
+        """
+        top_each = self._fetch_all(sql_each, ctx)
+
+        return {
+            "channel": "traffic",
+            "lag_type": lag_type,
+            "opp_type": opp_type,
+            "overview": overview,
+            "top_opps": top_each,
+            "top_opp_asins_csv": ",".join(
+                [row.get("opp_asin") for row in top_each if row.get("opp_asin")][:8]
+            ),
+            "reason_code": f"{lag_type}_by_traffic_pairs",
+            "prompt_hint": "从流量结构或关键词结构解释差异；不要重算，只引用 evidence_json 字段。",
+        }
 
     def _fetch_all(self, sql: str, params: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
         stmt = text(sql)

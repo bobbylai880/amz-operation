@@ -18,7 +18,8 @@ stage_2:
     - lag
     - lead
     - neutral
-  max_retries: 3
+    - parity
+  max_retries: 2
   allowed_action_codes:
     - price_adjust
     - coupon_update
