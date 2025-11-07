@@ -47,7 +47,7 @@ SELECT *
 FROM bi_amz_comp_llm_packet
 WHERE scene_tag = :scene_tag
   AND base_scene = :base_scene
-  AND morphology = :morphology
+  AND COALESCE(morphology, '') = COALESCE(:morphology, '')
   AND marketplace_id = :marketplace_id
   AND week = :week
   AND sunday = :sunday
@@ -61,7 +61,7 @@ SELECT reason_code, severity, reason_detail, top_opp_asins_csv
 FROM bi_amz_comp_lag_insights
 WHERE scene_tag = :scene_tag
   AND base_scene = :base_scene
-  AND morphology = :morphology
+  AND COALESCE(morphology, '') = COALESCE(:morphology, '')
   AND marketplace_id = :marketplace_id
   AND week = :week
   AND sunday = :sunday

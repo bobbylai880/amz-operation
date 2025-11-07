@@ -291,6 +291,99 @@ def test_competition_workflow_end_to_end(sqlite_engine, tmp_path):
     assert stub_llm.stage2_requests
 
 
+def test_stage2_packet_lookup_handles_blank_morphology(sqlite_engine, tmp_path):
+    evidence = {
+        "context": {
+            "my": {"brand": "OurBrand", "asin": "B012346"},
+            "ref": {"brand": "CompBrand", "asin": "B099998"},
+        },
+        "metrics": {"price_gap_pct": 0.15},
+        "drivers": [{"name": "price_gap_pct", "value": 0.15}],
+        "top_competitors": [{"brand": "CompBrand", "asin": "B099998"}],
+    }
+    with sqlite_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO vw_amz_comp_llm_overview
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_parent_asin, my_asin, opp_type, asin_priority, price_gap, confidence)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_parent_asin, :my_asin, :opp_type, :asin_priority, :price_gap, :confidence)
+                """
+            ),
+            {
+                "scene_tag": "SCN-2",
+                "base_scene": "base",
+                "morphology": "",
+                "marketplace_id": "US",
+                "week": "2025-W02",
+                "sunday": "2025-01-12",
+                "my_parent_asin": "PARENT2",
+                "my_asin": "B012346",
+                "opp_type": "leader",
+                "asin_priority": 1,
+                "price_gap": 0.15,
+                "confidence": 0.9,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO vw_amz_comp_llm_overview_traffic
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_parent_asin, my_asin, opp_type, asin_priority, traffic_gap, t_confidence)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_parent_asin, :my_asin, :opp_type, :asin_priority, :traffic_gap, :t_confidence)
+                """
+            ),
+            {
+                "scene_tag": "SCN-2",
+                "base_scene": "base",
+                "morphology": "",
+                "marketplace_id": "US",
+                "week": "2025-W02",
+                "sunday": "2025-01-12",
+                "my_parent_asin": "PARENT2",
+                "my_asin": "B012346",
+                "opp_type": "leader",
+                "asin_priority": 1,
+                "traffic_gap": 0.08,
+                "t_confidence": 0.85,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO bi_amz_comp_llm_packet
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_asin, lag_type, opp_type, evidence_json)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_asin, :lag_type, :opp_type, :evidence_json)
+                """
+            ),
+            {
+                "scene_tag": "SCN-2",
+                "base_scene": "base",
+                "morphology": None,
+                "marketplace_id": "US",
+                "week": "2025-W02",
+                "sunday": "2025-01-12",
+                "my_asin": "B012346",
+                "lag_type": "pricing",
+                "opp_type": "leader",
+                "evidence_json": json.dumps(evidence),
+            },
+        )
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    stub_llm = StubLLM()
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=stub_llm,
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    result = orchestrator.run("2025-W02", marketplace_id="US")
+
+    assert result.stage2_candidates == 1
+    assert result.stage2_processed == 1
+
+
 def test_stage2_candidate_requires_confidence(sqlite_engine, tmp_path):
     config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
     stub_llm = StubLLM()
