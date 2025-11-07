@@ -8,3 +8,4 @@
 5. 行动代码和根因代码只能使用配置中允许的取值。
 6. 提及我方商品时使用 "context.my.brand context.my.asin"；竞品使用 "brand asin" 的组合，可从 top_competitors 或 context.ref 中获取。
 7. 输出必须是 {"machine_json": {...}, "human_markdown": "..."}，且 machine_json 满足 machine_json_schema。
+8. machine_json 中的描述字段及 human_markdown 必须使用中文输出（枚举值和代码保持原样）。

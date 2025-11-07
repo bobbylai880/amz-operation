@@ -330,6 +330,53 @@ def test_stage2_candidate_requires_confidence(sqlite_engine, tmp_path):
     assert candidates == ()
 
 
+def test_stage2_candidates_allow_missing_or_string_confidence(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    stub_llm = StubLLM()
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=stub_llm,
+        config=config,
+        storage_root=tmp_path,
+    )
+    context = {
+        "scene_tag": "SCN-1",
+        "base_scene": "base",
+        "morphology": "standard",
+        "marketplace_id": "US",
+        "week": "2025-W01",
+        "sunday": "2025-01-05",
+        "my_parent_asin": "PARENT1",
+        "my_asin": "B012345",
+        "opp_type": "page",
+        "asin_priority": 1,
+    }
+    stage1_results = (
+        StageOneLLMResult(
+            context=context,
+            dimensions=(
+                {
+                    "lag_type": "pricing",
+                    "status": "lag",
+                    "severity": "mid",
+                    "source_opp_type": "page",
+                    "source_confidence": None,
+                },
+                {
+                    "lag_type": "traffic",
+                    "status": "lag",
+                    "severity": "high",
+                    "source_opp_type": "traffic",
+                    "source_confidence": "0.72 (traffic)",
+                },
+            ),
+        ),
+    )
+
+    candidates = orchestrator._prepare_stage2_candidates(stage1_results)
+    assert len(candidates) == 2
+
+
 def test_stage2_validation_enforces_allowed_codes(sqlite_engine, tmp_path):
     config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
     stub_llm = StubLLM()

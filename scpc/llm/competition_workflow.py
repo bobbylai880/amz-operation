@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -229,6 +230,7 @@ class CompetitionLLMOrchestrator:
                 "conf_min": self._config.stage_1.conf_min,
                 "band_weight": self._config.stage_1.band_weight,
                 "opp_weight": self._config.stage_1.opp_weight,
+                "output_language": "zh",
                 "response_schema": self._stage1_schema,
             }
             llm_result = self._invoke_with_retries(
@@ -269,11 +271,17 @@ class CompetitionLLMOrchestrator:
                 if status != "lag" or severity not in {"mid", "high"}:
                     continue
                 confidence = dimension.get("source_confidence")
-                try:
-                    confidence_value = float(confidence)
-                except (TypeError, ValueError):
-                    confidence_value = 0.0
+                confidence_value = self._parse_confidence(confidence)
+                if confidence_value is None:
+                    confidence_value = threshold
                 if confidence_value < threshold:
+                    LOGGER.debug(
+                        "competition_llm.stage2_skip_confidence threshold=%s confidence=%s context=%s dimension=%s",
+                        threshold,
+                        confidence,
+                        result.context,
+                        dimension,
+                    )
                     continue
                 candidates.append((result.context, dimension))
         return tuple(candidates)
@@ -306,6 +314,7 @@ class CompetitionLLMOrchestrator:
                 "machine_json_schema": self._stage2_schema,
                 "allowed_action_codes": list(self._config.stage_2.allowed_action_codes),
                 "allowed_root_cause_codes": list(self._config.stage_2.allowed_root_cause_codes),
+                "output_language": "zh",
             }
             llm_response = self._invoke_with_retries(
                 facts,
@@ -364,6 +373,25 @@ class CompetitionLLMOrchestrator:
             marketplace_id,
         )
         return resolved_week
+
+    @staticmethod
+    def _parse_confidence(value: Any) -> float | None:
+        """Normalize raw confidence values emitted by Stage-1."""
+
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, str):
+            match = re.search(r"-?\d+(?:\.\d+)?", value)
+            if match:
+                try:
+                    return float(match.group())
+                except ValueError:
+                    return None
+        return None
 
     def _query_stage1_table(self, sql_base: str, week: str, marketplace_id: str | None) -> Sequence[Mapping[str, Any]]:
         sql = sql_base
