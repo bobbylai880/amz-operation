@@ -95,6 +95,24 @@ _REQUIRED_CONTEXT_FIELDS = (
 )
 
 
+def _normalize_lag_type(value: object) -> str:
+    v = str(value or "").strip().lower()
+    mapping = {
+        "pricing": "price",
+        "price": "price",
+        "ranking": "rank",
+        "rank": "rank",
+        "content": "content",
+        "social": "social",
+        "badge": "badge",
+        "traffic": "traffic_mix",
+        "traffic_mix": "traffic_mix",
+        "keyword": "keyword",
+        "confidence": "confidence",
+    }
+    return mapping.get(v, v)
+
+
 @dataclass(slots=True)
 class StageOneLLMResult:
     context: Mapping[str, Any]
@@ -108,6 +126,7 @@ class StageTwoLLMResult:
     lag_type: str
     machine_json: Mapping[str, Any]
     human_markdown: str
+    evidence: Mapping[str, Any]
 
 
 @dataclass(slots=True)
@@ -160,7 +179,7 @@ class CompetitionLLMOrchestrator:
         if self._config.stage_2.enabled and stage2_candidates:
             stage2_outputs = self._execute_stage2(stage2_candidates)
             for item in stage2_outputs:
-                storage_paths.append(self._write_stage2_output(item))
+                storage_paths.extend(self._write_stage2_output(item))
         else:
             LOGGER.info(
                 "competition_llm.stage2_skipped enabled=%s candidate_count=%s",
@@ -281,6 +300,9 @@ class CompetitionLLMOrchestrator:
         allowed_set = set(allowed_statuses)
         for result in stage1_results:
             for dimension in result.dimensions:
+                if isinstance(dimension, Mapping) and "lag_type" in dimension:
+                    dimension = dict(dimension)
+                    dimension["lag_type"] = _normalize_lag_type(dimension.get("lag_type"))
                 raw_status = str(dimension.get("status", "")).lower()
                 status_aliases = {raw_status}
                 if raw_status == "parity":
@@ -313,12 +335,13 @@ class CompetitionLLMOrchestrator:
             packet = self._fetch_stage2_packet(context, dimension)
             if packet is None:
                 LOGGER.warning(
-                    "competition_llm.missing_packet context=%s dimension=%s",
+                    "competition_llm.missing_stage2_evidence context=%s dimension=%s",
                     context,
                     dimension,
                 )
                 continue
             lag_insight = self._fetch_optional_lag_insight(context, dimension)
+            evidence_payload = packet.get("evidence_json") or {}
             facts = {
                 "first_round_item": {
                     "context": context,
@@ -354,24 +377,126 @@ class CompetitionLLMOrchestrator:
                     lag_type=str(machine_json.get("lag_type", dimension.get("lag_type", ""))),
                     machine_json=machine_json,
                     human_markdown=human_markdown,
+                    evidence=evidence_payload,
                 )
             )
         return tuple(outputs)
 
-    def _write_stage2_output(self, result: StageTwoLLMResult) -> Path:
+    def _write_stage2_output(self, result: StageTwoLLMResult) -> Sequence[Path]:
         context = result.context
         week = str(context.get("week"))
         asin = context.get("my_asin", "unknown")
         lag_type = result.lag_type or "unknown"
         opp_type = context.get("opp_type", "na")
-        path = self._storage_root / week / "stage2" / f"{asin}_{lag_type}_{opp_type}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        stage2_dir = self._storage_root / week / "stage2"
+        stage2_dir.mkdir(parents=True, exist_ok=True)
+
+        base_name = f"{asin}_{lag_type}_{opp_type}"
+        main_path = stage2_dir / f"{base_name}.json"
         payload = {
             "machine_json": result.machine_json,
             "human_markdown": result.human_markdown,
         }
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
-        return path
+        main_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
+            encoding="utf-8",
+        )
+
+        summary_data = self._build_stage2_summary(result)
+        summary_paths: list[Path] = [main_path]
+        if summary_data:
+            summary_json_path = stage2_dir / f"{base_name}_summary.json"
+            summary_json_path.write_text(
+                json.dumps(summary_data, ensure_ascii=False, indent=2, default=_json_default),
+                encoding="utf-8",
+            )
+            summary_md_path = stage2_dir / f"{base_name}_summary.md"
+            summary_md_path.write_text(
+                self._render_stage2_summary_markdown(summary_data),
+                encoding="utf-8",
+            )
+            summary_paths.extend([summary_json_path, summary_md_path])
+
+        return tuple(summary_paths)
+
+    def _build_stage2_summary(self, result: StageTwoLLMResult) -> Mapping[str, Any] | None:
+        evidence = result.evidence or {}
+        if not evidence:
+            return None
+        overview = dict(evidence.get("overview") or {})
+        metrics_cfg = _OVERVIEW_METRIC_CONFIG.get(result.lag_type, {})
+        leader_summary = _compose_overview_summary(overview, metrics_cfg.get("leader", ()))
+        median_summary = _compose_overview_summary(overview, metrics_cfg.get("median", ()))
+        context_snapshot = {field: result.context.get(field) for field in _REQUIRED_CONTEXT_FIELDS}
+        summary: dict[str, Any] = {
+            "context": context_snapshot,
+            "lag_type": result.lag_type,
+            "channel": evidence.get("channel"),
+            "vs_leader": leader_summary,
+            "vs_median": median_summary,
+            "top_diff_reasons": list(evidence.get("top_diff_reasons") or ()),
+        }
+        if overview:
+            summary["overview"] = overview
+        top_opps = evidence.get("top_opps")
+        if top_opps:
+            summary["top_opps"] = top_opps
+        top_csv = evidence.get("top_opp_asins_csv")
+        if top_csv:
+            summary["top_opp_asins_csv"] = top_csv
+        return summary
+
+    def _render_stage2_summary_markdown(self, summary: Mapping[str, Any]) -> str:
+        context = summary.get("context", {})
+        lines: list[str] = []
+        title = f"# Stage-2 摘要（{summary.get('lag_type', 'unknown')}）"
+        lines.append(title)
+        lines.append("")
+        lines.append(f"- 周次：{context.get('week', '未知')}")
+        lines.append(f"- ASIN：{context.get('my_asin', '未知')}")
+        lines.append(f"- 对手类型：{context.get('opp_type', '未知')}")
+        lines.append("")
+
+        leader = summary.get("vs_leader", {})
+        lines.append("## 本品 vs 领先者")
+        leader_summary = leader.get("summary") or "暂无数据"
+        lines.append(f"- {leader_summary}")
+        leader_metrics = leader.get("metrics") or {}
+        if leader_metrics:
+            lines.append("")
+            lines.append("**关键指标：**")
+            for key, value in leader_metrics.items():
+                lines.append(f"- {key}: {_format_metric_value(value)}")
+        lines.append("")
+
+        median = summary.get("vs_median", {})
+        lines.append("## 本品 vs 中位数")
+        median_summary = median.get("summary") or "暂无数据"
+        lines.append(f"- {median_summary}")
+        median_metrics = median.get("metrics") or {}
+        if median_metrics:
+            lines.append("")
+            lines.append("**关键指标：**")
+            for key, value in median_metrics.items():
+                lines.append(f"- {key}: {_format_metric_value(value)}")
+        lines.append("")
+
+        reasons = summary.get("top_diff_reasons") or []
+        lines.append("## Top3 差距原因")
+        if not reasons:
+            lines.append("- 暂无数据")
+        else:
+            for item in reasons:
+                label = _format_opp_label(item)
+                summary_text = item.get("summary") or ""
+                lines.append(f"- {label}：{summary_text}")
+                metrics = item.get("metrics") or {}
+                if metrics:
+                    lines.append("  - 指标：")
+                    for key, value in metrics.items():
+                        lines.append(f"    - {key}: {_format_metric_value(value)}")
+
+        return "\n".join(lines) + "\n"
 
     def _resolve_week(self, week: str | None, marketplace_id: str | None) -> str:
         if week:
@@ -422,18 +547,37 @@ class CompetitionLLMOrchestrator:
 
     def _fetch_stage2_packet(self, context: Mapping[str, Any], dimension: Mapping[str, Any]) -> Mapping[str, Any] | None:
         params = self._build_stage2_params(context, dimension)
-        row = self._fetch_one(_STAGE2_PACKET_SQL, params)
-        if not row:
+        lag_type = params.get("lag_type")
+        opp_type = str(params.get("opp_type"))
+        common = {
+            **params,
+            "my_parent_asin": context.get("my_parent_asin"),
+        }
+
+        if lag_type in ("price", "rank", "content", "social", "badge", "confidence"):
+            evidence = self._build_page_evidence(common, lag_type, opp_type)
+        elif lag_type in ("traffic_mix", "keyword"):
+            evidence = self._build_traffic_evidence(common, lag_type, opp_type)
+        else:
+            LOGGER.warning(
+                "competition_llm.unsupported_lag_type lag_type=%s context=%s",
+                lag_type,
+                context,
+            )
             return None
-        packet = dict(row)
-        evidence = packet.get("evidence_json")
-        if isinstance(evidence, str):
-            try:
-                packet["evidence_json"] = json.loads(evidence)
-            except json.JSONDecodeError:
-                LOGGER.warning("competition_llm.bad_evidence_json context=%s", context)
-                return None
-        return packet
+
+        if not evidence:
+            return None
+
+        return {
+            **common,
+            "reason_code": evidence.get("reason_code", f"{lag_type}_auto"),
+            "severity": evidence.get("severity"),
+            "evidence_json": evidence,
+            "prompt_hint": evidence.get(
+                "prompt_hint", "仅使用 evidence_json 中已给出的指标，不要自行重算。"
+            ),
+        }
 
     def _fetch_optional_lag_insight(
         self, context: Mapping[str, Any], dimension: Mapping[str, Any]
@@ -451,13 +595,145 @@ class CompetitionLLMOrchestrator:
             "week": context.get("week"),
             "sunday": context.get("sunday"),
             "my_asin": context.get("my_asin"),
-            "lag_type": dimension.get("lag_type"),
+            "lag_type": _normalize_lag_type(dimension.get("lag_type")),
             "opp_type": context.get("opp_type"),
         }
         missing = [key for key, value in params.items() if value is None]
         if missing:
             raise ValueError(f"Stage-2 parameter missing required fields: {missing}")
         return params
+
+    def _build_page_evidence(
+        self, ctx: Mapping[str, Any], lag_type: str, opp_type: str
+    ) -> Mapping[str, Any] | None:
+        sql_overview = """
+          SELECT price_index_med, price_gap_leader, price_z,
+                 rank_pos_pct, content_gap, social_gap,
+                 badge_diff, badge_delta_sum, pressure, intensity_band, confidence
+          FROM bi_amz_comp_pairs
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin AND opp_type=:opp_type
+          LIMIT 1
+        """
+        overview = self._fetch_one(sql_overview, ctx)
+        if not overview:
+            return None
+
+        metric_map = {
+            "price": ("price_gap_each", "score_price"),
+            "rank": ("rank_pos_delta", "score_rank"),
+            "content": ("content_gap_each", "score_cont"),
+            "social": ("social_gap_each", "score_soc"),
+            "badge": ("badge_delta_sum", "score_badge"),
+            "confidence": ("confidence", "confidence"),
+        }
+        metric_col, score_col = metric_map.get(lag_type, ("pressure", "pressure"))
+
+        select_columns = [
+            "opp_asin",
+            "opp_parent_asin",
+            "price_gap_each",
+            "price_ratio_each",
+            "rank_pos_delta",
+            "content_gap_each",
+            "social_gap_each",
+            "badge_delta_sum",
+        ]
+        if lag_type == "confidence":
+            select_columns.append("confidence")
+        select_columns.append(f"{score_col} AS score")
+        select_clause = ",\n                 ".join(select_columns)
+        sql_each = f"""
+          SELECT {select_clause}
+          FROM bi_amz_comp_pairs_each
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin
+          ORDER BY ABS({metric_col}) DESC NULLS LAST
+          LIMIT 3
+        """
+        top_each = self._fetch_all(sql_each, ctx)
+        comparison_reasons = _build_comparison_reasons(lag_type, top_each)
+
+        return {
+            "channel": "page",
+            "lag_type": lag_type,
+            "opp_type": opp_type,
+            "overview": overview,
+            "top_opps": top_each,
+            "top_opp_asins_csv": ",".join(
+                [row.get("opp_asin") for row in top_each if row.get("opp_asin")][:8]
+            ),
+            "top_diff_reasons": comparison_reasons,
+            "reason_code": f"{lag_type}_by_pairs",
+            "prompt_hint": "优先解释 overview 与 top_opps 中的差异来源；引用已给字段名即可；不要推导新指标。",
+        }
+
+    def _build_traffic_evidence(
+        self, ctx: Mapping[str, Any], lag_type: str, opp_type: str
+    ) -> Mapping[str, Any] | None:
+        sql_overview = """
+          SELECT ad_ratio_gap_leader, ad_ratio_index_med, ad_to_natural_gap,
+                 sp_share_in_ad_gap, sbv_share_in_ad_gap, sb_share_in_ad_gap,
+                 kw_entropy_gap, kw_hhi_gap, kw_top3_share_gap,
+                 kw_brand_share_gap, kw_competitor_share_gap,
+                 t_pressure, t_intensity_band, t_confidence
+          FROM bi_amz_comp_traffic_pairs
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin AND opp_type=:opp_type
+          LIMIT 1
+        """
+        overview = self._fetch_one(sql_overview, ctx)
+        if not overview:
+            return None
+
+        if lag_type == "traffic_mix":
+            order_metric = "ABS(ad_to_natural_gap_each)"
+        else:
+            order_metric = "ABS(my_kw_top3_share_7d_avg - opp_kw_top3_share_7d_avg)"
+
+        sql_each = f"""
+          SELECT opp_asin, opp_parent_asin,
+                 my_ad_ratio, opp_ad_ratio, my_nf_ratio, opp_nf_ratio,
+                 my_recommend_ratio, opp_recommend_ratio,
+                 ad_ratio_gap_each, ad_to_natural_gap_each,
+                 my_kw_top3_share_7d_avg, opp_kw_top3_share_7d_avg,
+                 my_kw_brand_share_7d_avg, opp_kw_brand_share_7d_avg,
+                 my_kw_competitor_share_7d_avg, opp_kw_competitor_share_7d_avg,
+                 t_score_mix, t_score_kw, t_pressure
+          FROM bi_amz_comp_traffic_pairs_each
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin
+          ORDER BY {order_metric} DESC NULLS LAST
+          LIMIT 3
+        """
+        top_each = self._fetch_all(sql_each, ctx)
+        comparison_reasons = _build_comparison_reasons(lag_type, top_each)
+
+        return {
+            "channel": "traffic",
+            "lag_type": lag_type,
+            "opp_type": opp_type,
+            "overview": overview,
+            "top_opps": top_each,
+            "top_opp_asins_csv": ",".join(
+                [row.get("opp_asin") for row in top_each if row.get("opp_asin")][:8]
+            ),
+            "top_diff_reasons": comparison_reasons,
+            "reason_code": f"{lag_type}_by_traffic_pairs",
+            "prompt_hint": "从流量结构或关键词结构解释差异；不要重算，只引用 evidence_json 字段。",
+        }
 
     def _fetch_all(self, sql: str, params: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
         stmt = text(sql)
@@ -541,6 +817,180 @@ class CompetitionLLMOrchestrator:
             if self._config.stage_2.allowed_root_cause_codes and code not in self._config.stage_2.allowed_root_cause_codes:
                 raise ValueError(f"Root cause code {code!r} is not permitted")
 
+
+_OVERVIEW_METRIC_CONFIG: Mapping[str, Mapping[str, Sequence[tuple[str, str]]]] = {
+    "price": {
+        "leader": (("price_gap_leader", "与领先者价差"),),
+        "median": (("price_index_med", "相对中位数价格指数"), ("price_z", "价格Z分")),
+    },
+    "rank": {
+        "leader": (("rank_pos_pct", "领先者排名百分位"),),
+        "median": (("pressure", "竞争压力"), ("intensity_band", "竞争强度档位")),
+    },
+    "content": {
+        "leader": (("content_gap", "内容差距"),),
+        "median": (("pressure", "竞争压力"), ("intensity_band", "竞争强度档位")),
+    },
+    "social": {
+        "leader": (("social_gap", "社交口碑差距"),),
+        "median": (("pressure", "竞争压力"), ("intensity_band", "竞争强度档位")),
+    },
+    "badge": {
+        "leader": (("badge_diff", "权益标识差值"),),
+        "median": (("badge_delta_sum", "权益差异累计"),),
+    },
+    "confidence": {
+        "leader": (("confidence", "置信度"),),
+        "median": (("pressure", "竞争压力"),),
+    },
+    "traffic_mix": {
+        "leader": (
+            ("ad_ratio_gap_leader", "广告占比差距"),
+            ("ad_to_natural_gap", "广告对自然流量差距"),
+        ),
+        "median": (
+            ("ad_ratio_index_med", "广告占比指数"),
+            ("t_pressure", "流量竞争压力"),
+            ("t_intensity_band", "流量竞争强度档位"),
+        ),
+    },
+    "keyword": {
+        "leader": (
+            ("kw_top3_share_gap", "Top3 关键词份额差距"),
+            ("kw_competitor_share_gap", "竞品关键词份额差距"),
+        ),
+        "median": (
+            ("kw_entropy_gap", "关键词覆盖度差距"),
+            ("kw_hhi_gap", "关键词集中度差距"),
+            ("t_pressure", "流量竞争压力"),
+        ),
+    },
+}
+
+
+_COMPARISON_METRIC_KEYS: Mapping[str, Sequence[str]] = {
+    "price": ("price_gap_each", "price_ratio_each", "score"),
+    "rank": ("rank_pos_delta", "score"),
+    "content": ("content_gap_each", "score"),
+    "social": ("social_gap_each", "score"),
+    "badge": ("badge_delta_sum", "score"),
+    "confidence": ("confidence", "score"),
+    "traffic_mix": (
+        "ad_ratio_gap_each",
+        "ad_to_natural_gap_each",
+        "my_ad_ratio",
+        "opp_ad_ratio",
+        "my_nf_ratio",
+        "opp_nf_ratio",
+        "t_score_mix",
+        "t_pressure",
+    ),
+    "keyword": (
+        "my_kw_top3_share_7d_avg",
+        "opp_kw_top3_share_7d_avg",
+        "my_kw_brand_share_7d_avg",
+        "opp_kw_brand_share_7d_avg",
+        "my_kw_competitor_share_7d_avg",
+        "opp_kw_competitor_share_7d_avg",
+        "t_score_kw",
+        "t_pressure",
+    ),
+}
+
+
+def _compose_overview_summary(
+    overview: Mapping[str, Any], metrics: Sequence[tuple[str, str]]
+) -> Mapping[str, Any]:
+    metrics_payload: dict[str, Any] = {}
+    parts: list[str] = []
+    for column, label in metrics:
+        if column in overview:
+            value = overview.get(column)
+            metrics_payload[column] = value
+            if value is not None and value != "":
+                parts.append(f"{label}{_format_metric_value(value)}")
+    summary_text = "、".join(parts) if parts else "暂无数据"
+    return {"summary": summary_text, "metrics": metrics_payload}
+
+
+def _build_comparison_reasons(
+    lag_type: str, top_rows: Sequence[Mapping[str, Any]]
+) -> list[Mapping[str, Any]]:
+    reasons: list[Mapping[str, Any]] = []
+    if not top_rows:
+        return reasons
+    keys = _COMPARISON_METRIC_KEYS.get(lag_type, ("score",))
+    for row in top_rows[:3]:
+        metrics = {key: row.get(key) for key in keys if key in row}
+        if "score" in row and "score" not in metrics:
+            metrics["score"] = row.get("score")
+        reasons.append(
+            {
+                "opp_asin": row.get("opp_asin"),
+                "opp_parent_asin": row.get("opp_parent_asin"),
+                "summary": _compose_reason_sentence(lag_type, row),
+                "metrics": metrics,
+            }
+        )
+    return reasons
+
+
+def _compose_reason_sentence(lag_type: str, row: Mapping[str, Any]) -> str:
+    label = _format_opp_label(row)
+    if lag_type == "price":
+        gap = _format_metric_value(row.get("price_gap_each"))
+        ratio = _format_metric_value(row.get("price_ratio_each"))
+        return f"竞品 {label} 的价格差为 {gap}，我方/竞品价格比 {ratio}，价格优势不足。"
+    if lag_type == "rank":
+        delta = _format_metric_value(row.get("rank_pos_delta"))
+        return f"竞品 {label} 的排名领先差值 {delta}，我方自然位次需提升。"
+    if lag_type == "content":
+        gap = _format_metric_value(row.get("content_gap_each"))
+        return f"竞品 {label} 的内容表现领先 {gap}，需要优化前台素材。"
+    if lag_type == "social":
+        gap = _format_metric_value(row.get("social_gap_each"))
+        return f"竞品 {label} 的社交口碑差距为 {gap}，需加强评价与评分建设。"
+    if lag_type == "badge":
+        diff = _format_metric_value(row.get("badge_delta_sum"))
+        return f"竞品 {label} 拥有更多权益标识差值 {diff}，需补齐权益标签。"
+    if lag_type == "confidence":
+        confidence = _format_metric_value(row.get("confidence"))
+        return f"竞品 {label} 的信号置信度 {confidence} 更高，需补充可靠证据。"
+    if lag_type == "traffic_mix":
+        ad_gap = _format_metric_value(row.get("ad_ratio_gap_each"))
+        mix_gap = _format_metric_value(row.get("ad_to_natural_gap_each"))
+        return (
+            f"竞品 {label} 的广告占比差距 {ad_gap}，广告/自然流量组合差距 {mix_gap}，流量结构劣势明显。"
+        )
+    if lag_type == "keyword":
+        my_share = _format_metric_value(row.get("my_kw_top3_share_7d_avg"))
+        opp_share = _format_metric_value(row.get("opp_kw_top3_share_7d_avg"))
+        return f"竞品 {label} 的Top3关键词份额为 {opp_share}，我方仅 {my_share}，关键词覆盖不足。"
+    score = _format_metric_value(row.get("score"))
+    return f"竞品 {label} 的差距评分为 {score}，需结合明细进一步分析。"
+
+
+def _format_metric_value(value: Any) -> str:
+    if value is None or value == "":
+        return "缺失"
+    if isinstance(value, (int, float)):
+        if isinstance(value, bool):
+            return "是" if value else "否"
+        abs_value = abs(float(value))
+        if abs_value >= 100 or abs_value == 0:
+            return f"{value:.0f}" if abs_value >= 100 else f"{value:.2f}"
+        if abs_value >= 1:
+            return f"{value:.2f}"
+        return f"{value:.2%}"
+    return str(value)
+
+
+def _format_opp_label(row: Mapping[str, Any]) -> str:
+    opp_parent = row.get("opp_parent_asin") or ""
+    opp_asin = row.get("opp_asin") or "未知ASIN"
+    if opp_parent and opp_parent != opp_asin:
+        return f"{opp_parent} {opp_asin}"
+    return str(opp_asin)
 
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, (datetime, date)):
