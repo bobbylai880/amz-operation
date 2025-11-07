@@ -275,11 +275,19 @@ class CompetitionLLMOrchestrator:
     def _prepare_stage2_candidates(self, stage1_results: Sequence[StageOneLLMResult]) -> Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]]:
         candidates: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
         threshold = self._config.stage_1.conf_min
+        allowed_statuses = tuple(
+            status.lower() for status in getattr(self._config.stage_2, "trigger_status", ("lag",))
+        ) or ("lag",)
+        allowed_set = set(allowed_statuses)
         for result in stage1_results:
             for dimension in result.dimensions:
-                status = str(dimension.get("status", "")).lower()
-                severity = str(dimension.get("severity", "")).lower()
-                if status != "lag" or severity not in {"mid", "high"}:
+                raw_status = str(dimension.get("status", "")).lower()
+                status_aliases = {raw_status}
+                if raw_status == "parity":
+                    status_aliases.add("neutral")
+                if raw_status == "neutral":
+                    status_aliases.add("parity")
+                if allowed_set and status_aliases.isdisjoint(allowed_set):
                     continue
                 confidence = dimension.get("source_confidence")
                 confidence_value = self._parse_confidence(confidence)

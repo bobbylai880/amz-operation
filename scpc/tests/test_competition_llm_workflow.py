@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -569,7 +570,7 @@ def test_stage1_outputs_summary_for_leading_dimensions(sqlite_engine, tmp_path):
 
     result = orchestrator.run("2025-W03", marketplace_id="US")
 
-    assert result.stage2_candidates == 0
+    assert result.stage2_candidates == 2
     assert result.stage2_processed == 0
 
     stage1_paths = [p for p in result.storage_paths if "stage1" in str(p)]
@@ -580,6 +581,67 @@ def test_stage1_outputs_summary_for_leading_dimensions(sqlite_engine, tmp_path):
     for dim in payload["dimensions"]:
         assert dim["status"] in {"lead", "parity"}
         assert dim.get("notes")
+
+
+def test_stage2_trigger_status_configuration(sqlite_engine, tmp_path):
+    base_config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    stub_llm = StubLLM()
+    context = {
+        "scene_tag": "SCN-CONFIG",
+        "base_scene": "base",
+        "morphology": "standard",
+        "marketplace_id": "US",
+        "week": "2025-W04",
+        "sunday": "2025-01-26",
+        "my_parent_asin": "PARENT3",
+        "my_asin": "B0CONFIG",
+        "opp_type": "leader",
+        "asin_priority": 1,
+    }
+    lead_dimension = {
+        "lag_type": "pricing",
+        "status": "lead",
+        "severity": "low",
+        "source_opp_type": "page",
+        "source_confidence": 0.9,
+    }
+    parity_dimension = {
+        "lag_type": "traffic",
+        "status": "parity",
+        "severity": "low",
+        "source_opp_type": "traffic",
+        "source_confidence": 0.95,
+    }
+    stage1_results = (
+        StageOneLLMResult(
+            context=context,
+            summary="整体诊断：我方优势明显，需总结经验。",
+            dimensions=(lead_dimension, parity_dimension),
+        ),
+    )
+
+    orchestrator_all = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=stub_llm,
+        config=base_config,
+        storage_root=tmp_path,
+    )
+
+    candidates_all = orchestrator_all._prepare_stage2_candidates(stage1_results)
+    assert len(candidates_all) == 2
+
+    lag_only_config = replace(
+        base_config,
+        stage_2=replace(base_config.stage_2, trigger_status=("lag",)),
+    )
+    orchestrator_lag_only = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=stub_llm,
+        config=lag_only_config,
+        storage_root=tmp_path,
+    )
+    candidates_lag_only = orchestrator_lag_only._prepare_stage2_candidates(stage1_results)
+    assert candidates_lag_only == ()
 
 
 def test_stage2_validation_enforces_allowed_codes(sqlite_engine, tmp_path):

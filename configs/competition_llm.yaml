@@ -14,6 +14,10 @@ stage_1:
   max_retries: 3
 stage_2:
   enabled: true
+  trigger_status:
+    - lag
+    - lead
+    - neutral
   max_retries: 3
   allowed_action_codes:
     - price_adjust

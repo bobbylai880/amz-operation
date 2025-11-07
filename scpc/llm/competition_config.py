@@ -23,6 +23,7 @@ class StageTwoConfig:
     max_retries: int
     allowed_action_codes: Sequence[str]
     allowed_root_cause_codes: Sequence[str]
+    trigger_status: Sequence[str]
 
 
 @dataclass(slots=True)
@@ -70,11 +71,22 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         max_retries=int(stage1_raw.get("max_retries", 2)),
     )
 
+    trigger_status_raw = stage2_raw.get("trigger_status")
+    if trigger_status_raw is None:
+        trigger_status = ("lag",)
+    elif isinstance(trigger_status_raw, (list, tuple)):
+        trigger_status = tuple(str(status).lower() for status in trigger_status_raw if str(status).strip())
+    else:
+        raise ValueError("stage_2.trigger_status must be a list of statuses when provided")
+    if not trigger_status:
+        trigger_status = ("lag",)
+
     stage2 = StageTwoConfig(
         enabled=bool(stage2_raw.get("enabled", True)),
         max_retries=int(stage2_raw.get("max_retries", 2)),
         allowed_action_codes=tuple(stage2_raw.get("allowed_action_codes", [])),
         allowed_root_cause_codes=tuple(stage2_raw.get("allowed_root_cause_codes", [])),
+        trigger_status=trigger_status,
     )
 
     if not llm_raw.get("model"):
