@@ -53,6 +53,8 @@ class DeepSeekClient:
         else:
             response_format_payload = response_format
 
+        user_content = dumps(facts, ensure_ascii=False)
+
         payload = {
             "model": model,
             "temperature": temperature,
@@ -60,7 +62,7 @@ class DeepSeekClient:
             "response_format": response_format_payload,
             "messages": [
                 {"role": "system", "content": prompt},
-                {"role": "user", "content": facts},
+                {"role": "user", "content": user_content},
             ],
         }
         headers = {

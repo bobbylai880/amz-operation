@@ -22,6 +22,10 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from scpc.db.engine import create_doris_engine
 from scpc.db.io import replace_into
+from scpc.llm.competition_config import load_competition_llm_config
+from scpc.llm.competition_workflow import CompetitionLLMOrchestrator
+from scpc.llm.deepseek_client import create_client_from_env
+from scpc.llm.orchestrator import LLMOrchestrator
 from scpc.etl.competition_features import (
     build_competition_tables_from_entities,
     build_traffic_features,
@@ -1120,6 +1124,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Traffic scoring rule name (default: default_traffic)",
     )
     parser.add_argument(
+        "--with-llm",
+        action="store_true",
+        help="Execute the competition LLM workflow after compare outputs",
+    )
+    parser.add_argument(
+        "--llm-only",
+        action="store_true",
+        help="Skip ETL/compare and only run the competition LLM workflow",
+    )
+    parser.add_argument(
+        "--llm-config",
+        default="configs/competition_llm.yaml",
+        help="Path to the competition LLM configuration YAML",
+    )
+    parser.add_argument(
+        "--llm-storage-root",
+        default=None,
+        help="Directory to store Stage-1/Stage-2 LLM artefacts (defaults to storage/competition_llm)",
+    )
+    parser.add_argument(
         "--chunk-size",
         type=int,
         default=500,
@@ -1143,9 +1167,19 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     try:
         engine = create_doris_engine()
-        resolved_week = args.week
+        llm_only = args.llm_only
+        with_llm = args.with_llm or llm_only
         compare_only = args.compare_only
+
+        if llm_only and compare_only:
+            LOGGER.info("competition_pipeline_llm_only_overrides_compare")
+            compare_only = False
+
         with_compare = args.with_compare or compare_only
+        if with_llm and not llm_only:
+            with_compare = True
+
+        resolved_week = args.week
 
         if not resolved_week:
             if compare_only:
@@ -1180,8 +1214,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     resolved_week,
                 )
 
+        run_features = not compare_only and not llm_only
+        run_compare = with_compare and not llm_only
+
         feature_results: dict[str, pd.DataFrame] | None = None
-        if not compare_only:
+        if run_features:
             feature_results = run_competition_pipeline(
                 resolved_week,
                 args.mk,
@@ -1191,7 +1228,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 chunk_size=args.chunk_size,
             )
 
-        if with_compare:
+        if run_compare:
             current_entities = None
             if feature_results is not None:
                 current_entities = feature_results.get("entities_full")
@@ -1207,6 +1244,33 @@ def main(argv: Sequence[str] | None = None) -> None:
                 write=args.write_compare,
                 chunk_size=args.chunk_size,
             )
+
+        if with_llm:
+            llm_config = load_competition_llm_config(args.llm_config)
+            client = create_client_from_env()
+            try:
+                llm_orchestrator = LLMOrchestrator(client)
+                competition_orchestrator = CompetitionLLMOrchestrator(
+                    engine=engine,
+                    llm_orchestrator=llm_orchestrator,
+                    config=llm_config,
+                    storage_root=args.llm_storage_root,
+                )
+                target_week = resolved_week or args.week
+                result = competition_orchestrator.run(
+                    target_week,
+                    marketplace_id=args.mk,
+                )
+                LOGGER.info(
+                    "competition_pipeline_llm_completed week=%s stage1=%s stage2_candidates=%s stage2=%s storage=%s",
+                    result.week,
+                    result.stage1_processed,
+                    result.stage2_candidates,
+                    result.stage2_processed,
+                    [str(path) for path in result.storage_paths],
+                )
+            finally:
+                client.close()
     except Exception as exc:  # pragma: no cover - CLI level safeguard
         LOGGER.exception(
             "competition_pipeline_failed week=%s mk=%s error=%s",
