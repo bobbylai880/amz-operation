@@ -98,6 +98,7 @@ _REQUIRED_CONTEXT_FIELDS = (
 @dataclass(slots=True)
 class StageOneLLMResult:
     context: Mapping[str, Any]
+    summary: str
     dimensions: Sequence[Mapping[str, Any]]
 
 
@@ -242,10 +243,19 @@ class CompetitionLLMOrchestrator:
             context_result = llm_result.get("context")
             if not context_result:
                 raise ValueError("Stage-1 response missing context")
+            summary = llm_result.get("summary")
+            if not isinstance(summary, str) or not summary.strip():
+                raise ValueError("Stage-1 response missing summary")
             dimensions = llm_result.get("dimensions")
             if not isinstance(dimensions, Sequence) or not dimensions:
                 raise ValueError("Stage-1 response missing dimensions")
-            results.append(StageOneLLMResult(context=context_result, dimensions=tuple(dimensions)))
+            results.append(
+                StageOneLLMResult(
+                    context=context_result,
+                    summary=summary.strip(),
+                    dimensions=tuple(dimensions),
+                )
+            )
         return tuple(results)
 
     def _write_stage1_output(self, result: StageOneLLMResult) -> Path:
@@ -256,6 +266,7 @@ class CompetitionLLMOrchestrator:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "context": result.context,
+            "summary": result.summary,
             "dimensions": result.dimensions,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")

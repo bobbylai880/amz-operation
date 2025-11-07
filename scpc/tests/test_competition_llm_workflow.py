@@ -17,6 +17,10 @@ class StubLLM:
     def __init__(self) -> None:
         self.stage1_requests = []
         self.stage2_requests = []
+        self.stage1_overrides: dict[str, dict] = {}
+
+    def set_stage1_override(self, asin: str, response: dict) -> None:
+        self.stage1_overrides[asin] = response
 
     def run(self, config, *, retry=True, fallback=None):  # noqa: D401 - signature mirrors orchestrator
         facts = config.facts
@@ -57,8 +61,15 @@ class StubLLM:
             }
             return {"machine_json": machine_json, "human_markdown": "- 调整售价以收窄差距"}
         self.stage1_requests.append(facts)
+        context = facts["context"]
+        asin = context.get("my_asin")
+        if asin in self.stage1_overrides:
+            override = self.stage1_overrides[asin]
+            override.setdefault("context", context)
+            return override
         return {
-            "context": facts["context"],
+            "context": context,
+            "summary": "整体诊断：该 ASIN 在价格维度落后，需要关注定价策略。",
             "dimensions": [
                 {
                     "lag_type": "pricing",
@@ -66,6 +77,7 @@ class StubLLM:
                     "severity": "high",
                     "source_opp_type": "page",
                     "source_confidence": 0.8,
+                    "notes": "价格差距扩大到 12%，我方明显劣势。",
                 }
             ],
         }
@@ -408,6 +420,7 @@ def test_stage2_candidate_requires_confidence(sqlite_engine, tmp_path):
     stage1_results = (
         StageOneLLMResult(
             context=context,
+            summary="整体诊断：置信度不足，暂不进入二轮。",
             dimensions=(
                 {
                     "lag_type": "pricing",
@@ -447,6 +460,7 @@ def test_stage2_candidates_allow_missing_or_string_confidence(sqlite_engine, tmp
     stage1_results = (
         StageOneLLMResult(
             context=context,
+            summary="整体诊断：价格与流量均存在问题。",
             dimensions=(
                 {
                     "lag_type": "pricing",
@@ -468,6 +482,104 @@ def test_stage2_candidates_allow_missing_or_string_confidence(sqlite_engine, tmp
 
     candidates = orchestrator._prepare_stage2_candidates(stage1_results)
     assert len(candidates) == 2
+
+
+def test_stage1_outputs_summary_for_leading_dimensions(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    stub_llm = StubLLM()
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=stub_llm,
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    with sqlite_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO vw_amz_comp_llm_overview
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_parent_asin, my_asin, opp_type, asin_priority, price_gap, confidence)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_parent_asin, :my_asin, :opp_type, :asin_priority, :price_gap, :confidence)
+                """
+            ),
+            {
+                "scene_tag": "SCN-LEAD",
+                "base_scene": "base",
+                "morphology": "standard",
+                "marketplace_id": "US",
+                "week": "2025-W03",
+                "sunday": "2025-01-19",
+                "my_parent_asin": "PARENT2",
+                "my_asin": "B0LEADASIN",
+                "opp_type": "leader",
+                "asin_priority": 1,
+                "price_gap": -0.05,
+                "confidence": 0.9,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO vw_amz_comp_llm_overview_traffic
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_parent_asin, my_asin, opp_type, asin_priority, traffic_gap, t_confidence)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_parent_asin, :my_asin, :opp_type, :asin_priority, :traffic_gap, :t_confidence)
+                """
+            ),
+            {
+                "scene_tag": "SCN-LEAD",
+                "base_scene": "base",
+                "morphology": "standard",
+                "marketplace_id": "US",
+                "week": "2025-W03",
+                "sunday": "2025-01-19",
+                "my_parent_asin": "PARENT2",
+                "my_asin": "B0LEADASIN",
+                "opp_type": "leader",
+                "asin_priority": 1,
+                "traffic_gap": 0.12,
+                "t_confidence": 0.85,
+            },
+        )
+
+    stub_llm.set_stage1_override(
+        "B0LEADASIN",
+        {
+            "summary": "整体诊断：所有关键维度领先或与竞对持平，请保持现有策略。",
+            "dimensions": [
+                {
+                    "lag_type": "pricing",
+                    "status": "lead",
+                    "severity": "low",
+                    "source_opp_type": "page",
+                    "source_confidence": 0.92,
+                    "notes": "定价相对竞对低 5%，具备价格优势。",
+                },
+                {
+                    "lag_type": "traffic",
+                    "status": "lead",
+                    "severity": "low",
+                    "source_opp_type": "traffic",
+                    "source_confidence": 0.88,
+                    "notes": "流量较竞对高出 12%，持续扩大曝光。",
+                },
+            ],
+        },
+    )
+
+    result = orchestrator.run("2025-W03", marketplace_id="US")
+
+    assert result.stage2_candidates == 0
+    assert result.stage2_processed == 0
+
+    stage1_paths = [p for p in result.storage_paths if "stage1" in str(p)]
+    assert stage1_paths, "Stage-1 output should be persisted even without Stage-2"
+    target_path = next(p for p in stage1_paths if "B0LEADASIN" in p.name)
+    payload = json.loads(target_path.read_text(encoding="utf-8"))
+    assert payload["summary"].startswith("整体诊断")
+    for dim in payload["dimensions"]:
+        assert dim["status"] in {"lead", "parity"}
+        assert dim.get("notes")
 
 
 def test_stage2_validation_enforces_allowed_codes(sqlite_engine, tmp_path):
