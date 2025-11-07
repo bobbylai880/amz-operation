@@ -19,7 +19,7 @@ stage_2:
     - lead
     - neutral
     - parity
-  max_retries: 3
+  max_retries: 2
   allowed_action_codes:
     - price_adjust
     - coupon_update
