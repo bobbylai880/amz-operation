@@ -37,6 +37,10 @@ def _build_system_prompt(history_window: int) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(history_window=window)
 
 
+DEFAULT_HISTORY_WINDOW_WEEKS = 4
+SYSTEM_PROMPT = _build_system_prompt(DEFAULT_HISTORY_WINDOW_WEEKS)
+
+
 def _build_output_instructions(limit: int, horizon: int) -> list[str]:
     limit = max(1, int(limit))
     horizon = max(1, int(horizon))

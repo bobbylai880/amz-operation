@@ -112,6 +112,40 @@ def _latest_yearweek(outputs: dict[str, pd.DataFrame]) -> int | None:
     return None
 
 
+def _delete_scene_week(engine: Engine, table: str, scene: str, marketplace_id: str, yearweek: int) -> int:
+    """Delete rows for the target scene/marketplace/yearweek before reloading."""
+
+    sql = text(
+        f"""
+        DELETE FROM {table}
+        WHERE scene = :scene
+          AND marketplace_id = :mk
+          AND (year * 100 + week_num) = :yw
+        """
+    )
+
+    with engine.begin() as conn:
+        result = conn.execute(sql, {"scene": scene, "mk": marketplace_id, "yw": yearweek})
+        deleted = result.rowcount or 0
+
+    LOGGER.info(
+        "scene_pipeline_persist_cleanup scene=%s mk=%s table=%s yearweek=%s deleted=%s",
+        scene,
+        marketplace_id,
+        table,
+        yearweek,
+        deleted,
+        extra={
+            "scene": scene,
+            "mk": marketplace_id,
+            "table": table,
+            "yearweek": yearweek,
+            "deleted": deleted,
+        },
+    )
+    return deleted
+
+
 def _fetch_latest_yearweek(engine: Engine, scene: str, marketplace_id: str) -> int | None:
     with engine.connect() as conn:
         result = conn.execute(
@@ -422,12 +456,44 @@ def run_scene_pipeline(
                 "persist_results",
                 scene,
                 marketplace_id,
-                call="replace_into(bi_amz_scene_kw_week_clean|features|drivers)",
+                call="delete_then_replace(bi_amz_scene_kw_week_clean|features|drivers)",
             ) as record:
-                clean_rows = replace_into(engine, "bi_amz_scene_kw_week_clean", clean_df) if not clean_df.empty else 0
-                feature_rows = replace_into(engine, "bi_amz_scene_features", features_df) if not features_df.empty else 0
-                driver_rows = replace_into(engine, "bi_amz_scene_drivers", drivers_df) if not drivers_df.empty else 0
-                record(clean_rows=clean_rows, feature_rows=feature_rows, driver_rows=driver_rows)
+                outputs = {"clean": clean_df, "features": features_df, "drivers": drivers_df}
+                yearweek = _latest_yearweek(outputs) or _current_yearweek()
+
+                tables = [
+                    ("bi_amz_scene_kw_week_clean", clean_df),
+                    ("bi_amz_scene_features", features_df),
+                    ("bi_amz_scene_drivers", drivers_df),
+                ]
+
+                summary: dict[str, dict[str, int]] = {}
+                for table, df in tables:
+                    if df.empty:
+                        continue
+
+                    deleted = _delete_scene_week(engine, table, scene, marketplace_id, yearweek)
+                    inserted = replace_into(engine, table, df)
+
+                    LOGGER.info(
+                        "scene_pipeline_persist_write scene=%s mk=%s table=%s yearweek=%s inserted=%s",
+                        scene,
+                        marketplace_id,
+                        table,
+                        yearweek,
+                        inserted,
+                        extra={
+                            "scene": scene,
+                            "mk": marketplace_id,
+                            "table": table,
+                            "yearweek": yearweek,
+                            "inserted": inserted,
+                        },
+                    )
+
+                    summary[table] = {"deleted": deleted, "inserted": inserted}
+
+                record(**{f"{table}_rows": values["inserted"] for table, values in summary.items()})
 
         LOGGER.info(
             "scene_pipeline_complete scene=%s mk=%s clean_weeks=%s feature_rows=%s driver_rows=%s duration_ms=%s",
