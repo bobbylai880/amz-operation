@@ -8,14 +8,8 @@ from typing import Any, Callable, Mapping
 from .deepseek_client import DeepSeekClient, DeepSeekError
 
 
-def _validate_schema(schema: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
-    """Very small subset of JSON Schema validation.
-
-    The function checks required keys and basic type compatibility.  It is not a
-    full JSON Schema implementation but is sufficient for unit tests and
-    low-risk sanity validation.  A complete validator (e.g. ``jsonschema``)
-    should be plugged in once dependencies are available.
-    """
+def validate_schema(schema: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
+    """Very small subset of JSON Schema validation."""
 
     required = schema.get("required", [])
     for key in required:
@@ -68,7 +62,13 @@ class LLMOrchestrator:
     def __init__(self, client: DeepSeekClient) -> None:
         self._client = client
 
-    def run(self, config: LLMRunConfig, *, retry: bool = True, fallback: Callable[[], Mapping[str, Any]] | None = None) -> Mapping[str, Any]:
+    def run(
+        self,
+        config: LLMRunConfig,
+        *,
+        retry: bool = True,
+        fallback: Callable[[], Mapping[str, Any]] | None = None,
+    ) -> Mapping[str, Any]:
         """Execute a single LLM step and validate against the provided schema."""
 
         attempt = 0
@@ -85,7 +85,7 @@ class LLMOrchestrator:
                     top_p=config.top_p,
                 )
                 payload = loads(response.content)
-                _validate_schema(config.schema, payload)
+                validate_schema(config.schema, payload)
                 return payload
             except (DeepSeekError, ValueError) as exc:
                 last_error = exc
@@ -95,8 +95,8 @@ class LLMOrchestrator:
         if fallback is None:
             raise RuntimeError("LLM invocation failed") from last_error
         payload = fallback()
-        _validate_schema(config.schema, payload)
+        validate_schema(config.schema, payload)
         return payload
 
 
-__all__ = ["LLMOrchestrator", "LLMRunConfig"]
+__all__ = ["LLMOrchestrator", "LLMRunConfig", "validate_schema"]
