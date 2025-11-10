@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -42,33 +43,9 @@ ORDER BY sunday DESC
 LIMIT 1
 """
 
-_STAGE2_PACKET_SQL = """
-SELECT *
-FROM bi_amz_comp_llm_packet
-WHERE scene_tag = :scene_tag
-  AND base_scene = :base_scene
-  AND COALESCE(morphology, '') = COALESCE(:morphology, '')
-  AND marketplace_id = :marketplace_id
-  AND week = :week
-  AND sunday = :sunday
-  AND my_asin = :my_asin
-  AND lag_type = :lag_type
-  AND opp_type = :opp_type
-"""
-
-_STAGE2_LAG_INSIGHT_SQL = """
-SELECT reason_code, severity, reason_detail, top_opp_asins_csv
-FROM bi_amz_comp_lag_insights
-WHERE scene_tag = :scene_tag
-  AND base_scene = :base_scene
-  AND COALESCE(morphology, '') = COALESCE(:morphology, '')
-  AND marketplace_id = :marketplace_id
-  AND week = :week
-  AND sunday = :sunday
-  AND my_asin = :my_asin
-  AND lag_type = :lag_type
-  AND opp_type = :opp_type
-LIMIT 1
+_STAGE1_RULE_SQL = """
+SELECT rule_name, lag_type, metric, opp_type, cmp, threshold, weight, is_active
+FROM bi_amz_comp_lag_rule
 """
 
 _STAGE1_KEY_FIELDS = (
@@ -94,9 +71,95 @@ _REQUIRED_CONTEXT_FIELDS = (
     "opp_type",
 )
 
+_STAGE2_GROUP_FIELDS = (
+    "scene_tag",
+    "base_scene",
+    "morphology",
+    "marketplace_id",
+    "week",
+    "sunday",
+    "my_parent_asin",
+    "my_asin",
+)
+
+_PAGE_LAG_TYPES = {"price", "rank", "content", "social", "badge", "confidence"}
+_TRAFFIC_LAG_TYPES = {"traffic_mix", "keyword"}
+
+_COMPARATOR_ALIASES = {
+    "gt": ">",
+    "gte": ">=",
+    "ge": ">=",
+    "lt": "<",
+    "lte": "<=",
+    "le": "<=",
+    ">": ">",
+    ">=": ">=",
+    "<": "<",
+    "<=": "<=",
+}
+_COMPARATOR_FUNCS = {
+    ">": lambda value, threshold: value > threshold,
+    "<": lambda value, threshold: value < threshold,
+    ">=": lambda value, threshold: value >= threshold,
+    "<=": lambda value, threshold: value <= threshold,
+}
+_MIRROR_MAP = {
+    ">": "<",
+    ">=": "<=",
+    "<": ">",
+    "<=": ">=",
+}
+_SEVERITY_ORDER = {"low": 1, "mid": 2, "medium": 2, "high": 3}
+
+
+@dataclass(slots=True)
+class LagRule:
+    rule_name: str
+    lag_type: str
+    metric: str
+    opp_type: str
+    comparator: str
+    threshold: float
+    weight: float
+
+
+@dataclass(slots=True)
+class StageOneResult:
+    context: Mapping[str, Any]
+    summary: str
+    dimensions: Sequence[Mapping[str, Any]]
+
+
+@dataclass(slots=True)
+class StageTwoCandidate:
+    context: Mapping[str, Any]
+    dimension: Mapping[str, Any]
+
+
+@dataclass(slots=True)
+class StageTwoAggregateInput:
+    context: Mapping[str, Any]
+    items: Sequence[StageTwoCandidate]
+
+
+@dataclass(slots=True)
+class StageTwoAggregateResult:
+    context: Mapping[str, Any]
+    machine_json: Mapping[str, Any]
+    human_markdown: str
+    facts: Mapping[str, Any]
+
+
+@dataclass(slots=True)
+class CompetitionRunResult:
+    week: str
+    stage1_processed: int
+    stage2_candidates: int
+    stage2_processed: int
+    storage_paths: Sequence[Path]
+
 
 def _normalize_lag_type(value: object) -> str:
-    v = str(value or "").strip().lower()
     mapping = {
         "pricing": "price",
         "price": "price",
@@ -110,36 +173,12 @@ def _normalize_lag_type(value: object) -> str:
         "keyword": "keyword",
         "confidence": "confidence",
     }
-    return mapping.get(v, v)
-
-
-@dataclass(slots=True)
-class StageOneLLMResult:
-    context: Mapping[str, Any]
-    summary: str
-    dimensions: Sequence[Mapping[str, Any]]
-
-
-@dataclass(slots=True)
-class StageTwoLLMResult:
-    context: Mapping[str, Any]
-    lag_type: str
-    machine_json: Mapping[str, Any]
-    human_markdown: str
-    evidence: Mapping[str, Any]
-
-
-@dataclass(slots=True)
-class CompetitionRunResult:
-    week: str
-    stage1_processed: int
-    stage2_candidates: int
-    stage2_processed: int
-    storage_paths: Sequence[Path]
+    raw = str(value or "").strip().lower()
+    return mapping.get(raw, raw)
 
 
 class CompetitionLLMOrchestrator:
-    """Coordinate the Stage-1/Stage-2 competition LLM workflow."""
+    """Coordinate the Stage-1/Stage-2 competition workflow using a rule engine plus a single LLM round."""
 
     def __init__(
         self,
@@ -153,10 +192,8 @@ class CompetitionLLMOrchestrator:
         self._llm = llm_orchestrator
         self._config = config
         self._storage_root = Path(storage_root or "storage/competition_llm")
-        self._stage1_schema = load_schema("competition_stage1.schema.json")
-        self._stage2_schema = load_schema("competition_stage2.schema.json")
-        self._stage1_prompt = load_prompt("competition_stage1.md")
-        self._stage2_prompt = load_prompt("competition_stage2.md")
+        self._stage2_schema = load_schema("competition_stage2_aggregate.schema.json")
+        self._stage2_prompt = load_prompt("competition_stage2_aggregate.md")
 
     def run(self, week: str | None, *, marketplace_id: str | None = None) -> CompetitionRunResult:
         """Execute Stage-1 and Stage-2 for the provided week."""
@@ -169,17 +206,24 @@ class CompetitionLLMOrchestrator:
         )
 
         stage1_inputs = self._collect_stage1_inputs(target_week, marketplace_id)
-        stage1_outputs = self._execute_stage1(stage1_inputs)
+        stage1_outputs = self._execute_stage1_code(stage1_inputs)
         storage_paths: list[Path] = []
         for item in stage1_outputs:
             storage_paths.append(self._write_stage1_output(item))
 
         stage2_candidates = self._prepare_stage2_candidates(stage1_outputs)
-        stage2_outputs: list[StageTwoLLMResult] = []
+        stage2_outputs: Sequence[StageTwoAggregateResult] = ()
         if self._config.stage_2.enabled and stage2_candidates:
-            stage2_outputs = self._execute_stage2(stage2_candidates)
-            for item in stage2_outputs:
-                storage_paths.extend(self._write_stage2_output(item))
+            if getattr(self._config.stage_2, "aggregate_per_asin", False):
+                grouped = self._group_candidates_by_asin(stage2_candidates)
+                stage2_outputs = self._execute_stage2_aggregate(grouped)
+                for item in stage2_outputs:
+                    storage_paths.extend(self._write_stage2_output_aggregate(item))
+            else:
+                LOGGER.warning(
+                    "competition_llm.stage2_aggregate_disabled candidate_count=%s",
+                    len(stage2_candidates),
+                )
         else:
             LOGGER.info(
                 "competition_llm.stage2_skipped enabled=%s candidate_count=%s",
@@ -234,50 +278,104 @@ class CompetitionLLMOrchestrator:
                 LOGGER.debug("competition_llm.skip_empty_rows context=%s", context)
                 continue
             inputs.append((context, overview, traffic))
-        return inputs
+        return tuple(inputs)
 
-    def _execute_stage1(
+    def _execute_stage1_code(
         self,
         inputs: Sequence[tuple[Mapping[str, Any], Sequence[Mapping[str, Any]], Sequence[Mapping[str, Any]]]],
-    ) -> Sequence[StageOneLLMResult]:
-        results: list[StageOneLLMResult] = []
+    ) -> Sequence[StageOneResult]:
+        rules = self._load_active_rules()
+        if not rules:
+            LOGGER.warning("competition_llm.stage1_no_rules active=0")
+        results: list[StageOneResult] = []
         for context, overview_rows, traffic_rows in inputs:
-            payload = {
-                "context": context,
-                "overview_rows": overview_rows,
-                "traffic_rows": traffic_rows,
-                "thresholds": dict(self._config.stage_1.thresholds),
-                "conf_min": self._config.stage_1.conf_min,
-                "band_weight": self._config.stage_1.band_weight,
-                "opp_weight": self._config.stage_1.opp_weight,
-                "output_language": "zh",
-                "response_schema": self._stage1_schema,
-            }
-            llm_result = self._invoke_with_retries(
-                payload,
-                schema=self._stage1_schema,
-                prompt=self._stage1_prompt,
-                max_attempts=self._config.stage_1.max_retries,
-            )
-            context_result = llm_result.get("context")
-            if not context_result:
-                raise ValueError("Stage-1 response missing context")
-            summary = llm_result.get("summary")
-            if not isinstance(summary, str) or not summary.strip():
-                raise ValueError("Stage-1 response missing summary")
-            dimensions = llm_result.get("dimensions")
-            if not isinstance(dimensions, Sequence) or not dimensions:
-                raise ValueError("Stage-1 response missing dimensions")
+            opp_type = str(context.get("opp_type") or "").lower()
+            applicable_rules = [rule for rule in rules if rule.opp_type in ("any", opp_type)]
+            if not applicable_rules:
+                LOGGER.debug("competition_llm.stage1_skip_no_rules opp_type=%s context=%s", opp_type, context)
+                summary = "未检测到落后维度"
+                results.append(StageOneResult(context=context, summary=summary, dimensions=()))
+                continue
+
+            lag_scores: defaultdict[str, float] = defaultdict(float)
+            triggered_rules: defaultdict[str, list[str]] = defaultdict(list)
+            lead_hits: defaultdict[str, list[str]] = defaultdict(list)
+            confidence_tracker: defaultdict[str, float] = defaultdict(lambda: self._config.stage_1.conf_min)
+
+            for channel, rows in (("page", overview_rows), ("traffic", traffic_rows)):
+                if not rows:
+                    continue
+                confidence_field = "confidence" if channel == "page" else "t_confidence"
+                for row in rows:
+                    confidence_value = self._parse_confidence(row.get(confidence_field))
+                    if confidence_value is None:
+                        confidence_value = self._config.stage_1.conf_min
+                    for rule in applicable_rules:
+                        value = row.get(rule.metric)
+                        numeric_value = _coerce_float(value)
+                        if numeric_value is None:
+                            continue
+                        if _compare(numeric_value, rule.threshold, rule.comparator):
+                            lag_scores[rule.lag_type] += rule.weight
+                            confidence_tracker[rule.lag_type] = max(confidence_tracker[rule.lag_type], confidence_value)
+                            if rule.rule_name:
+                                triggered_rules[rule.lag_type].append(rule.rule_name)
+                            else:
+                                triggered_rules[rule.lag_type].append(f"{rule.metric}{rule.comparator}{rule.threshold}")
+                        else:
+                            mirror = _MIRROR_MAP.get(rule.comparator)
+                            if mirror and _compare(numeric_value, rule.threshold, mirror):
+                                lead_hits[rule.lag_type].append(rule.rule_name or rule.metric)
+                            confidence_tracker[rule.lag_type] = max(confidence_tracker[rule.lag_type], confidence_value)
+
+            dimensions: list[Mapping[str, Any]] = []
+            summary_parts: list[str] = []
+            for lag_type, score in sorted(lag_scores.items()):
+                if score <= 0:
+                    continue
+                severity = self._map_severity(score)
+                confidence_value = max(confidence_tracker.get(lag_type, 0.0), self._config.stage_1.conf_min)
+                payload = {
+                    "lag_type": lag_type,
+                    "status": "lag",
+                    "severity": severity,
+                    "lag_score": round(score, 4),
+                    "source_opp_type": context.get("opp_type"),
+                    "source_confidence": round(confidence_value, 4),
+                }
+                if triggered_rules.get(lag_type):
+                    payload["triggered_rules"] = triggered_rules[lag_type]
+                dimensions.append(payload)
+                LOGGER.info(
+                    "competition_llm.stage1_lag lag_type=%s opp_type=%s lag_score=%.3f severity=%s rules=%s",
+                    lag_type,
+                    context.get("opp_type"),
+                    score,
+                    severity,
+                    triggered_rules.get(lag_type, ()),
+                )
+                if triggered_rules.get(lag_type):
+                    summary_parts.append(f"{lag_type}: {', '.join(triggered_rules[lag_type])}")
+                else:
+                    summary_parts.append(f"{lag_type}: lag_score={score:.2f}")
+
+            if not dimensions:
+                if lead_hits:
+                    LOGGER.debug("competition_llm.stage1_lead_only opp_type=%s leads=%s", opp_type, dict(lead_hits))
+                summary = "未检测到落后维度"
+            else:
+                summary = "；".join(summary_parts) if summary_parts else "已识别落后维度"
+
             results.append(
-                StageOneLLMResult(
-                    context=context_result,
-                    summary=summary.strip(),
+                StageOneResult(
+                    context=context,
+                    summary=summary,
                     dimensions=tuple(dimensions),
                 )
             )
         return tuple(results)
 
-    def _write_stage1_output(self, result: StageOneLLMResult) -> Path:
+    def _write_stage1_output(self, result: StageOneResult) -> Path:
         week = str(result.context.get("week"))
         asin = result.context.get("my_asin", "unknown")
         opp_type = result.context.get("opp_type", "na")
@@ -291,8 +389,8 @@ class CompetitionLLMOrchestrator:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
         return path
 
-    def _prepare_stage2_candidates(self, stage1_results: Sequence[StageOneLLMResult]) -> Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]]:
-        candidates: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    def _prepare_stage2_candidates(self, stage1_results: Sequence[StageOneResult]) -> Sequence[StageTwoCandidate]:
+        candidates: list[StageTwoCandidate] = []
         threshold = self._config.stage_1.conf_min
         allowed_statuses = tuple(
             status.lower() for status in getattr(self._config.stage_2, "trigger_status", ("lag",))
@@ -300,16 +398,8 @@ class CompetitionLLMOrchestrator:
         allowed_set = set(allowed_statuses)
         for result in stage1_results:
             for dimension in result.dimensions:
-                if isinstance(dimension, Mapping) and "lag_type" in dimension:
-                    dimension = dict(dimension)
-                    dimension["lag_type"] = _normalize_lag_type(dimension.get("lag_type"))
-                raw_status = str(dimension.get("status", "")).lower()
-                status_aliases = {raw_status}
-                if raw_status == "parity":
-                    status_aliases.add("neutral")
-                if raw_status == "neutral":
-                    status_aliases.add("parity")
-                if allowed_set and status_aliases.isdisjoint(allowed_set):
+                status = str(dimension.get("status", "")).lower()
+                if allowed_set and status not in allowed_set:
                     continue
                 confidence = dimension.get("source_confidence")
                 confidence_value = self._parse_confidence(confidence)
@@ -324,40 +414,40 @@ class CompetitionLLMOrchestrator:
                         dimension,
                     )
                     continue
-                candidates.append((result.context, dimension))
+                candidates.append(StageTwoCandidate(context=result.context, dimension=dict(dimension)))
         return tuple(candidates)
 
-    def _execute_stage2(
-        self, candidates: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]]
-    ) -> Sequence[StageTwoLLMResult]:
-        outputs: list[StageTwoLLMResult] = []
-        for context, dimension in candidates:
-            packet = self._fetch_stage2_packet(context, dimension)
-            if packet is None:
-                LOGGER.warning(
-                    "competition_llm.missing_stage2_evidence context=%s dimension=%s",
-                    context,
-                    dimension,
-                )
+    def _group_candidates_by_asin(self, candidates: Sequence[StageTwoCandidate]) -> Sequence[StageTwoAggregateInput]:
+        grouped: dict[tuple[Any, ...], list[StageTwoCandidate]] = {}
+        contexts: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        for candidate in candidates:
+            context = candidate.context
+            base_context = {field: context.get(field) for field in _STAGE2_GROUP_FIELDS}
+            base_context["asin_priority"] = context.get("asin_priority")
+            key = tuple(base_context.get(field) for field in _STAGE2_GROUP_FIELDS)
+            grouped.setdefault(key, []).append(candidate)
+            contexts.setdefault(key, base_context)
+        return tuple(
+            StageTwoAggregateInput(context=contexts[key], items=tuple(items))
+            for key, items in grouped.items()
+        )
+
+    def _execute_stage2_aggregate(
+        self, groups: Sequence[StageTwoAggregateInput]
+    ) -> Sequence[StageTwoAggregateResult]:
+        outputs: list[StageTwoAggregateResult] = []
+        for group in groups:
+            facts = self._build_stage2_aggregate_facts(group)
+            lag_items = tuple(facts.get("lag_items") or ())
+            if not lag_items:
+                LOGGER.info("competition_llm.stage2_aggregate_skip_empty context=%s", group.context)
                 continue
-            lag_insight = self._fetch_optional_lag_insight(context, dimension)
-            evidence_payload = packet.get("evidence_json") or {}
-            facts = {
-                "first_round_item": {
-                    "context": context,
-                    "lag_type": dimension.get("lag_type"),
-                    "status": dimension.get("status"),
-                    "severity": dimension.get("severity"),
-                    "source_opp_type": dimension.get("source_opp_type"),
-                    "source_confidence": dimension.get("source_confidence"),
-                },
-                "llm_packet": packet,
-                "lag_insight": lag_insight or {},
-                "machine_json_schema": self._stage2_schema,
-                "allowed_action_codes": list(self._config.stage_2.allowed_action_codes),
-                "allowed_root_cause_codes": list(self._config.stage_2.allowed_root_cause_codes),
-                "output_language": "zh",
-            }
+            LOGGER.info(
+                "competition_llm.stage2_aggregate_input asin=%s lag_items=%s top_opps=%s",
+                facts.get("context", {}).get("my_asin"),
+                len(lag_items),
+                len(facts.get("top_opp_asins_csv", "").split(",")) if facts.get("top_opp_asins_csv") else 0,
+            )
             llm_response = self._invoke_with_retries(
                 facts,
                 schema={"type": "object", "required": ["machine_json", "human_markdown"]},
@@ -372,129 +462,218 @@ class CompetitionLLMOrchestrator:
             if not isinstance(human_markdown, str):
                 raise ValueError("Stage-2 human_markdown must be a string")
             outputs.append(
-                StageTwoLLMResult(
-                    context=machine_json.get("context", context),
-                    lag_type=str(machine_json.get("lag_type", dimension.get("lag_type", ""))),
+                StageTwoAggregateResult(
+                    context=facts.get("context", {}),
                     machine_json=machine_json,
                     human_markdown=human_markdown,
-                    evidence=evidence_payload,
+                    facts=facts,
                 )
             )
         return tuple(outputs)
 
-    def _write_stage2_output(self, result: StageTwoLLMResult) -> Sequence[Path]:
-        context = result.context
+    def _build_stage2_aggregate_facts(self, group: StageTwoAggregateInput) -> Mapping[str, Any]:
+        base_context = dict(group.context)
+        lag_entries: dict[str, dict[str, Any]] = {}
+        overall_top_map: dict[str, dict[str, Any]] = {}
+        opp_types_seen: set[str] = set()
+        evidence_cache: dict[tuple[Any, ...], Mapping[str, Any] | None] = {}
+
+        for candidate in group.items:
+            dimension = candidate.dimension
+            lag_type = _normalize_lag_type(dimension.get("lag_type"))
+            opp_type = str(candidate.context.get("opp_type") or dimension.get("source_opp_type") or "").lower()
+            if not lag_type or not opp_type:
+                LOGGER.debug("competition_llm.stage2_skip_invalid_dimension dimension=%s", dimension)
+                continue
+            severity_label = str(dimension.get("severity") or "low").lower()
+            severity_rank = _SEVERITY_ORDER.get(severity_label, 1)
+            opp_types_seen.add(opp_type)
+            confidence_value = self._parse_confidence(dimension.get("source_confidence")) or self._config.stage_1.conf_min
+            lag_score = _coerce_float(dimension.get("lag_score"))
+
+            evidence_items: list[Mapping[str, Any]] = []
+            if lag_type in _PAGE_LAG_TYPES:
+                cache_key = _stage2_cache_key(candidate.context, lag_type, opp_type, "page")
+                evidence_page = evidence_cache.get(cache_key)
+                if evidence_page is None:
+                    evidence_page = self._build_page_evidence(candidate.context, lag_type, opp_type)
+                    evidence_cache[cache_key] = evidence_page
+                if evidence_page:
+                    evidence_items.append(evidence_page)
+            if lag_type in _TRAFFIC_LAG_TYPES:
+                cache_key = _stage2_cache_key(candidate.context, lag_type, opp_type, "traffic")
+                evidence_traffic = evidence_cache.get(cache_key)
+                if evidence_traffic is None:
+                    evidence_traffic = self._build_traffic_evidence(candidate.context, lag_type, opp_type)
+                    evidence_cache[cache_key] = evidence_traffic
+                if evidence_traffic:
+                    evidence_items.append(evidence_traffic)
+
+            if not evidence_items:
+                LOGGER.warning(
+                    "competition_llm.stage2_missing_evidence lag_type=%s opp_type=%s context=%s",
+                    lag_type,
+                    opp_type,
+                    candidate.context,
+                )
+                continue
+
+            entry = lag_entries.setdefault(
+                lag_type,
+                {
+                    "lag_type": lag_type,
+                    "opp_types": set(),
+                    "severity_rank": 0,
+                    "source_confidence": self._config.stage_1.conf_min,
+                    "overview": {},
+                    "_top_map": {},
+                    "lag_scores": [],
+                    "triggered_rules": set(),
+                },
+            )
+            entry["opp_types"].add(opp_type)
+            entry["severity_rank"] = max(entry["severity_rank"], severity_rank)
+            entry["source_confidence"] = max(entry["source_confidence"], confidence_value)
+            if lag_score is not None:
+                entry["lag_scores"].append(lag_score)
+            if dimension.get("triggered_rules"):
+                entry["triggered_rules"].update(dimension.get("triggered_rules"))
+
+            for evidence in evidence_items:
+                overview = evidence.get("overview") or {}
+                if overview:
+                    entry.setdefault("overview", {}).setdefault(opp_type, {}).update(overview)
+                self._merge_top_opps(entry.setdefault("_top_map", {}), lag_type, evidence.get("top_opps"))
+                self._merge_top_opps(overall_top_map, lag_type, evidence.get("top_opps"))
+
+        lag_items_payload: list[dict[str, Any]] = []
+        for lag_type, entry in lag_entries.items():
+            overview = entry.get("overview") or {}
+            top_map = entry.get("_top_map") or {}
+            lag_item = {
+                "lag_type": lag_type,
+                "opp_types": sorted(entry.get("opp_types") or ()),
+                "severity": _severity_from_rank(entry.get("severity_rank", 0)),
+                "source_confidence": round(entry.get("source_confidence", self._config.stage_1.conf_min), 4),
+                "overview": {key: overview[key] for key in sorted(overview)},
+                "top_opps": self._finalise_top_opps(top_map),
+            }
+            if entry.get("lag_scores"):
+                lag_item["lag_score"] = max(entry["lag_scores"])
+            if entry.get("triggered_rules"):
+                lag_item["triggered_rules"] = sorted(entry["triggered_rules"])
+            lag_items_payload.append(lag_item)
+
+        lag_items_payload.sort(key=lambda item: (-_SEVERITY_ORDER.get(str(item.get("severity")).lower(), 1), item.get("lag_type")))
+        top_list = self._finalise_top_opps(overall_top_map)
+        top_csv = ""
+        if top_list:
+            top_csv = ",".join([row.get("opp_asin") for row in top_list[:8] if row.get("opp_asin")])
+
+        base_context["opp_types"] = sorted(opp_types_seen)
+        facts = {
+            "context": base_context,
+            "lag_items": lag_items_payload,
+            "top_opp_asins_csv": top_csv,
+            "allowed_action_codes": list(self._config.stage_2.allowed_action_codes),
+            "allowed_root_cause_codes": list(self._config.stage_2.allowed_root_cause_codes),
+            "output_language": "zh",
+            "machine_json_schema": "competition_stage2_aggregate.schema.json",
+        }
+        return facts
+
+    def _write_stage2_output_aggregate(self, result: StageTwoAggregateResult) -> Sequence[Path]:
+        context = result.context or {}
         week = str(context.get("week"))
         asin = context.get("my_asin", "unknown")
-        lag_type = result.lag_type or "unknown"
-        opp_type = context.get("opp_type", "na")
         stage2_dir = self._storage_root / week / "stage2"
         stage2_dir.mkdir(parents=True, exist_ok=True)
 
-        base_name = f"{asin}_{lag_type}_{opp_type}"
+        base_name = f"{asin}_ALL"
         main_path = stage2_dir / f"{base_name}.json"
         payload = {
             "machine_json": result.machine_json,
             "human_markdown": result.human_markdown,
         }
-        main_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
-            encoding="utf-8",
-        )
+        main_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
 
-        summary_data = self._build_stage2_summary(result)
-        summary_paths: list[Path] = [main_path]
+        markdown_path = stage2_dir / f"{base_name}.md"
+        markdown_content = (result.human_markdown or "").rstrip()
+
+        summary_data = self._build_stage2_summary_aggregate(result)
         if summary_data:
-            summary_json_path = stage2_dir / f"{base_name}_summary.json"
-            summary_json_path.write_text(
-                json.dumps(summary_data, ensure_ascii=False, indent=2, default=_json_default),
-                encoding="utf-8",
-            )
-            summary_md_path = stage2_dir / f"{base_name}_summary.md"
-            summary_md_path.write_text(
-                self._render_stage2_summary_markdown(summary_data),
-                encoding="utf-8",
-            )
-            summary_paths.extend([summary_json_path, summary_md_path])
+            appendix = self._render_stage2_summary_markdown(summary_data).rstrip()
+            if appendix:
+                if markdown_content:
+                    markdown_content = f"{markdown_content}\n\n{appendix}"
+                else:
+                    markdown_content = appendix
 
-        return tuple(summary_paths)
+        markdown_path.write_text(markdown_content + "\n", encoding="utf-8")
 
-    def _build_stage2_summary(self, result: StageTwoLLMResult) -> Mapping[str, Any] | None:
-        evidence = result.evidence or {}
-        if not evidence:
+        return (main_path, markdown_path)
+
+    def _build_stage2_summary_aggregate(self, result: StageTwoAggregateResult) -> Mapping[str, Any] | None:
+        facts = result.facts or {}
+        lag_items = facts.get("lag_items") or []
+        if not lag_items:
             return None
-        overview = dict(evidence.get("overview") or {})
-        metrics_cfg = _OVERVIEW_METRIC_CONFIG.get(result.lag_type, {})
-        leader_summary = _compose_overview_summary(overview, metrics_cfg.get("leader", ()))
-        median_summary = _compose_overview_summary(overview, metrics_cfg.get("median", ()))
-        context_snapshot = {field: result.context.get(field) for field in _REQUIRED_CONTEXT_FIELDS}
-        summary: dict[str, Any] = {
-            "context": context_snapshot,
-            "lag_type": result.lag_type,
-            "channel": evidence.get("channel"),
-            "vs_leader": leader_summary,
-            "vs_median": median_summary,
-            "top_diff_reasons": list(evidence.get("top_diff_reasons") or ()),
+        summary = {
+            "context": facts.get("context"),
+            "lag_items": lag_items,
+            "top_opp_asins_csv": facts.get("top_opp_asins_csv"),
         }
-        if overview:
-            summary["overview"] = overview
-        top_opps = evidence.get("top_opps")
-        if top_opps:
-            summary["top_opps"] = top_opps
-        top_csv = evidence.get("top_opp_asins_csv")
-        if top_csv:
-            summary["top_opp_asins_csv"] = top_csv
         return summary
 
     def _render_stage2_summary_markdown(self, summary: Mapping[str, Any]) -> str:
         context = summary.get("context", {})
         lines: list[str] = []
-        title = f"# Stage-2 摘要（{summary.get('lag_type', 'unknown')}）"
-        lines.append(title)
+        lines.append("## 附录：数据摘要")
         lines.append("")
         lines.append(f"- 周次：{context.get('week', '未知')}")
         lines.append(f"- ASIN：{context.get('my_asin', '未知')}")
-        lines.append(f"- 对手类型：{context.get('opp_type', '未知')}")
+        opp_types = ", ".join(context.get("opp_types", ())) or "未知"
+        lines.append(f"- 覆盖对手类型：{opp_types}")
+        top_csv = summary.get("top_opp_asins_csv") or ""
+        if top_csv:
+            lines.append(f"- Top 对手：{top_csv}")
         lines.append("")
 
-        leader = summary.get("vs_leader", {})
-        lines.append("## 本品 vs 领先者")
-        leader_summary = leader.get("summary") or "暂无数据"
-        lines.append(f"- {leader_summary}")
-        leader_metrics = leader.get("metrics") or {}
-        if leader_metrics:
+        lag_items = summary.get("lag_items") or []
+        for item in lag_items:
+            lag_type = item.get("lag_type", "unknown")
+            lines.append(f"## 落后维度：{lag_type}")
+            lines.append(f"- 对手类型：{', '.join(item.get('opp_types', ())) or '未知'}")
+            lines.append(f"- 严重度：{item.get('severity', '未知')}")
+            lines.append(f"- 置信度：{_format_metric_value(item.get('source_confidence'))}")
+            if item.get("triggered_rules"):
+                lines.append(f"- 触发规则：{', '.join(item['triggered_rules'])}")
             lines.append("")
-            lines.append("**关键指标：**")
-            for key, value in leader_metrics.items():
-                lines.append(f"- {key}: {_format_metric_value(value)}")
-        lines.append("")
-
-        median = summary.get("vs_median", {})
-        lines.append("## 本品 vs 中位数")
-        median_summary = median.get("summary") or "暂无数据"
-        lines.append(f"- {median_summary}")
-        median_metrics = median.get("metrics") or {}
-        if median_metrics:
-            lines.append("")
-            lines.append("**关键指标：**")
-            for key, value in median_metrics.items():
-                lines.append(f"- {key}: {_format_metric_value(value)}")
-        lines.append("")
-
-        reasons = summary.get("top_diff_reasons") or []
-        lines.append("## Top3 差距原因")
-        if not reasons:
-            lines.append("- 暂无数据")
-        else:
-            for item in reasons:
-                label = _format_opp_label(item)
-                summary_text = item.get("summary") or ""
-                lines.append(f"- {label}：{summary_text}")
-                metrics = item.get("metrics") or {}
+            overview = item.get("overview") or {}
+            for opp, metrics in overview.items():
+                lines.append(f"### vs {opp}")
                 if metrics:
-                    lines.append("  - 指标：")
                     for key, value in metrics.items():
-                        lines.append(f"    - {key}: {_format_metric_value(value)}")
+                        lines.append(f"- {key}: {_format_metric_value(value)}")
+                else:
+                    lines.append("- 暂无概览数据")
+                lines.append("")
+            top_opps = item.get("top_opps") or []
+            lines.append("### Top 对手差距")
+            if not top_opps:
+                lines.append("- 暂无数据")
+            else:
+                for row in top_opps:
+                    label = _format_opp_label(row)
+                    metrics = []
+                    for key in _COMPARISON_METRIC_KEYS.get(lag_type, ()):
+                        if row.get(key) is not None:
+                            metrics.append(f"{key}={_format_metric_value(row.get(key))}")
+                    text = f"- {label}"
+                    if metrics:
+                        text += f"：{', '.join(metrics)}"
+                    lines.append(text)
+            lines.append("")
 
         return "\n".join(lines) + "\n"
 
@@ -520,8 +699,6 @@ class CompetitionLLMOrchestrator:
 
     @staticmethod
     def _parse_confidence(value: Any) -> float | None:
-        """Normalize raw confidence values emitted by Stage-1."""
-
         if value is None:
             return None
         if isinstance(value, (int, float)):
@@ -545,63 +722,129 @@ class CompetitionLLMOrchestrator:
             params["marketplace_id"] = marketplace_id
         return self._fetch_all(sql, params)
 
-    def _fetch_stage2_packet(self, context: Mapping[str, Any], dimension: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        params = self._build_stage2_params(context, dimension)
-        lag_type = params.get("lag_type")
-        opp_type = str(params.get("opp_type"))
-        common = {
-            **params,
-            "my_parent_asin": context.get("my_parent_asin"),
-        }
-
-        if lag_type in ("price", "rank", "content", "social", "badge", "confidence"):
-            evidence = self._build_page_evidence(common, lag_type, opp_type)
-        elif lag_type in ("traffic_mix", "keyword"):
-            evidence = self._build_traffic_evidence(common, lag_type, opp_type)
-        else:
-            LOGGER.warning(
-                "competition_llm.unsupported_lag_type lag_type=%s context=%s",
-                lag_type,
-                context,
+    def _load_active_rules(self) -> Sequence[LagRule]:
+        rows = self._fetch_all(_STAGE1_RULE_SQL, {})
+        rules: list[LagRule] = []
+        for row in rows:
+            if not row.get("is_active"):
+                continue
+            lag_type = _normalize_lag_type(row.get("lag_type"))
+            metric = str(row.get("metric") or "").strip()
+            if not lag_type or not metric:
+                continue
+            comparator_raw = str(row.get("cmp") or row.get("comparator") or "").strip()
+            comparator = _COMPARATOR_ALIASES.get(comparator_raw.lower(), comparator_raw)
+            if comparator not in _COMPARATOR_FUNCS:
+                LOGGER.warning("competition_llm.stage1_skip_rule comparator=%s rule=%s", comparator_raw, row)
+                continue
+            threshold = _coerce_float(row.get("threshold"))
+            if threshold is None:
+                LOGGER.warning("competition_llm.stage1_skip_rule threshold rule=%s", row)
+                continue
+            weight = _coerce_float(row.get("weight")) or 1.0
+            opp_type = str(row.get("opp_type") or "any").lower()
+            rules.append(
+                LagRule(
+                    rule_name=str(row.get("rule_name") or f"{metric}_{comparator}"),
+                    lag_type=lag_type,
+                    metric=metric,
+                    opp_type=opp_type,
+                    comparator=comparator,
+                    threshold=float(threshold),
+                    weight=float(weight),
+                )
             )
-            return None
+        return tuple(rules)
 
-        if not evidence:
-            return None
+    def _map_severity(self, score: float) -> str:
+        thresholds = self._config.stage_1.severity_thresholds or {}
+        high_threshold = float(thresholds.get("high", 2.0))
+        mid_threshold = float(thresholds.get("mid", 1.0))
+        if score >= high_threshold:
+            return "high"
+        if score >= mid_threshold:
+            return "mid"
+        return "low"
 
-        return {
-            **common,
-            "reason_code": evidence.get("reason_code", f"{lag_type}_auto"),
-            "severity": evidence.get("severity"),
-            "evidence_json": evidence,
-            "prompt_hint": evidence.get(
-                "prompt_hint", "仅使用 evidence_json 中已给出的指标，不要自行重算。"
-            ),
-        }
+    def _fetch_all(self, sql: str, params: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
+        stmt = text(sql)
+        with self._engine.connect() as conn:
+            result = conn.execute(stmt, params)
+            rows = result.fetchall()
+            return [self._serialise_row(dict(row._mapping)) for row in rows]
 
-    def _fetch_optional_lag_insight(
-        self, context: Mapping[str, Any], dimension: Mapping[str, Any]
-    ) -> Mapping[str, Any] | None:
-        params = self._build_stage2_params(context, dimension)
-        row = self._fetch_one(_STAGE2_LAG_INSIGHT_SQL, params)
-        return dict(row) if row else None
+    def _fetch_one(self, sql: str, params: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        stmt = text(sql)
+        with self._engine.connect() as conn:
+            result = conn.execute(stmt, params)
+            row = result.fetchone()
+            if not row:
+                return None
+            return self._serialise_row(dict(row._mapping))
 
-    def _build_stage2_params(self, context: Mapping[str, Any], dimension: Mapping[str, Any]) -> dict[str, Any]:
-        params = {
-            "scene_tag": context.get("scene_tag"),
-            "base_scene": context.get("base_scene"),
-            "morphology": context.get("morphology"),
-            "marketplace_id": context.get("marketplace_id"),
-            "week": context.get("week"),
-            "sunday": context.get("sunday"),
-            "my_asin": context.get("my_asin"),
-            "lag_type": _normalize_lag_type(dimension.get("lag_type")),
-            "opp_type": context.get("opp_type"),
-        }
-        missing = [key for key, value in params.items() if value is None]
-        if missing:
-            raise ValueError(f"Stage-2 parameter missing required fields: {missing}")
-        return params
+    def _serialise_row(self, row: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
+        for key, value in list(row.items()):
+            row[key] = _serialise_value(value)
+        return row
+
+    def _build_stage1_key(self, row: Mapping[str, Any]) -> tuple[Any, ...]:
+        return tuple(row.get(field) for field in _STAGE1_KEY_FIELDS)
+
+    def _build_context(self, row: Mapping[str, Any]) -> Mapping[str, Any]:
+        context = {field: row.get(field) for field in _REQUIRED_CONTEXT_FIELDS}
+        context["asin_priority"] = row.get("asin_priority", 0)
+        return context
+
+    def _invoke_with_retries(
+        self,
+        facts: Mapping[str, Any],
+        *,
+        schema: Mapping[str, Any],
+        prompt: str,
+        max_attempts: int,
+    ) -> Mapping[str, Any]:
+        attempts = 0
+        last_error: Exception | None = None
+        payload = facts
+        while attempts < max_attempts:
+            attempts += 1
+            config = LLMRunConfig(
+                prompt=prompt,
+                facts=payload,
+                schema=schema,
+                model=self._config.llm.model,
+                temperature=self._config.llm.temperature,
+                response_format=self._config.llm.response_format,
+                top_p=self._config.llm.top_p,
+            )
+            try:
+                return self._llm.run(config, retry=False)
+            except Exception as exc:  # pragma: no cover - aggregated error handling
+                last_error = exc
+                LOGGER.warning(
+                    "competition_llm.llm_retry attempt=%s max_attempts=%s error=%s",
+                    attempts,
+                    max_attempts,
+                    exc,
+                )
+                if attempts >= max_attempts:
+                    break
+        if last_error:
+            raise last_error
+        raise RuntimeError("LLM invocation failed without exception")
+
+    def _validate_stage2_machine_json(self, payload: Mapping[str, Any]) -> None:
+        validate_schema(self._stage2_schema, payload)
+        actions = payload.get("recommended_actions", [])
+        for action in actions:
+            code = action.get("action_code")
+            if self._config.stage_2.allowed_action_codes and code not in self._config.stage_2.allowed_action_codes:
+                raise ValueError(f"Action code {code!r} is not permitted")
+        root_causes = payload.get("root_causes", [])
+        for cause in root_causes:
+            code = cause.get("root_cause_code")
+            if self._config.stage_2.allowed_root_cause_codes and code not in self._config.stage_2.allowed_root_cause_codes:
+                raise ValueError(f"Root cause code {code!r} is not permitted")
 
     def _build_page_evidence(
         self, ctx: Mapping[str, Any], lag_type: str, opp_type: str
@@ -735,87 +978,25 @@ class CompetitionLLMOrchestrator:
             "prompt_hint": "从流量结构或关键词结构解释差异；不要重算，只引用 evidence_json 字段。",
         }
 
-    def _fetch_all(self, sql: str, params: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
-        stmt = text(sql)
-        with self._engine.connect() as conn:
-            result = conn.execute(stmt, params)
-            rows = result.fetchall()
-            return [self._serialise_row(dict(row._mapping)) for row in rows]
+    def _merge_top_opps(
+        self, bucket: MutableMapping[str, dict[str, Any]], lag_type: str, rows: Sequence[Mapping[str, Any]] | None
+    ) -> None:
+        if not rows:
+            return
+        for row in rows:
+            opp_asin = row.get("opp_asin")
+            if not opp_asin:
+                continue
+            impact = _compute_top_impact(lag_type, row)
+            current = bucket.get(opp_asin)
+            if not current or impact > current.get("impact", float("-inf")):
+                bucket[opp_asin] = {"impact": impact, "row": dict(row)}
 
-    def _fetch_one(self, sql: str, params: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        stmt = text(sql)
-        with self._engine.connect() as conn:
-            result = conn.execute(stmt, params)
-            row = result.fetchone()
-            if not row:
-                return None
-            return self._serialise_row(dict(row._mapping))
-
-    def _serialise_row(self, row: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
-        for key, value in list(row.items()):
-            row[key] = _serialise_value(value)
-        return row
-
-    def _build_stage1_key(self, row: Mapping[str, Any]) -> tuple[Any, ...]:
-        return tuple(row.get(field) for field in _STAGE1_KEY_FIELDS)
-
-    def _build_context(self, row: Mapping[str, Any]) -> Mapping[str, Any]:
-        context = {field: row.get(field) for field in _REQUIRED_CONTEXT_FIELDS}
-        context["asin_priority"] = row.get("asin_priority", 0)
-        return context
-
-    def _invoke_with_retries(
-        self,
-        facts: Mapping[str, Any],
-        *,
-        schema: Mapping[str, Any],
-        prompt: str,
-        max_attempts: int,
-    ) -> Mapping[str, Any]:
-        attempts = 0
-        last_error: Exception | None = None
-        payload = facts
-        while attempts < max_attempts:
-            attempts += 1
-            config = LLMRunConfig(
-                prompt=prompt,
-                facts=payload,
-                schema=schema,
-                model=self._config.llm.model,
-                temperature=self._config.llm.temperature,
-                response_format=self._config.llm.response_format,
-                top_p=self._config.llm.top_p,
-            )
-            try:
-                return self._llm.run(config, retry=False)
-            except Exception as exc:  # pragma: no cover - aggregated error handling
-                last_error = exc
-                LOGGER.warning(
-                    "competition_llm.llm_retry attempt=%s max_attempts=%s error=%s",
-                    attempts,
-                    max_attempts,
-                    exc,
-                )
-                if attempts >= max_attempts:
-                    break
-                payload = dict(facts)
-                payload["validation_error"] = str(exc)
-        if last_error:
-            raise last_error
-        raise RuntimeError("LLM invocation failed without exception")
-
-    def _validate_stage2_machine_json(self, payload: Mapping[str, Any]) -> None:
-        validate_schema(self._stage2_schema, payload)
-        actions = payload.get("recommended_actions", [])
-        for action in actions:
-            code = action.get("action_code")
-            if self._config.stage_2.allowed_action_codes and code not in self._config.stage_2.allowed_action_codes:
-                raise ValueError(f"Action code {code!r} is not permitted")
-        root_causes = payload.get("root_causes", [])
-        for cause in root_causes:
-            code = cause.get("root_cause_code")
-            if self._config.stage_2.allowed_root_cause_codes and code not in self._config.stage_2.allowed_root_cause_codes:
-                raise ValueError(f"Root cause code {code!r} is not permitted")
+    def _finalise_top_opps(self, bucket: Mapping[str, dict[str, Any]]) -> list[Mapping[str, Any]]:
+        if not bucket:
+            return []
+        ordered = sorted(bucket.values(), key=lambda item: item.get("impact", 0.0), reverse=True)
+        return [item.get("row", {}) for item in ordered]
 
 
 _OVERVIEW_METRIC_CONFIG: Mapping[str, Mapping[str, Sequence[tuple[str, str]]]] = {
@@ -898,6 +1079,87 @@ _COMPARISON_METRIC_KEYS: Mapping[str, Sequence[str]] = {
 }
 
 
+def _severity_from_rank(rank: int) -> str:
+    if rank >= _SEVERITY_ORDER["high"]:
+        return "high"
+    if rank >= _SEVERITY_ORDER["mid"]:
+        return "mid"
+    return "low"
+
+
+def _stage2_cache_key(context: Mapping[str, Any], lag_type: str, opp_type: str, channel: str) -> tuple[Any, ...]:
+    return (
+        channel,
+        lag_type,
+        opp_type,
+        context.get("scene_tag"),
+        context.get("base_scene"),
+        context.get("morphology"),
+        context.get("marketplace_id"),
+        context.get("week"),
+        context.get("sunday"),
+        context.get("my_asin"),
+    )
+
+
+def _compare(value: float, threshold: float, comparator: str) -> bool:
+    func = _COMPARATOR_FUNCS.get(comparator)
+    if func is None:
+        return False
+    return func(value, threshold)
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            match = re.search(r"-?\d+(?:\.\d+)?", value)
+            if match:
+                try:
+                    return float(match.group())
+                except ValueError:
+                    return None
+    return None
+
+
+def _compute_top_impact(lag_type: str, row: Mapping[str, Any]) -> float:
+    score = _coerce_float(row.get("score"))
+    if score is not None:
+        return score
+    metric_key = None
+    if lag_type == "price":
+        metric_key = "price_gap_each"
+    elif lag_type == "rank":
+        metric_key = "rank_pos_delta"
+    elif lag_type == "content":
+        metric_key = "content_gap_each"
+    elif lag_type == "social":
+        metric_key = "social_gap_each"
+    elif lag_type == "badge":
+        metric_key = "badge_delta_sum"
+    elif lag_type == "confidence":
+        metric_key = "confidence"
+    elif lag_type == "traffic_mix":
+        metric_key = "ad_to_natural_gap_each"
+    elif lag_type == "keyword":
+        my_share = _coerce_float(row.get("my_kw_top3_share_7d_avg"))
+        opp_share = _coerce_float(row.get("opp_kw_top3_share_7d_avg"))
+        if my_share is not None and opp_share is not None:
+            return abs(my_share - opp_share)
+    if metric_key:
+        metric_value = _coerce_float(row.get(metric_key))
+        if metric_value is not None:
+            return abs(metric_value)
+    return 0.0
+
+
 def _compose_overview_summary(
     overview: Mapping[str, Any], metrics: Sequence[tuple[str, str]]
 ) -> Mapping[str, Any]:
@@ -919,8 +1181,8 @@ def _build_comparison_reasons(
     reasons: list[Mapping[str, Any]] = []
     if not top_rows:
         return reasons
-    keys = _COMPARISON_METRIC_KEYS.get(lag_type, ("score",))
-    for row in top_rows[:3]:
+    keys = _COMPARISON_METRIC_KEYS.get(lag_type, ())
+    for row in top_rows:
         metrics = {key: row.get(key) for key in keys if key in row}
         if "score" in row and "score" not in metrics:
             metrics["score"] = row.get("score")
@@ -992,6 +1254,7 @@ def _format_opp_label(row: Mapping[str, Any]) -> str:
         return f"{opp_parent} {opp_asin}"
     return str(opp_asin)
 
+
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
@@ -1011,6 +1274,6 @@ def _serialise_value(value: Any) -> Any:
 __all__ = [
     "CompetitionLLMOrchestrator",
     "CompetitionRunResult",
-    "StageOneLLMResult",
-    "StageTwoLLMResult",
+    "StageOneResult",
+    "StageTwoAggregateResult",
 ]
