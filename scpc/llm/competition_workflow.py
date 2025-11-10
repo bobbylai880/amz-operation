@@ -102,6 +102,7 @@ _STAGE2_GROUP_FIELDS = (
 
 _PAGE_LAG_TYPES = {"price", "rank", "content", "social", "badge", "confidence"}
 _TRAFFIC_LAG_TYPES = {"traffic_mix", "keyword"}
+_PAIRWISE_ONLY_LAG_TYPES = {"rank", "content", "social", "keyword"}
 
 _LAG_TYPE_FILENAME_ALIASES: Mapping[str, str] = {
     "price": "pricing",
@@ -1062,7 +1063,7 @@ class CompetitionLLMOrchestrator:
                 max_attempts=self._config.stage_2.max_retries,
             )
             machine_json = llm_response.get("machine_json")
-            human_markdown = llm_response.get("human_markdown")
+            human_markdown_raw = llm_response.get("human_markdown")
             if not isinstance(machine_json, Mapping):
                 raise ValueError("Stage-2 machine_json missing or invalid")
             machine_json = dict(machine_json)
@@ -1070,8 +1071,12 @@ class CompetitionLLMOrchestrator:
                 machine_json["context"] = facts.get("context", {})
             machine_json = self._materialize_evidence(machine_json, facts)
             self._validate_stage2_machine_json(machine_json)
-            if not isinstance(human_markdown, str):
-                raise ValueError("Stage-2 human_markdown must be a string")
+            if not isinstance(human_markdown_raw, str):
+                LOGGER.debug(
+                    "competition_llm.stage2_markdown_non_string type=%s",
+                    type(human_markdown_raw).__name__,
+                )
+            human_markdown = self._render_stage2_diff_markdown(machine_json, facts)
             outputs.append(
                 StageTwoAggregateResult(
                     context=facts.get("context", {}),
@@ -1433,6 +1438,128 @@ class CompetitionLLMOrchestrator:
 
         return "\n".join(lines) + "\n"
 
+    def _render_stage2_diff_markdown(
+        self,
+        machine_json: Mapping[str, Any],
+        facts: Mapping[str, Any] | None,
+    ) -> str:
+        root_causes = machine_json.get("root_causes")
+        if not isinstance(root_causes, Sequence) or not root_causes:
+            return "# 差异点与对比对象\n\n- 暂无证据\n"
+
+        row_index = self._build_evidence_row_index(facts or {})
+        lines: list[str] = ["# 差异点与对比对象", ""]
+
+        for cause in root_causes:
+            if not isinstance(cause, Mapping):
+                continue
+            title = str(
+                cause.get("summary")
+                or cause.get("root_cause_code")
+                or cause.get("lag_dimension")
+                or "差异"
+            )
+            lines.append(f"## {title}")
+            evidence_items = cause.get("evidence")
+            formatted: list[str] = []
+            if isinstance(evidence_items, Sequence):
+                for item in evidence_items:
+                    if not isinstance(item, Mapping):
+                        continue
+                    text = self._format_evidence_markdown_line(item, row_index)
+                    if text:
+                        formatted.append(text)
+            if not formatted:
+                lines.append("- 暂无证据")
+            else:
+                for text in formatted:
+                    lines.append(f"- {text}")
+            lines.append("")
+
+        return "\n".join(lines).strip() + "\n"
+
+    def _build_evidence_row_index(
+        self, facts: Mapping[str, Any]
+    ) -> Mapping[str, Mapping[str, Any]]:
+        if not isinstance(facts, Mapping):
+            return {}
+        lag_items = facts.get("lag_items")
+        if not isinstance(lag_items, Sequence):
+            return {}
+        index: dict[str, Mapping[str, Any]] = {}
+        for item in lag_items:
+            if not isinstance(item, Mapping):
+                continue
+            top_opps = item.get("top_opps")
+            if not isinstance(top_opps, Sequence):
+                continue
+            for row in top_opps:
+                if not isinstance(row, Mapping):
+                    continue
+                opp_asin = str(row.get("opp_asin") or "").strip()
+                if not opp_asin:
+                    continue
+                index.setdefault(opp_asin, row)
+        return index
+
+    def _format_evidence_markdown_line(
+        self,
+        evidence: Mapping[str, Any],
+        row_index: Mapping[str, Mapping[str, Any]],
+    ) -> str | None:
+        metric = str(evidence.get("metric") or "").strip()
+        against = str(evidence.get("against") or "").strip().lower()
+        my_value = evidence.get("my_value")
+        opp_value = evidence.get("opp_value")
+        if not metric or my_value is None or opp_value is None:
+            return None
+
+        if against != "asin":
+            if against == "leader":
+                label = "领先者"
+            elif against == "median":
+                label = "中位数"
+            else:
+                label = "对手"
+            my_text = _format_metric_value(my_value)
+            opp_text = _format_metric_value(opp_value)
+            return f"{metric}：我方 {my_text} / {label} {opp_text}"
+
+        opp_asin = str(evidence.get("opp_asin") or "").strip()
+        base_row: Mapping[str, Any]
+        row = row_index.get(opp_asin)
+        if isinstance(row, Mapping):
+            temp_row = dict(row)
+        else:
+            temp_row = {}
+        if opp_asin and "opp_asin" not in temp_row:
+            temp_row["opp_asin"] = opp_asin
+        base_row = temp_row
+
+        note = evidence.get("note")
+        if isinstance(note, str) and note.strip():
+            return note.strip()
+
+        formatter_map: Mapping[str, Callable[[Any, Any, Mapping[str, Any]], str]] = {
+            "rank_leaf": _format_rank_leaf_note,
+            "rank_pos_pct": _format_rank_pct_note,
+            "image_cnt": _format_image_note,
+            "video_cnt": _format_video_note,
+            "content_score": _format_content_score_note,
+            "rating": _format_rating_note,
+            "reviews": _format_reviews_note,
+            "social_proof": _format_social_proof_note,
+        }
+
+        formatter = formatter_map.get(metric)
+        if formatter:
+            return formatter(my_value, opp_value, base_row)
+
+        label = _format_opponent_display_label(base_row)
+        my_text = _format_metric_value(my_value)
+        opp_text = _format_metric_value(opp_value)
+        return f"{metric}：我方 {my_text} / 对手({label}) {opp_text}"
+
     def _resolve_week(self, week: str | None, marketplace_id: str | None) -> str:
         if week:
             return week
@@ -1763,8 +1890,11 @@ class CompetitionLLMOrchestrator:
                         lag_data = lag_index.get(hinted_type)
                         break
 
+            pairwise_only = lag_type in _PAIRWISE_ONLY_LAG_TYPES
             if lag_data is not None:
                 for hint in hints:
+                    if pairwise_only and str(hint.get("kind") or "").lower() == "overview":
+                        continue
                     raw_evidence.extend(
                         self._build_evidence_from_hint(lag_index, lag_type, hint)
                     )
@@ -1774,7 +1904,7 @@ class CompetitionLLMOrchestrator:
                         self._extract_pairwise_evidence(lag_type, lag_data)
                     )
 
-                if not raw_evidence:
+                if not raw_evidence and not pairwise_only:
                     raw_evidence.extend(
                         self._extract_overview_evidence(lag_type, lag_data)
                     )
@@ -1818,6 +1948,8 @@ class CompetitionLLMOrchestrator:
         opp_type = hint.get("opp_type")
         opp_asin = hint.get("opp_asin")
         if kind == "overview":
+            if lag_type in _PAIRWISE_ONLY_LAG_TYPES:
+                return []
             return self._extract_overview_evidence(
                 lag_type,
                 lag_data,
@@ -1993,7 +2125,7 @@ class CompetitionLLMOrchestrator:
         *,
         metric: Any = None,
         opp_asin: Any = None,
-        limit: int = 3,
+        limit: int | None = None,
     ) -> list[Mapping[str, Any]]:
         rows = lag_data.get("top_opps")
         if not isinstance(rows, Sequence):
@@ -2021,10 +2153,11 @@ class CompetitionLLMOrchestrator:
                 candidates.append((priority, impact, payload))
 
         ordered = sorted(candidates, key=lambda item: (item[0], -abs(item[1])))
+        effective_limit = limit if limit is not None else (4 if lag_type == "rank" else 3)
         results: list[Mapping[str, Any]] = []
         for _, _, entry in ordered:
             results.append(entry)
-            if len(results) >= limit:
+            if len(results) >= effective_limit:
                 break
         return results
 
@@ -2163,6 +2296,7 @@ class CompetitionLLMOrchestrator:
             my_share = pair.get("my_share")
             opp_share = pair.get("opp_share")
             note = _format_keyword_note(
+                row,
                 keyword,
                 my_rank,
                 opp_rank,
@@ -2420,6 +2554,10 @@ class CompetitionLLMOrchestrator:
                 updated.pop("evidence_refs", None)
                 root_causes[index] = updated
 
+        mutable_payload["actions"] = []
+        if "recommended_actions" in mutable_payload:
+            mutable_payload["recommended_actions"] = []
+
         validate_schema(self._stage2_schema, mutable_payload)
 
     def _build_page_evidence(
@@ -2654,7 +2792,7 @@ class CompetitionLLMOrchestrator:
             "week": week,
             "asin": asin,
         }
-        sql = """
+        sql_full = """
           SELECT brand, payload
           FROM bi_amz_asin_product_snapshot
           WHERE marketplace_id=:marketplace_id
@@ -2662,24 +2800,51 @@ class CompetitionLLMOrchestrator:
             AND asin=:asin
           LIMIT 1
         """
+        row: Mapping[str, Any] | None = None
+        payload: Any | None = None
+        need_payload_query = False
         try:
-            row = self._fetch_one(sql, params)
+            row = self._fetch_one(sql_full, params)
         except SQLAlchemyError as exc:  # pragma: no cover - optional table
             LOGGER.debug(
                 "competition_llm.stage2_brand_lookup_failed asin=%s error=%s",
                 asin,
                 exc,
             )
-            row = None
+            need_payload_query = True
 
-        if not row:
-            return None
+        if row:
+            brand_value = row.get("brand")
+            if isinstance(brand_value, str) and brand_value.strip():
+                return brand_value.strip()
+            payload = row.get("payload")
+            if payload in (None, ""):
+                payload = None
+                need_payload_query = True
+        else:
+            need_payload_query = True
 
-        brand_value = row.get("brand")
-        if isinstance(brand_value, str) and brand_value.strip():
-            return brand_value.strip()
+        if need_payload_query:
+            sql_payload_only = """
+              SELECT payload
+              FROM bi_amz_asin_product_snapshot
+              WHERE marketplace_id=:marketplace_id
+                AND week=:week
+                AND asin=:asin
+              LIMIT 1
+            """
+            try:
+                payload_row = self._fetch_one(sql_payload_only, params)
+            except SQLAlchemyError as exc:  # pragma: no cover - optional table
+                LOGGER.debug(
+                    "competition_llm.stage2_brand_payload_lookup_failed asin=%s error=%s",
+                    asin,
+                    exc,
+                )
+                payload_row = None
+            if payload_row:
+                payload = payload_row.get("payload")
 
-        payload = row.get("payload")
         if payload in (None, ""):
             return None
         if isinstance(payload, (bytes, bytearray)):
@@ -3275,9 +3440,18 @@ def _format_percentage_text(value: Any) -> str:
     return f"{number * 100:.2f}%"
 
 
-def _format_rank_leaf_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+def _format_opponent_display_label(row: Mapping[str, Any] | None) -> str:
+    if not isinstance(row, Mapping):
+        row = {}
+    return _format_opp_label(row)
+
+
+def _format_rank_leaf_note(my_value: Any, opp_value: Any, row: Mapping[str, Any]) -> str:
+    label = _format_opponent_display_label(row)
     my_text = _format_integer_text(my_value)
     opp_text = _format_integer_text(opp_value)
+    my_display = my_text if my_text == "缺失" else f"{my_text} 位"
+    opp_display = opp_text if opp_text == "缺失" else f"{opp_text} 位"
     my_num = _coerce_float(my_value)
     opp_num = _coerce_float(opp_value)
     gap_text = ""
@@ -3285,11 +3459,12 @@ def _format_rank_leaf_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) 
         gap = my_num - opp_num
         if abs(gap) >= 1:
             direction = "落后" if gap > 0 else "领先"
-            gap_text = f"，{direction} {abs(int(round(gap)))} 位"
-    return f"类目排名：我方 {my_text}，对手 {opp_text}{gap_text}"
+            gap_text = f"（{direction} {abs(int(round(gap)))} 位）"
+    return f"排名：我方 {my_display} / 对手({label}) {opp_display}{gap_text}"
 
 
-def _format_rank_pct_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+def _format_rank_pct_note(my_value: Any, opp_value: Any, row: Mapping[str, Any]) -> str:
+    label = _format_opponent_display_label(row)
     my_text = _format_percentage_text(my_value)
     opp_text = _format_percentage_text(opp_value)
     my_num = _coerce_float(my_value)
@@ -3299,21 +3474,26 @@ def _format_rank_pct_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -
         gap = my_num - opp_num
         if abs(gap) >= 0.005:
             direction = "落后" if gap > 0 else "领先"
-            gap_text = f"，{direction} {abs(gap) * 100:.2f}%"
-    return f"排名百分位：我方 {my_text}，对手 {opp_text}{gap_text}"
+            gap_text = f"（{direction} {abs(gap) * 100:.2f}%）"
+    return f"排名百分位：我方 {my_text} / 对手({label}) {opp_text}{gap_text}"
 
 
-def _format_image_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
-    return _format_count_note("图片数", my_value, opp_value, "张")
+def _format_image_note(my_value: Any, opp_value: Any, row: Mapping[str, Any]) -> str:
+    return _format_count_note("图片", my_value, opp_value, "张", row)
 
 
-def _format_video_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
-    return _format_count_note("视频数", my_value, opp_value, "个")
+def _format_video_note(my_value: Any, opp_value: Any, row: Mapping[str, Any]) -> str:
+    return _format_count_note("视频", my_value, opp_value, "个", row)
 
 
-def _format_count_note(label: str, my_value: Any, opp_value: Any, unit: str) -> str:
+def _format_count_note(
+    label: str, my_value: Any, opp_value: Any, unit: str, row: Mapping[str, Any]
+) -> str:
+    label_text = _format_opponent_display_label(row)
     my_text = _format_integer_text(my_value)
     opp_text = _format_integer_text(opp_value)
+    my_display = my_text if my_text == "缺失" else f"{my_text} {unit}"
+    opp_display = opp_text if opp_text == "缺失" else f"{opp_text} {unit}"
     my_num = _coerce_float(my_value)
     opp_num = _coerce_float(opp_value)
     gap_text = ""
@@ -3321,46 +3501,49 @@ def _format_count_note(label: str, my_value: Any, opp_value: Any, unit: str) -> 
         gap = opp_num - my_num
         if abs(gap) >= 1:
             if gap > 0:
-                gap_text = f"，缺少 {int(round(abs(gap)))}{unit}"
+                gap_text = f"（缺少 {int(round(abs(gap)))}{unit}）"
             else:
-                gap_text = f"，多出 {int(round(abs(gap)))}{unit}"
-    return f"{label}：我方 {my_text}，对手 {opp_text}{gap_text}"
+                gap_text = f"（多出 {int(round(abs(gap)))}{unit}）"
+    return f"{label}：我方 {my_display} / 对手({label_text}) {opp_display}{gap_text}"
 
 
 def _format_content_score_note(
-    my_value: Any, opp_value: Any, _: Mapping[str, Any]
+    my_value: Any, opp_value: Any, row: Mapping[str, Any]
 ) -> str:
+    label = _format_opponent_display_label(row)
     my_text = _format_decimal_text(my_value)
     opp_text = _format_decimal_text(opp_value)
     gap = _compute_pair_gap(my_value, opp_value)
-    gap_text = f"，差距 {gap:.2f}" if gap >= 0.01 else ""
-    return f"内容得分：我方 {my_text}，对手 {opp_text}{gap_text}"
+    gap_text = f"（差距 {gap:.2f}）" if gap >= 0.01 else ""
+    return f"内容得分：我方 {my_text} / 对手({label}) {opp_text}{gap_text}"
 
 
-def _format_rating_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+def _format_rating_note(my_value: Any, opp_value: Any, row: Mapping[str, Any]) -> str:
+    label = _format_opponent_display_label(row)
     my_text = _format_decimal_text(my_value)
     opp_text = _format_decimal_text(opp_value)
     gap = _compute_pair_gap(my_value, opp_value)
-    gap_text = f"，相差 {gap:.2f}" if gap >= 0.01 else ""
-    return f"评分：我方 {my_text}，对手 {opp_text}{gap_text}"
+    gap_text = f"（相差 {gap:.2f}）" if gap >= 0.01 else ""
+    return f"评分：我方 {my_text} / 对手({label}) {opp_text}{gap_text}"
 
 
-def _format_reviews_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
-    note = _format_count_note("评论数", my_value, opp_value, "条")
-    return note
+def _format_reviews_note(my_value: Any, opp_value: Any, row: Mapping[str, Any]) -> str:
+    return _format_count_note("评论", my_value, opp_value, "条", row)
 
 
 def _format_social_proof_note(
-    my_value: Any, opp_value: Any, _: Mapping[str, Any]
+    my_value: Any, opp_value: Any, row: Mapping[str, Any]
 ) -> str:
+    label = _format_opponent_display_label(row)
     my_text = _format_decimal_text(my_value)
     opp_text = _format_decimal_text(opp_value)
     gap = _compute_pair_gap(my_value, opp_value)
-    gap_text = f"，差距 {gap:.2f}" if gap >= 0.01 else ""
-    return f"社交证明：我方 {my_text}，对手 {opp_text}{gap_text}"
+    gap_text = f"（差距 {gap:.2f}）" if gap >= 0.01 else ""
+    return f"社交证明：我方 {my_text} / 对手({label}) {opp_text}{gap_text}"
 
 
 def _format_keyword_note(
+    row: Mapping[str, Any],
     keyword: str,
     my_rank: Any,
     opp_rank: Any,
@@ -3368,7 +3551,8 @@ def _format_keyword_note(
     opp_share: Any,
     tag: Any,
 ) -> str:
-    my_rank_text = f"TOP{int(my_rank)}" if my_rank is not None else "无"
+    label = _format_opponent_display_label(row)
+    my_rank_text = f"TOP{int(my_rank)}" if my_rank is not None else "无排名"
     opp_rank_text = f"TOP{int(opp_rank)}" if opp_rank is not None else "缺失"
     my_share_text = _format_percentage_text(my_share)
     opp_share_text = _format_percentage_text(opp_share)
@@ -3376,8 +3560,8 @@ def _format_keyword_note(
     if tag:
         keyword_label = f"{keyword_label}（{tag}）"
     return (
-        f"关键词 {keyword_label}：我方{my_rank_text}，对手{opp_rank_text}；"
-        f"7天份额 我方{my_share_text} 对手{opp_share_text}"
+        f"关键词「{keyword_label}」：我方 {my_rank_text} ({my_share_text}) / "
+        f"对手({label}) {opp_rank_text} ({opp_share_text})"
     )
 
 
