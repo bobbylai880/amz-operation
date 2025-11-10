@@ -42,10 +42,21 @@ class StubLLM:
                 "root_causes": [
                     {
                         "description": "pricing misalignment",
-                        "evidence_refs": ["metrics.price_gap_pct"],
+                        "summary": "价格指数偏高，净价落后",
+                        "evidence": [
+                            {
+                                "metric": "price_index_med",
+                                "against": "median",
+                                "my_value": 1.2,
+                                "opp_value": 1.0,
+                                "unit": "ratio",
+                                "source": "page.overview",
+                            }
+                        ],
                         "is_root": True,
                         "is_partial": False,
                         "root_cause_code": "pricing_misalignment",
+                        "priority": 1,
                         "owner": "pricing",
                     }
                 ],
@@ -677,10 +688,20 @@ def test_stage2_validation_enforces_allowed_codes(sqlite_engine, tmp_path):
         "root_causes": [
             {
                 "description": "pricing issue",
-                "evidence_refs": ["metrics.price_gap_pct"],
+                "summary": "价格指数偏高",
+                "evidence": [
+                    {
+                        "metric": "price_index_med",
+                        "against": "median",
+                        "my_value": 1.3,
+                        "opp_value": 1.0,
+                        "unit": "ratio",
+                    }
+                ],
                 "is_root": True,
                 "is_partial": False,
                 "root_cause_code": "pricing_misalignment",
+                "priority": 1,
             }
         ],
         "actions": [
@@ -724,8 +745,14 @@ def test_stage2_validation_drops_missing_code_actions(sqlite_engine, tmp_path):
             {
                 "root_cause_code": "pricing_misalignment",
                 "summary": "价格与竞品差距显著",
-                "evidence_refs": [
-                    {"lag_type": "price", "opp_type": "leader", "metric": "price_gap_pct", "value": 0.12}
+                "evidence": [
+                    {
+                        "metric": "price_index_med",
+                        "against": "median",
+                        "my_value": 1.25,
+                        "opp_value": 1.0,
+                        "unit": "ratio",
+                    }
                 ],
                 "priority": 1,
             }
@@ -745,3 +772,60 @@ def test_stage2_validation_drops_missing_code_actions(sqlite_engine, tmp_path):
     orchestrator._validate_stage2_machine_json(payload)
 
     assert payload["actions"] == []
+
+
+def test_materialize_evidence_converts_legacy_refs(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    facts = {
+        "lag_items": [
+            {
+                "lag_type": "pricing",
+                "overview": {"median": {"price_index_med": 1.8}},
+                "top_opps": [
+                    {
+                        "opp_asin": "B099999",
+                        "my_price_net": 16.99,
+                        "opp_price_net": 12.99,
+                    }
+                ],
+            }
+        ]
+    }
+    machine_json = {
+        "context": {"my_asin": "B012345"},
+        "lag_type": "mixed",
+        "root_causes": [
+            {
+                "root_cause_code": "pricing_misalignment",
+                "summary": "价格指数偏高",
+                "priority": 1,
+                "evidence_refs": [
+                    {
+                        "lag_type": "price",
+                        "opp_type": "median",
+                        "metric": "price_index_med",
+                        "value": 1.8,
+                    }
+                ],
+            }
+        ],
+        "actions": [],
+    }
+
+    result = orchestrator._materialize_evidence(machine_json, facts)
+    root_causes = result["root_causes"]
+    assert root_causes
+    evidence = root_causes[0].get("evidence")
+    assert evidence
+    first = evidence[0]
+    assert first["metric"] == "price_index_med"
+    assert first["against"] == "median"
+    assert first["opp_value"] == 1.0
+    assert "evidence_refs" not in root_causes[0]

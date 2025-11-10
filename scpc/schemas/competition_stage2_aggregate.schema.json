@@ -11,7 +11,7 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["root_cause_code", "summary", "evidence_refs", "priority"],
+        "required": ["root_cause_code", "summary", "evidence", "priority"],
         "properties": {
           "root_cause_code": { "type": "string" },
           "summary": { "type": "string" },
@@ -31,6 +31,25 @@
           "related_opp_asins": {
             "type": "array",
             "items": { "type": "string" }
+          },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["metric", "against", "my_value", "opp_value"],
+              "properties": {
+                "metric": { "type": "string" },
+                "against": { "type": "string", "enum": ["leader", "median", "asin"] },
+                "my_value": { "type": ["number", "string"] },
+                "opp_value": { "type": ["number", "string"] },
+                "unit": { "type": ["string", "null"] },
+                "source": { "type": ["string", "null"] },
+                "opp_asin": { "type": ["string", "null"] },
+                "note": { "type": ["string", "null"] }
+              },
+              "additionalProperties": false
+            }
           },
           "evidence_refs": {
             "type": "array",
