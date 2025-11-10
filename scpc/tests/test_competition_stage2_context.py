@@ -12,7 +12,7 @@ def test_ensure_stage2_context_preserves_existing_context():
         "context": {"my_asin": "B001"},
         "lag_type": "mixed",
         "root_causes": [],
-        "recommended_actions": [],
+        "actions": [],
     }
     fallback = {"my_asin": "B002"}
 
@@ -26,7 +26,7 @@ def test_ensure_stage2_context_injects_fallback_when_missing():
     machine_json = {
         "lag_type": "mixed",
         "root_causes": [],
-        "recommended_actions": [],
+        "actions": [],
     }
     fallback = {"my_asin": "B003", "week": "2025-W01"}
 
@@ -40,7 +40,7 @@ def test_ensure_stage2_context_handles_non_mapping_fallback():
     machine_json = {
         "lag_type": "mixed",
         "root_causes": [],
-        "recommended_actions": [],
+        "actions": [],
     }
 
     result = _ensure_stage2_context(machine_json, None)

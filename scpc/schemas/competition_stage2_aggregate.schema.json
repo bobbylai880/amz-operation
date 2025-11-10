@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Competition Stage-2 Aggregate Output",
   "type": "object",
-  "required": ["context", "lag_type", "root_causes", "recommended_actions"],
+  "required": ["context", "lag_type", "root_causes", "actions"],
   "properties": {
     "context": { "type": "object" },
     "lag_type": { "type": "string", "enum": ["mixed"] },
@@ -11,17 +11,45 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["root_cause_code", "summary", "evidence_refs", "priority"],
+        "required": ["root_cause_code", "summary", "evidence", "priority"],
         "properties": {
           "root_cause_code": { "type": "string" },
           "summary": { "type": "string" },
           "lag_dimension": {
             "type": "string",
-            "enum": ["price", "rank", "content", "social", "badge", "traffic_mix", "keyword", "confidence"]
+            "enum": [
+              "price",
+              "rank",
+              "content",
+              "social",
+              "badge",
+              "traffic_mix",
+              "keyword",
+              "confidence"
+            ]
           },
           "related_opp_asins": {
             "type": "array",
             "items": { "type": "string" }
+          },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["metric", "against", "my_value", "opp_value"],
+              "properties": {
+                "metric": { "type": "string" },
+                "against": { "type": "string", "enum": ["leader", "median", "asin"] },
+                "my_value": { "type": ["number", "string"] },
+                "opp_value": { "type": ["number", "string"] },
+                "unit": { "type": ["string", "null"] },
+                "source": { "type": ["string", "null"] },
+                "opp_asin": { "type": ["string", "null"] },
+                "note": { "type": ["string", "null"] }
+              },
+              "additionalProperties": false
+            }
           },
           "evidence_refs": {
             "type": "array",
@@ -40,21 +68,36 @@
         }
       }
     },
-    "recommended_actions": {
+    "actions": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {
         "type": "object",
-        "required": ["action_code", "rationale", "priority"],
+        "required": ["code", "why", "how", "expected_impact", "owner", "due_weeks"],
         "properties": {
-          "action_code": { "type": "string" },
-          "rationale": { "type": "string" },
-          "priority": { "type": "integer", "minimum": 1 },
-          "target": { "type": "string" },
-          "expected_impact": { "type": "string" }
+          "code": { "type": "string" },
+          "why": { "type": "string" },
+          "how": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            ]
+          },
+          "expected_impact": { "type": "string" },
+          "owner": { "type": "string" },
+          "due_weeks": { "type": "integer", "minimum": 0 },
+          "priority": { "type": "integer", "minimum": 1 }
         }
       }
     },
-    "top_opp_asins_csv": { "type": "string" }
-  }
+    "top_opp_asins_csv": { "type": "string" },
+    "recommended_actions": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  },
+  "additionalProperties": true
 }
