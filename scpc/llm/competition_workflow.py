@@ -1899,10 +1899,12 @@ class CompetitionLLMOrchestrator:
                         self._build_evidence_from_hint(lag_index, lag_type, hint)
                     )
 
-                if not raw_evidence:
-                    raw_evidence.extend(
-                        self._extract_pairwise_evidence(lag_type, lag_data)
-                    )
+                pairwise_entries = self._extract_pairwise_evidence(lag_type, lag_data)
+                if pairwise_only:
+                    if pairwise_entries:
+                        raw_evidence = list(pairwise_entries) + list(raw_evidence)
+                elif not raw_evidence:
+                    raw_evidence.extend(pairwise_entries)
 
                 if not raw_evidence and not pairwise_only:
                     raw_evidence.extend(
@@ -1926,7 +1928,8 @@ class CompetitionLLMOrchestrator:
                     hints,
                 )
 
-            entry["evidence"] = normalised[:3]
+            limit = 4 if lag_type == "rank" else 3
+            entry["evidence"] = normalised[:limit]
             entry.pop("evidence_refs", None)
             cleaned_causes.append(entry)
 
