@@ -1129,9 +1129,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Execute the competition LLM workflow after compare outputs",
     )
     parser.add_argument(
-        "--llm-only",
-        action="store_true",
-        help="Skip ETL/compare and only run the competition LLM workflow",
+        "--llm-stage",
+        choices=("both", "stage1", "stage2"),
+        default="both",
+        help="Select which LLM stages to execute when running the competition workflow (default: both)",
     )
     parser.add_argument(
         "--llm-config",
@@ -1167,16 +1168,11 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     try:
         engine = create_doris_engine()
-        llm_only = args.llm_only
-        with_llm = args.with_llm or llm_only
+        with_llm = args.with_llm
         compare_only = args.compare_only
 
-        if llm_only and compare_only:
-            LOGGER.info("competition_pipeline_llm_only_overrides_compare")
-            compare_only = False
-
         with_compare = args.with_compare or compare_only
-        if with_llm and not llm_only:
+        if with_llm:
             with_compare = True
 
         resolved_week = args.week
@@ -1214,8 +1210,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     resolved_week,
                 )
 
-        run_features = not compare_only and not llm_only
-        run_compare = with_compare and not llm_only
+        run_features = not compare_only
+        run_compare = with_compare
 
         feature_results: dict[str, pd.DataFrame] | None = None
         if run_features:
@@ -1257,9 +1253,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                     storage_root=args.llm_storage_root,
                 )
                 target_week = resolved_week or args.week
+                if args.llm_stage == "both":
+                    stage_selection: Sequence[str] | None = ("stage1", "stage2")
+                else:
+                    stage_selection = (args.llm_stage,)
                 result = competition_orchestrator.run(
                     target_week,
                     marketplace_id=args.mk,
+                    stages=stage_selection,
                 )
                 LOGGER.info(
                     "competition_pipeline_llm_completed week=%s stage1=%s stage2_candidates=%s stage2=%s storage=%s",

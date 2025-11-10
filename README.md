@@ -244,22 +244,24 @@ WHERE marketplace_id = 'US' AND week = '2025W44';
 完成 Compare 之后，可以直接在同一 CLI 中触发 Stage-1/Stage-2 LLM 编排。命令新增以下参数：
 
 - `--with-llm`：在特征 + Compare 结束后继续执行 LLM 阶段；
-- `--llm-only`：跳过清洗/特征/Compare，直接消费既有 `vw_amz_comp_llm_overview*` 视图并运行 LLM，两者互斥；
+- `--llm-stage`：控制执行阶段，可选 `stage1`/`stage2`/`both`（默认 `both`），当选择 `stage2` 时会自动串行跑完 Stage-1 以构建候选；
 - `--llm-config`：覆盖默认的 `configs/competition_llm.yaml` 配置（阈值、模型、重试策略）；
 - `--llm-storage-root`：指定 Stage-1/Stage-2 JSON 产出的持久化目录（默认 `storage/competition_llm`）。
 
-示例：仅运行 LLM 编排并将结果写入 `storage/competition_llm/2025W10/`：
+示例：Compare 已入库，仅重跑 LLM 并将结果写入 `storage/competition_llm/2025W10/`：
 
 ```bash
 python -m scpc.etl.competition_pipeline \
   --mk US \
   --week 2025W10 \
-  --llm-only \
+  --compare-only \
+  --with-llm \
+  --llm-stage stage2 \
   --llm-config configs/competition_llm.yaml \
   --llm-storage-root storage/competition_llm
 ```
 
-CLI 会基于配置文件加载 Stage-1 阈值、Stage-2 动作白名单与 DeepSeek 连接参数，依次请求 `vw_amz_comp_llm_overview` 与 `vw_amz_comp_llm_overview_traffic`，完成两阶段诊断后把 Schema 校验通过的 JSON 及 Markdown 输出存入目标目录。运行日志会记录每次提示、重试和跳过原因（如缺失 `llm_packet`）。
+CLI 会基于配置文件加载 Stage-1 阈值、Stage-2 动作白名单与 DeepSeek 连接参数，依次请求 `vw_amz_comp_llm_overview` 与 `vw_amz_comp_llm_overview_traffic`，完成所选阶段的诊断后把 Schema 校验通过的 JSON 及 Markdown 输出存入目标目录。每次向 LLM 发送请求前，系统会将实际使用的 Prompt+Facts 落盘到 `stage2/prompts/` 目录，便于复核与审计；运行日志会记录提示、重试和跳过原因（如缺失 `llm_packet`）。
 
 ## 目录结构
 ```

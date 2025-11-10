@@ -16,6 +16,7 @@ class StageOneConfig:
     opp_weight: float
     severity_thresholds: Mapping[str, float]
     max_retries: int = 2
+    rules_config_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -73,6 +74,10 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         "mid": float(stage1_severity_raw.get("mid", 1.0)),
     }
 
+    rules_config_path = stage1_raw.get("rules_config_path")
+    if isinstance(rules_config_path, str) and not rules_config_path.strip():
+        rules_config_path = None
+
     stage1 = StageOneConfig(
         thresholds=stage1_raw.get("thresholds", {}),
         conf_min=float(stage1_raw.get("conf_min", 0.6)),
@@ -80,6 +85,7 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         opp_weight=float(stage1_raw.get("opp_weight", 0.5)),
         severity_thresholds=severity_thresholds,
         max_retries=int(stage1_raw.get("max_retries", 2)),
+        rules_config_path=rules_config_path,
     )
 
     trigger_status_raw = stage2_raw.get("trigger_status")
