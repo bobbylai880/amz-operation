@@ -1,83 +1,13 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
+  "additionalProperties": false,
   "required": [
-    "scene_forecast",
-    "top_keywords_forecast",
     "confidence",
     "insufficient_data",
     "analysis_summary"
   ],
   "properties": {
-    "scene_forecast": {
-      "type": "object",
-      "required": ["weeks"],
-      "properties": {
-        "weeks": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 6,
-          "items": {
-            "type": "object",
-            "required": [
-              "year",
-              "week_num",
-              "start_date",
-              "direction",
-              "projected_vol",
-              "pct_change",
-              "pct_change_value"
-            ],
-            "properties": {
-              "year": {"type": "integer"},
-              "week_num": {"type": "integer"},
-              "start_date": {"type": "string", "format": "date"},
-              "direction": {"type": "string", "enum": ["up", "down", "flat"]},
-              "projected_vol": {"type": "number"},
-              "pct_change": {"type": "string"},
-              "pct_change_value": {"type": "number"}
-            }
-          }
-        }
-      }
-    },
-    "top_keywords_forecast": {
-      "type": "array",
-      "maxItems": 10,
-      "items": {
-        "type": "object",
-        "required": ["keyword", "weeks"],
-        "properties": {
-          "keyword": {"type": "string"},
-          "weeks": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 6,
-            "items": {
-              "type": "object",
-              "required": [
-                "year",
-                "week_num",
-                "start_date",
-                "direction",
-                "projected_vol",
-                "pct_change",
-                "pct_change_value"
-              ],
-              "properties": {
-                "year": {"type": "integer"},
-                "week_num": {"type": "integer"},
-                "start_date": {"type": "string", "format": "date"},
-                "direction": {"type": "string", "enum": ["up", "down", "flat"]},
-                "projected_vol": {"type": "number"},
-                "pct_change": {"type": "string"},
-                "pct_change_value": {"type": "number"}
-              }
-            }
-          }
-        }
-      }
-    },
     "confidence": {"type": "number"},
     "insufficient_data": {"type": "boolean"},
     "analysis_summary": {"type": "string", "minLength": 1, "maxLength": 400},
