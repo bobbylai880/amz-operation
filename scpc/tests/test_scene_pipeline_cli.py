@@ -1,4 +1,5 @@
 import json
+from datetime import date
 
 import pytest
 
@@ -28,6 +29,7 @@ def test_parse_args_strips_leading_space_tokens(monkeypatch):
     assert args.emit_json is False
     assert args.emit_md is False
     assert args.llm_only is False
+    assert args.write_summary is False
 
 
 def test_parse_args_llm_only_enables_with_llm():
@@ -40,6 +42,59 @@ def test_parse_args_llm_only_enables_with_llm():
 def test_parse_args_llm_only_conflicts_with_write():
     with pytest.raises(SystemExit):
         parse_args(["--scene", "S", "--mk", "US", "--llm-only", "--write"])
+
+
+def test_parse_args_write_summary_enables_with_llm():
+    args = parse_args(["--scene", "S", "--mk", "US", "--write-summary"])
+    assert args.with_llm is True
+    assert args.write_summary is True
+
+
+def test_main_writes_summary_to_db(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    features = pd.DataFrame(
+        {"year": [2024], "week_num": [12], "start_date": [pd.Timestamp("2024-03-17")]}  # Sunday
+    )
+    outputs = {"clean": pd.DataFrame(), "features": features, "drivers": pd.DataFrame()}
+
+    monkeypatch.setattr("scpc.etl.scene_pipeline.run_scene_pipeline", lambda *args, **kwargs: outputs)
+    monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: DummyEngine())
+    summary = {
+        "confidence": 0.81,
+        "insufficient_data": False,
+        "analysis_summary": "场景短期平稳，关注库存周转。",
+    }
+    monkeypatch.setattr("scpc.etl.scene_pipeline.summarize_scene", lambda **kwargs: summary)
+    monkeypatch.setattr("scpc.etl.scene_pipeline._resolve_llm_metadata", lambda: ("deepseek-pro", "v1.0"))
+
+    captured: dict[str, object] = {}
+
+    def _capture_write(_engine, **kwargs):
+        captured.update(kwargs)
+        return 1
+
+    monkeypatch.setattr("scpc.etl.scene_pipeline.write_scene_summary_to_db", _capture_write)
+    monkeypatch.setenv("SCPC_LOG_DIR", str(log_dir))
+
+    main([
+        "--scene",
+        "写库场景",
+        "--mk",
+        "US",
+        "--weeks-back",
+        "8",
+        "--with-llm",
+        "--write-summary",
+    ])
+
+    assert captured["scene"] == "写库场景"
+    assert captured["marketplace_id"] == "US"
+    assert captured["week"] == "2024W12"
+    assert captured["summary_str"] == "场景短期平稳，关注库存周转。"
+    assert captured["llm_model"] == "deepseek-pro"
+    assert captured["llm_version"] == "v1.0"
+    assert captured["confidence"] == 0.81
+    assert captured["sunday"] == date(2024, 3, 17)
 
 
 def test_main_emits_scene_summary_json(tmp_path, monkeypatch):
