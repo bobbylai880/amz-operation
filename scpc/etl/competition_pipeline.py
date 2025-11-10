@@ -1135,6 +1135,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Select which LLM stages to execute when running the competition workflow (default: both)",
     )
     parser.add_argument(
+        "--llm-stage",
+        choices=("both", "stage1", "stage2"),
+        default="both",
+        help="Select which LLM stages to execute when running the competition workflow (default: both)",
+    )
+    parser.add_argument(
         "--llm-config",
         default="configs/competition_llm.yaml",
         help="Path to the competition LLM configuration YAML",

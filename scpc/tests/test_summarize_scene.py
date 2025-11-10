@@ -28,10 +28,10 @@ class DummyConnection:
 @pytest.fixture
 def sample_features():
     base = date(2025, 3, 2)
-    current_weeks = [base + timedelta(weeks=offset) for offset in range(4)]
+    current_weeks = [base + timedelta(weeks=offset) for offset in range(6)]
     last_year_past = [dt - timedelta(days=364) for dt in current_weeks]
     pivot = last_year_past[-1]
-    last_year_future = [pivot + timedelta(weeks=offset) for offset in range(1, 5)]
+    last_year_future = [pivot + timedelta(weeks=offset) for offset in range(1, 7)]
     all_dates = sorted(set(current_weeks + last_year_past + last_year_future))
 
     def _volume_for(dt: date) -> float:
@@ -77,10 +77,10 @@ def sample_drivers():
 @pytest.fixture
 def sample_keyword_volumes():
     base = date(2025, 3, 2)
-    current_weeks = [base + timedelta(weeks=offset) for offset in range(4)]
+    current_weeks = [base + timedelta(weeks=offset) for offset in range(6)]
     last_year_past = [dt - timedelta(days=364) for dt in current_weeks]
     pivot = last_year_past[-1]
-    last_year_future = [pivot + timedelta(weeks=offset) for offset in range(1, 5)]
+    last_year_future = [pivot + timedelta(weeks=offset) for offset in range(1, 7)]
     all_dates = sorted(set(current_weeks + last_year_past + last_year_future))
     keywords = {"alpha": 300, "beta": 260, "gamma": 220}
     rows = []
@@ -169,6 +169,24 @@ def test_summarize_scene_retries_on_schema_error(
                                 "pct_change": "-0.60%",
                                 "pct_change_value": -0.006,
                             },
+                            {
+                                "year": 2025,
+                                "week_num": 17,
+                                "start_date": "2025-04-27",
+                                "direction": "down",
+                                "projected_vol": 262.0,
+                                "pct_change": "-0.40%",
+                                "pct_change_value": -0.004,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 18,
+                                "start_date": "2025-05-04",
+                                "direction": "up",
+                                "projected_vol": 271.0,
+                                "pct_change": "0.90%",
+                                "pct_change_value": 0.009,
+                            },
                         ]
                     },
                     "top_keywords_forecast": [
@@ -183,6 +201,51 @@ def test_summarize_scene_retries_on_schema_error(
                                     "projected_vol": 340.0,
                                     "pct_change": "1.10%",
                                     "pct_change_value": 0.011,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 14,
+                                    "start_date": "2025-04-06",
+                                    "direction": "up",
+                                    "projected_vol": 344.0,
+                                    "pct_change": "1.20%",
+                                    "pct_change_value": 0.012,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 15,
+                                    "start_date": "2025-04-13",
+                                    "direction": "flat",
+                                    "projected_vol": 345.0,
+                                    "pct_change": "0.10%",
+                                    "pct_change_value": 0.001,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 16,
+                                    "start_date": "2025-04-20",
+                                    "direction": "down",
+                                    "projected_vol": 339.0,
+                                    "pct_change": "-0.35%",
+                                    "pct_change_value": -0.0035,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 17,
+                                    "start_date": "2025-04-27",
+                                    "direction": "down",
+                                    "projected_vol": 333.0,
+                                    "pct_change": "-0.45%",
+                                    "pct_change_value": -0.0045,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 18,
+                                    "start_date": "2025-05-04",
+                                    "direction": "flat",
+                                    "projected_vol": 333.0,
+                                    "pct_change": "0.00%",
+                                    "pct_change_value": 0.0,
                                 }
                             ],
                         },
@@ -197,6 +260,51 @@ def test_summarize_scene_retries_on_schema_error(
                                     "projected_vol": 312.0,
                                     "pct_change": "0.80%",
                                     "pct_change_value": 0.008,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 14,
+                                    "start_date": "2025-04-06",
+                                    "direction": "up",
+                                    "projected_vol": 318.0,
+                                    "pct_change": "0.95%",
+                                    "pct_change_value": 0.0095,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 15,
+                                    "start_date": "2025-04-13",
+                                    "direction": "flat",
+                                    "projected_vol": 319.0,
+                                    "pct_change": "0.20%",
+                                    "pct_change_value": 0.002,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 16,
+                                    "start_date": "2025-04-20",
+                                    "direction": "down",
+                                    "projected_vol": 313.0,
+                                    "pct_change": "-0.45%",
+                                    "pct_change_value": -0.0045,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 17,
+                                    "start_date": "2025-04-27",
+                                    "direction": "down",
+                                    "projected_vol": 308.0,
+                                    "pct_change": "-0.30%",
+                                    "pct_change_value": -0.003,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 18,
+                                    "start_date": "2025-05-04",
+                                    "direction": "flat",
+                                    "projected_vol": 308.0,
+                                    "pct_change": "0.00%",
+                                    "pct_change_value": 0.0,
                                 }
                             ],
                         },
@@ -211,6 +319,51 @@ def test_summarize_scene_retries_on_schema_error(
                                     "projected_vol": 284.0,
                                     "pct_change": "0.20%",
                                     "pct_change_value": 0.002,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 14,
+                                    "start_date": "2025-04-06",
+                                    "direction": "flat",
+                                    "projected_vol": 284.5,
+                                    "pct_change": "0.10%",
+                                    "pct_change_value": 0.001,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 15,
+                                    "start_date": "2025-04-13",
+                                    "direction": "down",
+                                    "projected_vol": 283.0,
+                                    "pct_change": "-0.53%",
+                                    "pct_change_value": -0.0053,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 16,
+                                    "start_date": "2025-04-20",
+                                    "direction": "down",
+                                    "projected_vol": 280.0,
+                                    "pct_change": "-1.06%",
+                                    "pct_change_value": -0.0106,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 17,
+                                    "start_date": "2025-04-27",
+                                    "direction": "down",
+                                    "projected_vol": 277.0,
+                                    "pct_change": "-1.07%",
+                                    "pct_change_value": -0.0107,
+                                },
+                                {
+                                    "year": 2025,
+                                    "week_num": 18,
+                                    "start_date": "2025-05-04",
+                                    "direction": "flat",
+                                    "projected_vol": 277.0,
+                                    "pct_change": "0.00%",
+                                    "pct_change_value": 0.0,
                                 }
                             ],
                         },
@@ -235,7 +388,7 @@ def test_summarize_scene_retries_on_schema_error(
     result = summarize_scene(engine=DummyEngine(), scene="X", mk="US", topn=5)
 
     assert "scene_forecast" in result
-    assert len(result["scene_forecast"]["weeks"]) == 4
+    assert len(result["scene_forecast"]["weeks"]) == 6
     assert "analysis_summary" in result
     assert calls, "expected DeepSeek to be invoked"
     parsed = json.loads(calls[0])
@@ -245,6 +398,7 @@ def test_summarize_scene_retries_on_schema_error(
     scene_guidance = forecast_guidance.get("scene", {}) if isinstance(forecast_guidance, dict) else {}
     weeks = scene_guidance.get("forecast_weeks", []) if isinstance(scene_guidance, dict) else []
     if weeks:
+        assert len(weeks) == 6
         first_week = weeks[0]
         assert isinstance(first_week.get("pct_change"), str)
         assert first_week["pct_change"].endswith("%")
@@ -255,6 +409,7 @@ def test_summarize_scene_retries_on_schema_error(
     for kw in keyword_guidance:
         weeks = kw.get("forecast_weeks", [])
         if weeks:
+            assert len(weeks) == 6
             first_kw_week = weeks[0]
             assert "projected_vol" in first_kw_week
             assert isinstance(first_kw_week.get("pct_change"), str)
@@ -335,7 +490,52 @@ def test_top_keyword_limit_respects_config(
                             "projected_vol": 260.0,
                             "pct_change": "1.20%",
                             "pct_change_value": 0.012,
-                        }
+                        },
+                        {
+                            "year": 2025,
+                            "week_num": 14,
+                            "start_date": "2025-04-06",
+                            "direction": "up",
+                            "projected_vol": 268.0,
+                            "pct_change": "1.10%",
+                            "pct_change_value": 0.011,
+                        },
+                        {
+                            "year": 2025,
+                            "week_num": 15,
+                            "start_date": "2025-04-13",
+                            "direction": "flat",
+                            "projected_vol": 270.0,
+                            "pct_change": "0.30%",
+                            "pct_change_value": 0.003,
+                        },
+                        {
+                            "year": 2025,
+                            "week_num": 16,
+                            "start_date": "2025-04-20",
+                            "direction": "down",
+                            "projected_vol": 266.0,
+                            "pct_change": "-0.40%",
+                            "pct_change_value": -0.004,
+                        },
+                        {
+                            "year": 2025,
+                            "week_num": 17,
+                            "start_date": "2025-04-27",
+                            "direction": "down",
+                            "projected_vol": 262.0,
+                            "pct_change": "-0.30%",
+                            "pct_change_value": -0.003,
+                        },
+                        {
+                            "year": 2025,
+                            "week_num": 18,
+                            "start_date": "2025-05-04",
+                            "direction": "flat",
+                            "projected_vol": 262.0,
+                            "pct_change": "0.00%",
+                            "pct_change_value": 0.0,
+                        },
                     ]
                 },
                 "top_keywords_forecast": [
@@ -350,7 +550,52 @@ def test_top_keyword_limit_respects_config(
                                 "projected_vol": 340.0,
                                 "pct_change": "1.10%",
                                 "pct_change_value": 0.011,
-                            }
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 14,
+                                "start_date": "2025-04-06",
+                                "direction": "up",
+                                "projected_vol": 344.0,
+                                "pct_change": "1.20%",
+                                "pct_change_value": 0.012,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 15,
+                                "start_date": "2025-04-13",
+                                "direction": "flat",
+                                "projected_vol": 346.0,
+                                "pct_change": "0.30%",
+                                "pct_change_value": 0.003,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 16,
+                                "start_date": "2025-04-20",
+                                "direction": "down",
+                                "projected_vol": 340.0,
+                                "pct_change": "-0.35%",
+                                "pct_change_value": -0.0035,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 17,
+                                "start_date": "2025-04-27",
+                                "direction": "down",
+                                "projected_vol": 334.0,
+                                "pct_change": "-0.40%",
+                                "pct_change_value": -0.004,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 18,
+                                "start_date": "2025-05-04",
+                                "direction": "flat",
+                                "projected_vol": 334.0,
+                                "pct_change": "0.00%",
+                                "pct_change_value": 0.0,
+                            },
                         ],
                     },
                     {
@@ -364,7 +609,52 @@ def test_top_keyword_limit_respects_config(
                                 "projected_vol": 312.0,
                                 "pct_change": "0.80%",
                                 "pct_change_value": 0.008,
-                            }
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 14,
+                                "start_date": "2025-04-06",
+                                "direction": "up",
+                                "projected_vol": 318.0,
+                                "pct_change": "0.95%",
+                                "pct_change_value": 0.0095,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 15,
+                                "start_date": "2025-04-13",
+                                "direction": "flat",
+                                "projected_vol": 319.0,
+                                "pct_change": "0.20%",
+                                "pct_change_value": 0.002,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 16,
+                                "start_date": "2025-04-20",
+                                "direction": "down",
+                                "projected_vol": 313.0,
+                                "pct_change": "-0.45%",
+                                "pct_change_value": -0.0045,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 17,
+                                "start_date": "2025-04-27",
+                                "direction": "down",
+                                "projected_vol": 308.0,
+                                "pct_change": "-0.30%",
+                                "pct_change_value": -0.003,
+                            },
+                            {
+                                "year": 2025,
+                                "week_num": 18,
+                                "start_date": "2025-05-04",
+                                "direction": "flat",
+                                "projected_vol": 308.0,
+                                "pct_change": "0.00%",
+                                "pct_change_value": 0.0,
+                            },
                         ],
                     },
                 ],

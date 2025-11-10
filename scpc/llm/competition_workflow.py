@@ -15,6 +15,7 @@ from typing import Any, Mapping, MutableMapping, Sequence
 import yaml
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from scpc.llm.orchestrator import LLMOrchestrator, LLMRunConfig, validate_schema
 from scpc.prompts import load_prompt
@@ -23,6 +24,26 @@ from scpc.schemas import load_schema
 from .competition_config import CompetitionLLMConfig
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _ensure_stage2_context(
+    machine_json: Mapping[str, Any], fallback_context: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Guarantee that the stage-2 machine JSON contains a context object."""
+
+    context_payload = machine_json.get("context")
+    if isinstance(context_payload, Mapping) and context_payload:
+        # Return a shallow copy so downstream callers can freely mutate.
+        return dict(machine_json)
+
+    fallback = fallback_context if isinstance(fallback_context, Mapping) else None
+    LOGGER.warning(
+        "competition_llm.stage2_missing_context fallback_available=%s",
+        bool(fallback),
+    )
+    result = dict(machine_json)
+    result["context"] = dict(fallback or {})
+    return result
 
 
 _STAGE1_OVERVIEW_SQL_BASE = """
@@ -288,6 +309,23 @@ class StageOneResult:
 
 
 @dataclass(slots=True)
+class StageOneLLMResult(StageOneResult):
+    """Structured Stage-1 output produced by the LLM round."""
+
+    llm_metrics: Mapping[str, Any] | None = None
+    prompt_path: Path | None = None
+
+    def to_stage_one_result(self) -> "StageOneResult":
+        """Drop any LLM-specific metadata and return the base result payload."""
+
+        return StageOneResult(
+            context=self.context,
+            summary=self.summary,
+            dimensions=self.dimensions,
+        )
+
+
+@dataclass(slots=True)
 class StageTwoCandidate:
     context: Mapping[str, Any]
     dimension: Mapping[str, Any]
@@ -351,6 +389,17 @@ class CompetitionLLMOrchestrator:
         self._llm = llm_orchestrator
         self._config = config
         self._storage_root = Path(storage_root or "storage/competition_llm")
+        self._stage1_prompt = load_prompt("competition.md")
+        self._stage1_schema: Mapping[str, Any] = {
+            "type": "object",
+            "required": ["context", "summary", "dimensions"],
+            "properties": {
+                "context": {"type": "object"},
+                "summary": {"type": "string"},
+                "dimensions": {"type": "array", "items": {"type": "object"}},
+                "metrics": {"type": ["object", "null"]},
+            },
+        }
         self._stage2_schema = load_schema("competition_stage2_aggregate.schema.json")
         self._stage2_prompt = load_prompt("competition_stage2_aggregate.md")
         self._current_marketplace_id: str | None = None
@@ -574,6 +623,250 @@ class CompetitionLLMOrchestrator:
             LOGGER.warning("competition_llm.stage1_no_rules active=0")
         return tuple(results)
 
+    def _apply_stage1_llm(
+        self,
+        rule_result: StageOneResult,
+        overview_rows: Sequence[Mapping[str, Any]],
+        traffic_rows: Sequence[Mapping[str, Any]],
+    ) -> StageOneLLMResult:
+        context = dict(rule_result.context)
+        packets = self._load_stage1_packets(context)
+        insights = self._load_stage1_insights(context)
+        facts = self._build_stage1_llm_facts(
+            context,
+            overview_rows,
+            traffic_rows,
+            rule_result,
+            packets,
+            insights,
+        )
+        prompt_path: Path | None = None
+        try:
+            prompt_path = self._write_prompt_snapshot(
+                stage="stage1",
+                week=str(context.get("week") or "unknown"),
+                base_name=self._build_stage1_storage_name(context),
+                prompt=self._stage1_prompt,
+                facts=facts,
+            )
+        except Exception as exc:  # pragma: no cover - snapshot errors should not block execution
+            LOGGER.warning(
+                "competition_llm.stage1_prompt_snapshot_failed asin=%s error=%s",
+                context.get("my_asin"),
+                exc,
+            )
+            prompt_path = None
+
+        try:
+            response = self._invoke_with_retries(
+                facts,
+                schema=self._stage1_schema,
+                prompt=self._stage1_prompt,
+                max_attempts=self._config.stage_1.max_retries,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "competition_llm.stage1_llm_failed asin=%s error=%s",
+                context.get("my_asin"),
+                exc,
+            )
+            return StageOneLLMResult(
+                context=context,
+                summary=rule_result.summary,
+                dimensions=rule_result.dimensions,
+                llm_metrics=None,
+                prompt_path=prompt_path,
+            )
+
+        try:
+            validate_schema(self._stage1_schema, response)
+        except Exception as exc:
+            LOGGER.warning(
+                "competition_llm.stage1_llm_invalid asin=%s error=%s",
+                context.get("my_asin"),
+                exc,
+            )
+            return StageOneLLMResult(
+                context=context,
+                summary=rule_result.summary,
+                dimensions=rule_result.dimensions,
+                llm_metrics=None,
+                prompt_path=prompt_path,
+            )
+
+        llm_context_raw = response.get("context")
+        if isinstance(llm_context_raw, Mapping):
+            llm_context = dict(rule_result.context)
+            llm_context.update({key: llm_context_raw.get(key) for key in llm_context_raw})
+        else:
+            llm_context = dict(rule_result.context)
+
+        summary = response.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            summary = rule_result.summary
+
+        rule_dim_index: dict[str, Mapping[str, Any]] = {}
+        for dim in rule_result.dimensions:
+            if isinstance(dim, Mapping):
+                key = _normalize_lag_type(dim.get("lag_type"))
+                if key:
+                    rule_dim_index[key] = dim
+
+        dimensions_payload: list[Mapping[str, Any]] = []
+        response_dimensions = response.get("dimensions")
+        if isinstance(response_dimensions, Sequence):
+            for dim in response_dimensions:
+                if not isinstance(dim, Mapping):
+                    continue
+                dim_payload = dict(dim)
+                original_lag_label = str(dim_payload.get("lag_type") or "").strip()
+                lag_type = _normalize_lag_type(original_lag_label) or original_lag_label.lower()
+                if lag_type:
+                    dim_payload["lag_type_normalized"] = lag_type
+                rule_dim = rule_dim_index.get(lag_type)
+                if rule_dim:
+                    for field in ("lag_score", "triggered_rules", "source_confidence", "source_opp_type"):
+                        value = dim_payload.get(field)
+                        if value in (None, "", ()):  # pragma: no branch - normalising falsy
+                            rule_value = rule_dim.get(field)
+                            if rule_value not in (None, "", ()):  # pragma: no branch - ensure signal present
+                                dim_payload[field] = rule_value
+                if "status" not in dim_payload or not dim_payload.get("status"):
+                    dim_payload["status"] = "lag"
+                dimensions_payload.append(dim_payload)
+
+        if not dimensions_payload:
+            dimensions_payload = [dict(dim) for dim in rule_result.dimensions]
+
+        metrics_payload = response.get("metrics")
+        if not isinstance(metrics_payload, Mapping):
+            metrics_payload = None
+
+        return StageOneLLMResult(
+            context=llm_context,
+            summary=summary,
+            dimensions=tuple(dimensions_payload),
+            llm_metrics=metrics_payload,
+            prompt_path=prompt_path,
+        )
+
+    def _build_stage1_llm_facts(
+        self,
+        context: Mapping[str, Any],
+        overview_rows: Sequence[Mapping[str, Any]],
+        traffic_rows: Sequence[Mapping[str, Any]],
+        rule_result: StageOneResult,
+        packets: Sequence[Mapping[str, Any]],
+        insights: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        return {
+            "context": context,
+            "rule_summary": rule_result.summary,
+            "rule_dimensions": [dict(dimension) for dimension in rule_result.dimensions],
+            "overview_rows": [dict(row) for row in overview_rows],
+            "traffic_rows": [dict(row) for row in traffic_rows],
+            "lag_packets": list(packets),
+            "lag_insights": list(insights),
+            "output_language": "zh",
+        }
+
+    def _load_stage1_packets(self, context: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
+        sql = """
+          SELECT lag_type, opp_type, evidence_json
+          FROM bi_amz_comp_llm_packet
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin
+        """
+        params = {
+            "scene_tag": context.get("scene_tag"),
+            "base_scene": context.get("base_scene"),
+            "morphology": context.get("morphology"),
+            "marketplace_id": context.get("marketplace_id"),
+            "week": context.get("week"),
+            "sunday": context.get("sunday"),
+            "my_asin": context.get("my_asin"),
+        }
+        try:
+            rows = self._fetch_all(sql, params)
+        except SQLAlchemyError as exc:  # pragma: no cover - depends on optional table
+            LOGGER.debug(
+                "competition_llm.stage1_packets_unavailable asin=%s error=%s",
+                context.get("my_asin"),
+                exc,
+            )
+            return ()
+
+        packets: list[Mapping[str, Any]] = []
+        for row in rows:
+            payload_raw = row.get("evidence_json")
+            evidence_payload: Mapping[str, Any] | None = None
+            if isinstance(payload_raw, str) and payload_raw.strip():
+                try:
+                    parsed = json.loads(payload_raw)
+                except json.JSONDecodeError as exc:  # pragma: no cover - malformed fixtures
+                    LOGGER.warning(
+                        "competition_llm.stage1_packet_parse_error asin=%s error=%s",
+                        context.get("my_asin"),
+                        exc,
+                    )
+                else:
+                    if isinstance(parsed, Mapping):
+                        evidence_payload = parsed
+            packets.append(
+                {
+                    "lag_type": _normalize_lag_type(row.get("lag_type")),
+                    "opp_type": row.get("opp_type"),
+                    "evidence": evidence_payload,
+                }
+            )
+        return tuple(packets)
+
+    def _load_stage1_insights(self, context: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
+        sql = """
+          SELECT lag_type, opp_type, reason_code, severity, reason_detail, top_opp_asins_csv
+          FROM bi_amz_comp_lag_insights
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin
+        """
+        params = {
+            "scene_tag": context.get("scene_tag"),
+            "base_scene": context.get("base_scene"),
+            "morphology": context.get("morphology"),
+            "marketplace_id": context.get("marketplace_id"),
+            "week": context.get("week"),
+            "sunday": context.get("sunday"),
+            "my_asin": context.get("my_asin"),
+        }
+        try:
+            rows = self._fetch_all(sql, params)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage1_insights_unavailable asin=%s error=%s",
+                context.get("my_asin"),
+                exc,
+            )
+            return ()
+
+        insights: list[Mapping[str, Any]] = []
+        for row in rows:
+            insights.append(
+                {
+                    "lag_type": _normalize_lag_type(row.get("lag_type")),
+                    "opp_type": row.get("opp_type"),
+                    "reason_code": row.get("reason_code"),
+                    "severity": row.get("severity"),
+                    "reason_detail": row.get("reason_detail"),
+                    "top_opp_asins_csv": row.get("top_opp_asins_csv"),
+                }
+            )
+        return tuple(insights)
+
     def _write_stage1_output(self, result: StageOneResult) -> Path:
         week = str(result.context.get("week"))
         asin = result.context.get("my_asin", "unknown")
@@ -711,19 +1004,28 @@ class CompetitionLLMOrchestrator:
         overall_top_map: dict[str, dict[str, Any]] = {}
         opp_types_seen: set[str] = set()
         evidence_cache: dict[tuple[Any, ...], Mapping[str, Any] | None] = {}
+        first_round_item: Mapping[str, Any] | None = None
 
         for candidate in group.items:
             dimension = candidate.dimension
-            lag_type = _normalize_lag_type(dimension.get("lag_type"))
+            lag_type = dimension.get("lag_type_normalized") or _normalize_lag_type(dimension.get("lag_type"))
             opp_type = str(candidate.context.get("opp_type") or dimension.get("source_opp_type") or "").lower()
             if not lag_type or not opp_type:
                 LOGGER.debug("competition_llm.stage2_skip_invalid_dimension dimension=%s", dimension)
                 continue
+            display_label = str(dimension.get("lag_type") or "").strip() or _LAG_TYPE_FILENAME_ALIASES.get(lag_type, lag_type)
             severity_label = str(dimension.get("severity") or "low").lower()
             severity_rank = _SEVERITY_ORDER.get(severity_label, 1)
             opp_types_seen.add(opp_type)
             confidence_value = self._parse_confidence(dimension.get("source_confidence")) or self._config.stage_1.conf_min
             lag_score = _coerce_float(dimension.get("lag_score"))
+
+            if first_round_item is None:
+                first_round_item = {
+                    "context": dict(candidate.context),
+                    "lag_type": display_label,
+                    "dimension": dict(dimension),
+                }
 
             evidence_items: list[Mapping[str, Any]] = []
             if lag_type in _PAGE_LAG_TYPES:
@@ -744,6 +1046,11 @@ class CompetitionLLMOrchestrator:
                     evidence_items.append(evidence_traffic)
 
             if not evidence_items:
+                packet_evidence = self._load_cached_packet_evidence(candidate.context, lag_type, opp_type)
+                if packet_evidence:
+                    evidence_items.append(packet_evidence)
+
+            if not evidence_items:
                 LOGGER.warning(
                     "competition_llm.stage2_missing_evidence lag_type=%s opp_type=%s context=%s",
                     lag_type,
@@ -756,6 +1063,7 @@ class CompetitionLLMOrchestrator:
                 lag_type,
                 {
                     "lag_type": lag_type,
+                    "label": display_label,
                     "opp_types": set(),
                     "severity_rank": 0,
                     "source_confidence": self._config.stage_1.conf_min,
@@ -765,6 +1073,8 @@ class CompetitionLLMOrchestrator:
                     "triggered_rules": set(),
                 },
             )
+            if display_label:
+                entry.setdefault("label", display_label)
             entry["opp_types"].add(opp_type)
             entry["severity_rank"] = max(entry["severity_rank"], severity_rank)
             entry["source_confidence"] = max(entry["source_confidence"], confidence_value)
@@ -785,7 +1095,7 @@ class CompetitionLLMOrchestrator:
             overview = entry.get("overview") or {}
             top_map = entry.get("_top_map") or {}
             lag_item = {
-                "lag_type": lag_type,
+                "lag_type": entry.get("label") or _LAG_TYPE_FILENAME_ALIASES.get(lag_type, lag_type),
                 "opp_types": sorted(entry.get("opp_types") or ()),
                 "severity": _severity_from_rank(entry.get("severity_rank", 0)),
                 "source_confidence": round(entry.get("source_confidence", self._config.stage_1.conf_min), 4),
@@ -814,7 +1124,125 @@ class CompetitionLLMOrchestrator:
             "output_language": "zh",
             "machine_json_schema": "competition_stage2_aggregate.schema.json",
         }
+        if first_round_item:
+            facts["first_round_item"] = first_round_item
         return facts
+
+    def _load_cached_packet_evidence(
+        self,
+        context: Mapping[str, Any],
+        lag_type: str,
+        opp_type: str,
+    ) -> Mapping[str, Any] | None:
+        sql = """
+          SELECT lag_type, opp_type, evidence_json
+          FROM bi_amz_comp_llm_packet
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND my_asin=:my_asin
+        """
+        params = {
+            "scene_tag": context.get("scene_tag"),
+            "base_scene": context.get("base_scene"),
+            "morphology": context.get("morphology"),
+            "marketplace_id": context.get("marketplace_id"),
+            "week": context.get("week"),
+            "sunday": context.get("sunday"),
+            "my_asin": context.get("my_asin"),
+        }
+        try:
+            rows = self._fetch_all(sql, params)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_packet_lookup_failed asin=%s lag_type=%s error=%s",
+                context.get("my_asin"),
+                lag_type,
+                exc,
+            )
+            return None
+        if not rows:
+            return None
+        selected_row: Mapping[str, Any] | None = None
+        normalized_target = _normalize_lag_type(lag_type)
+        opp_type_lower = str(opp_type or "").lower()
+        for row in rows:
+            row_lag = _normalize_lag_type(row.get("lag_type"))
+            row_opp = str(row.get("opp_type") or "").lower()
+            if row_lag == normalized_target and (not opp_type_lower or row_opp == opp_type_lower):
+                selected_row = row
+                break
+        if selected_row is None:
+            selected_row = rows[0]
+
+        payload_raw = selected_row.get("evidence_json")
+        if not isinstance(payload_raw, str) or not payload_raw.strip():
+            return None
+        try:
+            parsed = json.loads(payload_raw)
+        except json.JSONDecodeError as exc:  # pragma: no cover - malformed fixtures
+            LOGGER.warning(
+                "competition_llm.stage2_packet_parse_error asin=%s lag_type=%s error=%s",
+                context.get("my_asin"),
+                lag_type,
+                exc,
+            )
+            return None
+        if not isinstance(parsed, Mapping):
+            return None
+
+        overview = {}
+        metrics = parsed.get("metrics")
+        if isinstance(metrics, Mapping):
+            overview = dict(metrics)
+
+        top_opps: list[Mapping[str, Any]] = []
+        competitors = parsed.get("top_competitors")
+        if isinstance(competitors, Sequence):
+            for item in competitors:
+                if not isinstance(item, Mapping):
+                    continue
+                entry: dict[str, Any] = {
+                    "opp_asin": item.get("asin"),
+                    "opp_parent_asin": item.get("parent_asin") or item.get("parent"),
+                    "opp_brand": item.get("brand"),
+                }
+                value = item.get("value")
+                if value is not None:
+                    coerced = _coerce_float(value)
+                    entry["score"] = coerced if coerced is not None else value
+                top_opps.append(entry)
+
+        reasons: list[Mapping[str, Any]] = []
+        drivers = parsed.get("drivers")
+        if isinstance(drivers, Sequence):
+            for driver in drivers:
+                if not isinstance(driver, Mapping):
+                    continue
+                reason_entry: dict[str, Any] = {}
+                metric_name = driver.get("name") or driver.get("metric")
+                if metric_name:
+                    reason_entry["metric"] = metric_name
+                if driver.get("value") is not None:
+                    reason_entry["value"] = driver.get("value")
+                if driver.get("description"):
+                    reason_entry["description"] = driver.get("description")
+                if reason_entry:
+                    reasons.append(reason_entry)
+
+        top_csv = ",".join([row.get("opp_asin") for row in top_opps if row.get("opp_asin")])
+
+        return {
+            "channel": "cached",
+            "lag_type": normalized_target,
+            "opp_type": opp_type,
+            "overview": overview,
+            "top_opps": top_opps,
+            "top_opp_asins_csv": top_csv,
+            "top_diff_reasons": reasons,
+            "prompt_hint": parsed.get("prompt_hint"),
+        }
 
     def _write_stage2_output_aggregate(self, result: StageTwoAggregateResult) -> Sequence[Path]:
         context = result.context or {}
@@ -1135,6 +1563,13 @@ class CompetitionLLMOrchestrator:
     def _serialise_row(self, row: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
         for key, value in list(row.items()):
             row[key] = _serialise_value(value)
+        if "price_gap_leader" not in row and "price_gap" in row:
+            row["price_gap_leader"] = row["price_gap"]
+        if "traffic_gap" in row:
+            if "ad_ratio_index_med" not in row:
+                row["ad_ratio_index_med"] = row["traffic_gap"]
+            if "ad_to_natural_gap" not in row:
+                row["ad_to_natural_gap"] = row["traffic_gap"]
         return row
 
     def _build_stage1_key(self, row: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -1211,7 +1646,16 @@ class CompetitionLLMOrchestrator:
             AND my_asin=:my_asin AND opp_type=:opp_type
           LIMIT 1
         """
-        overview = self._fetch_one(sql_overview, ctx)
+        try:
+            overview = self._fetch_one(sql_overview, ctx)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_page_overview_unavailable asin=%s lag_type=%s error=%s",
+                ctx.get("my_asin"),
+                lag_type,
+                exc,
+            )
+            overview = None
         if not overview:
             return None
 
@@ -1250,7 +1694,16 @@ class CompetitionLLMOrchestrator:
           ORDER BY ABS({metric_col}) DESC NULLS LAST
           LIMIT 3
         """
-        top_each = self._fetch_all(sql_each, ctx)
+        try:
+            top_each = self._fetch_all(sql_each, ctx)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_page_pairs_unavailable asin=%s lag_type=%s error=%s",
+                ctx.get("my_asin"),
+                lag_type,
+                exc,
+            )
+            top_each = []
         comparison_reasons = _build_comparison_reasons(lag_type, top_each)
 
         return {
@@ -1284,7 +1737,16 @@ class CompetitionLLMOrchestrator:
             AND my_asin=:my_asin AND opp_type=:opp_type
           LIMIT 1
         """
-        overview = self._fetch_one(sql_overview, ctx)
+        try:
+            overview = self._fetch_one(sql_overview, ctx)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_traffic_overview_unavailable asin=%s lag_type=%s error=%s",
+                ctx.get("my_asin"),
+                lag_type,
+                exc,
+            )
+            overview = None
         if not overview:
             return None
 
@@ -1311,7 +1773,16 @@ class CompetitionLLMOrchestrator:
           ORDER BY {order_metric} DESC NULLS LAST
           LIMIT 3
         """
-        top_each = self._fetch_all(sql_each, ctx)
+        try:
+            top_each = self._fetch_all(sql_each, ctx)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_traffic_pairs_unavailable asin=%s lag_type=%s error=%s",
+                ctx.get("my_asin"),
+                lag_type,
+                exc,
+            )
+            top_each = []
         comparison_reasons = _build_comparison_reasons(lag_type, top_each)
 
         return {
@@ -1624,6 +2095,7 @@ def _serialise_value(value: Any) -> Any:
 __all__ = [
     "CompetitionLLMOrchestrator",
     "CompetitionRunResult",
+    "StageOneLLMResult",
     "StageOneResult",
     "StageTwoAggregateResult",
 ]
