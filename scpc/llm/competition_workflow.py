@@ -305,6 +305,8 @@ class StageTwoAggregateResult:
     machine_json: Mapping[str, Any]
     human_markdown: str
     facts: Mapping[str, Any]
+    storage_base_name: str
+    prompt_path: Path | None = None
 
 
 @dataclass(slots=True)
@@ -353,42 +355,76 @@ class CompetitionLLMOrchestrator:
         self._stage2_prompt = load_prompt("competition_stage2_aggregate.md")
         self._current_marketplace_id: str | None = None
 
-    def run(self, week: str | None, *, marketplace_id: str | None = None) -> CompetitionRunResult:
+    def run(
+        self,
+        week: str | None,
+        *,
+        marketplace_id: str | None = None,
+        stages: Sequence[str] | None = None,
+    ) -> CompetitionRunResult:
         """Execute Stage-1 and Stage-2 for the provided week."""
 
         self._current_marketplace_id = marketplace_id
         target_week = self._resolve_week(week, marketplace_id)
+        raw_stage_request = {str(stage).lower() for stage in (stages or ("stage1", "stage2")) if stage}
+        if not raw_stage_request:
+            raw_stage_request = {"stage1", "stage2"}
+        requested_stages = set(raw_stage_request)
+        if "stage2" in requested_stages:
+            requested_stages.add("stage1")
+        stage2_requested = stages is None or "stage2" in raw_stage_request
+        run_stage1 = "stage1" in requested_stages
+        run_stage2 = "stage2" in requested_stages and self._config.stage_2.enabled
+
         LOGGER.info(
-            "competition_llm.start week=%s marketplace_id=%s",
+            "competition_llm.start week=%s marketplace_id=%s stages=%s",
             target_week,
             marketplace_id,
+            sorted(requested_stages),
         )
 
-        stage1_inputs = self._collect_stage1_inputs(target_week, marketplace_id)
-        stage1_outputs = self._execute_stage1_code(stage1_inputs)
         storage_paths: list[Path] = []
-        for item in stage1_outputs:
-            storage_paths.append(self._write_stage1_output(item))
+        stage1_outputs: Sequence[StageOneResult] = ()
+        if run_stage1:
+            stage1_inputs = self._collect_stage1_inputs(target_week, marketplace_id)
+            stage1_outputs = self._execute_stage1_code(stage1_inputs)
+            for item in stage1_outputs:
+                storage_paths.append(self._write_stage1_output(item))
+        else:
+            LOGGER.info("competition_llm.stage1_skipped")
 
-        stage2_candidates = self._prepare_stage2_candidates(stage1_outputs)
+        stage2_candidates: Sequence[StageTwoCandidate] = ()
+        if run_stage2:
+            stage2_candidates = self._prepare_stage2_candidates(stage1_outputs)
+
         stage2_outputs: Sequence[StageTwoAggregateResult] = ()
-        if self._config.stage_2.enabled and stage2_candidates:
+        if run_stage2 and stage2_candidates:
             if getattr(self._config.stage_2, "aggregate_per_asin", False):
                 grouped = self._group_candidates_by_asin(stage2_candidates)
                 stage2_outputs = self._execute_stage2_aggregate(grouped)
                 for item in stage2_outputs:
+                    if item.prompt_path:
+                        storage_paths.append(item.prompt_path)
                     storage_paths.extend(self._write_stage2_output_aggregate(item))
             else:
                 LOGGER.warning(
                     "competition_llm.stage2_aggregate_disabled candidate_count=%s",
                     len(stage2_candidates),
                 )
-        else:
+        elif run_stage2:
             LOGGER.info(
                 "competition_llm.stage2_skipped enabled=%s candidate_count=%s",
                 self._config.stage_2.enabled,
                 len(stage2_candidates),
             )
+        elif stage2_requested:
+            LOGGER.info(
+                "competition_llm.stage2_skipped enabled=%s candidate_count=%s",
+                self._config.stage_2.enabled,
+                len(stage2_candidates),
+            )
+        else:
+            LOGGER.info("competition_llm.stage2_not_requested")
 
         LOGGER.info(
             "competition_llm.end week=%s stage1=%s stage2_candidates=%s stage2=%s",
@@ -552,6 +588,22 @@ class CompetitionLLMOrchestrator:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
         return path
 
+    def _write_prompt_snapshot(
+        self,
+        *,
+        stage: str,
+        week: str,
+        base_name: str,
+        prompt: str,
+        facts: Mapping[str, Any],
+    ) -> Path:
+        prompt_dir = self._storage_root / week / stage / "prompts"
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        path = prompt_dir / f"{base_name}.prompt.json"
+        payload = {"prompt": prompt, "facts": facts}
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
+        return path
+
     def _prepare_stage2_candidates(self, stage1_results: Sequence[StageOneResult]) -> Sequence[StageTwoCandidate]:
         candidates: list[StageTwoCandidate] = []
         threshold = self._config.stage_1.conf_min
@@ -611,6 +663,16 @@ class CompetitionLLMOrchestrator:
                 len(lag_items),
                 len(facts.get("top_opp_asins_csv", "").split(",")) if facts.get("top_opp_asins_csv") else 0,
             )
+            context = facts.get("context") or {}
+            week_label = str(context.get("week") or "unknown")
+            base_name = self._build_stage2_storage_name(context)
+            prompt_path = self._write_prompt_snapshot(
+                stage="stage2",
+                week=week_label,
+                base_name=base_name,
+                prompt=self._stage2_prompt,
+                facts=facts,
+            )
             llm_response = self._invoke_with_retries(
                 facts,
                 schema={"type": "object", "required": ["machine_json", "human_markdown"]},
@@ -630,9 +692,15 @@ class CompetitionLLMOrchestrator:
                     machine_json=machine_json,
                     human_markdown=human_markdown,
                     facts=facts,
+                    storage_base_name=base_name,
+                    prompt_path=prompt_path,
                 )
             )
         return tuple(outputs)
+
+    def _build_stage2_storage_name(self, context: Mapping[str, Any]) -> str:
+        asin = str(context.get("my_asin") or "unknown")
+        return f"{asin}_ALL"
 
     def _build_stage2_aggregate_facts(self, group: StageTwoAggregateInput) -> Mapping[str, Any]:
         base_context = dict(group.context)
@@ -752,7 +820,7 @@ class CompetitionLLMOrchestrator:
         stage2_dir = self._storage_root / week / "stage2"
         stage2_dir.mkdir(parents=True, exist_ok=True)
 
-        base_name = f"{asin}_ALL"
+        base_name = result.storage_base_name or f"{asin}_ALL"
         main_path = stage2_dir / f"{base_name}.json"
         payload = {
             "machine_json": result.machine_json,
