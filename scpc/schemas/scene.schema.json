@@ -16,7 +16,7 @@
         "weeks": {
           "type": "array",
           "minItems": 1,
-          "maxItems": 4,
+          "maxItems": 6,
           "items": {
             "type": "object",
             "required": [
@@ -43,7 +43,7 @@
     },
     "top_keywords_forecast": {
       "type": "array",
-      "maxItems": 3,
+      "maxItems": 10,
       "items": {
         "type": "object",
         "required": ["keyword", "weeks"],
@@ -52,7 +52,7 @@
           "weeks": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 4,
+            "maxItems": 6,
             "items": {
               "type": "object",
               "required": [
