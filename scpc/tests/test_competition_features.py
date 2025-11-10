@@ -1,3 +1,6 @@
+import math
+
+import pandas as pd
 import pytest
 
 from scpc.etl.competition_features import (
@@ -27,6 +30,20 @@ def _build_traffic_features() -> tuple:
     keyword_tags = build_keyword_tag_sample()
     traffic = build_traffic_features(flow, keyword_daily, keyword_tags)
     return traffic, flow, keyword_daily, keyword_tags
+
+
+def _prepare_entities() -> pd.DataFrame:
+    snapshots = build_competition_snapshot_sample().drop(
+        columns=["scene_tag", "base_scene", "morphology"]
+    )
+    scene_tags = build_scene_tag_sample()
+    traffic, *_ = _build_traffic_features()
+    return clean_competition_entities(
+        snapshots,
+        my_asins=MY_ASINS_SAMPLE,
+        scene_tags=scene_tags,
+        traffic=traffic,
+    )
 
 
 def test_build_traffic_features_generates_mix_and_keyword_metrics() -> None:
@@ -64,22 +81,19 @@ def test_clean_competition_entities_derives_expected_features() -> None:
 
 
 def test_build_pairs_and_deltas_respect_scoring_rules() -> None:
-    snapshots = build_competition_snapshot_sample().drop(columns=["scene_tag", "base_scene", "morphology"])
-    scene_tags = build_scene_tag_sample()
     rules = build_scoring_rules_sample()
-    traffic, *_ = _build_traffic_features()
-
-    entities = clean_competition_entities(
-        snapshots,
-        my_asins=MY_ASINS_SAMPLE,
-        scene_tags=scene_tags,
-        traffic=traffic,
-    )
+    entities = _prepare_entities()
     pairs, traffic_pairs = build_competition_pairs(entities, scoring_rules=rules)
     pairs_each, traffic_pairs_each = build_competition_pairs_each(entities, scoring_rules=rules)
 
     assert set(pairs["opp_type"]) == {"leader", "median"}
     assert not pairs_each.empty
+    assert "opp_type" in pairs_each.columns
+    assert {"leader", "asin"}.issubset(set(pairs_each["opp_type"]))
+
+    leader_each = pairs_each[
+        (pairs_each["week"] == "2025W10") & (pairs_each["opp_type"] == "leader")
+    ].iloc[0]
 
     leader = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "leader")].iloc[0]
     leader_traffic = traffic_pairs[(traffic_pairs["week"] == "2025W10") & (traffic_pairs["opp_type"] == "leader")].iloc[0]
@@ -90,6 +104,7 @@ def test_build_pairs_and_deltas_respect_scoring_rules() -> None:
     assert leader_traffic["ad_ratio_gap_leader"] == pytest.approx(0.45 - 0.55, rel=1e-3)
     assert leader_traffic["t_pressure"] is not None
     assert leader_traffic["t_intensity_band"] in {"C1", "C2", "C3", "C4"}
+    assert leader_each["opp_asin"] == leader["opp_asin"]
 
     median = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "median")].iloc[0]
     median_traffic = traffic_pairs[(traffic_pairs["week"] == "2025W10") & (traffic_pairs["opp_type"] == "median")].iloc[0]
@@ -138,6 +153,62 @@ def test_build_pairs_uses_yaml_defaults_when_rules_missing() -> None:
     median = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "median")].iloc[0]
     assert median["pressure"] == pytest.approx(0.499, rel=1e-3)
     assert median["intensity_band"] == "C2"
+
+
+def test_leader_selection_prefers_lowest_rank_leaf() -> None:
+    entities = _prepare_entities()
+    pairs, _ = build_competition_pairs(entities)
+    leader = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "leader")].iloc[0]
+    assert leader["opp_asin"] == "COMP-ASIN-1"
+
+
+def test_leader_selection_falls_back_to_rank_score_when_rank_leaf_missing() -> None:
+    entities = _prepare_entities().copy()
+    mask = (entities["hyy_asin"] == 0) & (entities["week"] == "2025W10")
+    entities.loc[mask, "rank_leaf"] = math.nan
+    entities.loc[mask & (entities["asin"] == "COMP-ASIN-1"), "rank_score"] = 0.9
+    entities.loc[mask & (entities["asin"] == "COMP-ASIN-2"), "rank_score"] = 0.2
+
+    pairs, _ = build_competition_pairs(entities)
+    leader = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "leader")].iloc[0]
+    assert leader["opp_asin"] == "COMP-ASIN-1"
+
+
+def test_leader_selection_falls_back_to_rank_pos_pct_when_available() -> None:
+    entities = _prepare_entities().copy()
+    mask = (entities["hyy_asin"] == 0) & (entities["week"] == "2025W10")
+    entities.loc[mask, "rank_leaf"] = math.nan
+    entities.loc[mask, "rank_score"] = math.nan
+    entities.loc[mask & (entities["asin"] == "COMP-ASIN-1"), "rank_pos_pct"] = 0.72
+    entities.loc[mask & (entities["asin"] == "COMP-ASIN-2"), "rank_pos_pct"] = 0.54
+
+    pairs, _ = build_competition_pairs(entities)
+    leader = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "leader")].iloc[0]
+    assert leader["opp_asin"] == "COMP-ASIN-1"
+
+
+def test_leader_selection_falls_back_to_rank_root_when_scores_missing() -> None:
+    entities = _prepare_entities().copy()
+    mask = (entities["hyy_asin"] == 0) & (entities["week"] == "2025W10")
+    entities.loc[mask, "rank_leaf"] = math.nan
+    entities.loc[mask, "rank_score"] = math.nan
+
+    pairs, _ = build_competition_pairs(entities)
+    leader = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "leader")].iloc[0]
+    assert leader["opp_asin"] == "COMP-ASIN-1"
+
+
+def test_leader_selection_uses_tie_breaker_rating_when_rank_equal() -> None:
+    entities = _prepare_entities().copy()
+    mask = (entities["hyy_asin"] == 0) & (entities["week"] == "2025W10")
+    entities.loc[mask, "rank_leaf"] = 40
+    entities.loc[mask, "rank_score"] = 0.5
+    entities.loc[mask & (entities["asin"] == "COMP-ASIN-1"), "rating"] = 4.6
+    entities.loc[mask & (entities["asin"] == "COMP-ASIN-2"), "rating"] = 4.9
+
+    pairs, _ = build_competition_pairs(entities)
+    leader = pairs[(pairs["week"] == "2025W10") & (pairs["opp_type"] == "leader")].iloc[0]
+    assert leader["opp_asin"] == "COMP-ASIN-2"
 
 
 def test_build_tables_and_compute_competition_features() -> None:

@@ -964,6 +964,7 @@ def run_competition_compare_pipeline(
     traffic_rule_name: str = "default_traffic",
     write: bool = False,
     chunk_size: int = 500,
+    rebuild_leader_only: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """Build competition compare tables from precomputed features and optionally persist them."""
 
@@ -1020,7 +1021,23 @@ def run_competition_compare_pipeline(
             SCENE_WEEK_TABLE: tables.summary,
         }
 
-        for table_name, df in table_map.items():
+        tables_to_write = table_map
+        if rebuild_leader_only:
+            LOGGER.info(
+                "competition_compare_rebuild_leader_only week=%s previous=%s", week, previous_week
+            )
+            filtered: dict[str, pd.DataFrame] = {}
+            for table_name, df in table_map.items():
+                if "opp_type" in df.columns:
+                    filtered_df = df.loc[df["opp_type"] == "leader"].copy()
+                    filtered[table_name] = filtered_df
+                else:
+                    LOGGER.info(
+                        "competition_compare_leader_only_skip table=%s", table_name
+                    )
+            tables_to_write = filtered
+
+        for table_name, df in tables_to_write.items():
             table_columns = _load_table_columns(engine, table_name)
             aligned, dropped, missing = _prune_to_table(df, table_columns)
             if dropped:
@@ -1150,6 +1167,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=500,
         help="Batch size for Doris upsert",
     )
+    parser.add_argument(
+        "--rebuild-leader-only",
+        action="store_true",
+        help="When set, only recompute and persist compare rows where opp_type='leader'",
+    )
     return parser.parse_args(argv)
 
 
@@ -1239,6 +1261,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 traffic_rule_name=args.traffic_rule_name,
                 write=args.write_compare,
                 chunk_size=args.chunk_size,
+                rebuild_leader_only=args.rebuild_leader_only,
             )
 
         if with_llm:

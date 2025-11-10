@@ -958,6 +958,7 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                     sunday TEXT,
                     my_asin TEXT,
                     opp_asin TEXT,
+                    opp_type TEXT,
                     opp_parent_asin TEXT,
                     price_gap_each REAL,
                     price_ratio_each REAL,
@@ -1079,12 +1080,12 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
             text(
                 """
                 INSERT INTO bi_amz_comp_pairs_each
-                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_asin, opp_asin, opp_parent_asin,
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_asin, opp_asin, opp_type, opp_parent_asin,
                  price_gap_each, price_ratio_each, rank_pos_delta, content_gap_each, social_gap_each, badge_delta_sum,
                  my_price_net, opp_price_net, my_price_current, opp_price_current,
                  my_rank_pos_pct, opp_rank_pos_pct, my_content_score, opp_content_score,
                  my_social_proof, opp_social_proof, score_price, score_rank, score_cont, score_soc, score_badge)
-                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_asin, :opp_asin, :opp_parent_asin,
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_asin, :opp_asin, :opp_type, :opp_parent_asin,
                         :price_gap_each, :price_ratio_each, :rank_pos_delta, :content_gap_each, :social_gap_each, :badge_delta_sum,
                         :my_price_net, :opp_price_net, :my_price_current, :opp_price_current,
                         :my_rank_pos_pct, :opp_rank_pos_pct, :my_content_score, :opp_content_score,
@@ -1101,6 +1102,7 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                 "my_asin": ctx["my_asin"],
                 "opp_asin": "B0OPPASIN",
                 "opp_parent_asin": "PARENT-OPP",
+                "opp_type": "leader",
                 "price_gap_each": 7.0,
                 "price_ratio_each": 1.54,
                 "rank_pos_delta": 0.1,
@@ -1414,7 +1416,7 @@ def test_pairwise_evidence_notes_and_units(sqlite_engine, tmp_path):
     )
     assert rank_entries[0]["metric"] == "rank_leaf"
     assert rank_entries[0]["unit"] == "rank"
-    assert "类目排名" in rank_entries[0]["note"]
+    assert "排名" in rank_entries[0]["note"]
     assert rank_entries[1]["metric"] == "rank_pos_pct"
     assert rank_entries[1]["unit"] == "pct"
     assert "排名百分位" in rank_entries[1]["note"]
@@ -1431,10 +1433,12 @@ def test_pairwise_evidence_notes_and_units(sqlite_engine, tmp_path):
     content_entries = orchestrator._extract_pairwise_evidence(
         "content", {"top_opps": [content_row]}, limit=3
     )
-    notes = [entry["note"] for entry in content_entries]
-    assert any("图片数" in note for note in notes)
-    assert any("视频数" in note for note in notes)
-    assert any("内容得分" in note for note in notes)
+    assert {entry["metric"] for entry in content_entries} == {
+        "image_cnt",
+        "video_cnt",
+        "content_score",
+    }
+    assert all(entry.get("note") for entry in content_entries)
 
     social_row = {
         "opp_asin": "B0OPP3",
@@ -1448,8 +1452,12 @@ def test_pairwise_evidence_notes_and_units(sqlite_engine, tmp_path):
     social_entries = orchestrator._extract_pairwise_evidence(
         "social", {"top_opps": [social_row]}, limit=3
     )
-    assert any("评分" in entry["note"] for entry in social_entries)
-    assert any("评论数" in entry["note"] for entry in social_entries)
+    assert {entry["metric"] for entry in social_entries} == {
+        "rating",
+        "reviews",
+        "social_proof",
+    }
+    assert all(entry.get("note") for entry in social_entries)
 
     keyword_row = {
         "opp_asin": "B0OPP4",
@@ -1473,7 +1481,7 @@ def test_pairwise_evidence_notes_and_units(sqlite_engine, tmp_path):
     assert first_keyword["unit"] == "rank"
     assert first_keyword["my_value"] == "无"
     assert "关键词" in first_keyword["note"]
-    assert "7天份额" in first_keyword["note"]
+    assert "%" in first_keyword["note"]
 
 
 def test_stage2_validation_enforces_allowed_codes(sqlite_engine, tmp_path):
@@ -1696,3 +1704,194 @@ def test_materialize_evidence_converts_legacy_refs(sqlite_engine, tmp_path):
     assert first["against"] == "median"
     assert first["opp_value"] == 1.0
     assert "evidence_refs" not in root_causes[0]
+
+
+def test_materialize_evidence_drops_rank_overview_entries(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    facts = {
+        "lag_items": [
+            {
+                "lag_type": "rank",
+                "top_opps": [
+                    {
+                        "opp_asin": "B0RANK1",
+                        "my_rank_leaf": 48,
+                        "opp_rank_leaf": 12,
+                        "my_rank_pos_pct": 0.52,
+                        "opp_rank_pos_pct": 0.18,
+                    }
+                ],
+            }
+        ]
+    }
+    machine_json = {
+        "context": {"my_asin": "B012345"},
+        "lag_type": "mixed",
+        "root_causes": [
+            {
+                "root_cause_code": "rank_gap",
+                "summary": "排名落后",
+                "priority": 1,
+                "evidence": [
+                    {
+                        "metric": "rank_pos_pct",
+                        "against": "leader",
+                        "my_value": 0.52,
+                        "opp_value": 0.18,
+                        "source": "page.overview",
+                    },
+                    {
+                        "metric": "rank_leaf",
+                        "against": "asin",
+                        "my_value": 48,
+                        "opp_value": 12,
+                        "opp_asin": "B0RANK1",
+                        "source": "pairs_each",
+                    },
+                ],
+            }
+        ],
+        "actions": [],
+    }
+
+    result = orchestrator._materialize_evidence(machine_json, facts)
+    root_causes = result["root_causes"]
+    assert len(root_causes) == 1
+    evidence = root_causes[0]["evidence"]
+    assert len(evidence) == 1
+    assert evidence[0]["metric"] == "rank_leaf"
+
+
+def test_materialize_evidence_social_priority_filters_evidence(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    facts = {
+        "lag_items": [
+            {
+                "lag_type": "social",
+                "top_opps": [
+                    {
+                        "opp_asin": "B0SOC1",
+                        "my_rating": 4.6,
+                        "opp_rating": 4.3,
+                        "my_reviews": 420,
+                        "opp_reviews": 180,
+                        "my_social_proof": 2.4,
+                        "opp_social_proof": 2.1,
+                    }
+                ],
+            }
+        ]
+    }
+    machine_json = {
+        "context": {"my_asin": "B012345"},
+        "lag_type": "mixed",
+        "root_causes": [
+            {
+                "root_cause_code": "social_gap",
+                "summary": "社交指标落后",
+                "priority": 1,
+                "evidence": [
+                    {
+                        "metric": "rating",
+                        "against": "asin",
+                        "my_value": 4.6,
+                        "opp_value": 4.3,
+                        "opp_asin": "B0SOC1",
+                        "source": "pairs_each",
+                    },
+                    {
+                        "metric": "reviews",
+                        "against": "asin",
+                        "my_value": 420,
+                        "opp_value": 180,
+                        "opp_asin": "B0SOC1",
+                        "source": "pairs_each",
+                    },
+                ],
+            }
+        ],
+        "actions": [],
+    }
+
+    result = orchestrator._materialize_evidence(machine_json, facts)
+    assert result["root_causes"] == []
+    assert result["lag_type"] == "none"
+
+
+def test_materialize_evidence_social_priority_preserves_unfavorable(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    facts = {
+        "lag_items": [
+            {
+                "lag_type": "social",
+                "top_opps": [
+                    {
+                        "opp_asin": "B0SOC2",
+                        "my_rating": 4.1,
+                        "opp_rating": 4.7,
+                        "my_reviews": 150,
+                        "opp_reviews": 640,
+                        "my_social_proof": 1.9,
+                        "opp_social_proof": 2.6,
+                    }
+                ],
+            }
+        ]
+    }
+    machine_json = {
+        "context": {"my_asin": "B012345"},
+        "lag_type": "mixed",
+        "root_causes": [
+            {
+                "root_cause_code": "social_gap",
+                "summary": "社交指标落后",
+                "priority": 1,
+                "evidence": [
+                    {
+                        "metric": "rating",
+                        "against": "asin",
+                        "my_value": 4.1,
+                        "opp_value": 4.7,
+                        "opp_asin": "B0SOC2",
+                        "source": "pairs_each",
+                    },
+                    {
+                        "metric": "reviews",
+                        "against": "asin",
+                        "my_value": 150,
+                        "opp_value": 640,
+                        "opp_asin": "B0SOC2",
+                        "source": "pairs_each",
+                    },
+                ],
+            }
+        ],
+        "actions": [],
+    }
+
+    result = orchestrator._materialize_evidence(machine_json, facts)
+    root_causes = result["root_causes"]
+    assert len(root_causes) == 1
+    evidence = root_causes[0]["evidence"]
+    assert {item["metric"] for item in evidence} == {"rating", "reviews", "social_proof"}
