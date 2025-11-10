@@ -8,7 +8,7 @@ import os
 import re
 import sys
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Mapping, Sequence
@@ -20,13 +20,19 @@ from sqlalchemy.exc import OperationalError
 
 from scpc.db.engine import create_doris_engine
 from scpc.db.io import replace_into
+import scpc.llm.summarize_scene as summarize_scene_module
 from scpc.etl.scene_clean import CleanResult, clean_keyword_panel
 from scpc.etl.scene_drivers import compute_scene_drivers
 from scpc.etl.scene_features import compute_scene_features
 from scpc.llm.summarize_scene import SceneSummarizationError, summarize_scene
 from scpc.reports.builder import build_scene_markdown
+from scpc.settings import get_deepseek_settings
 
 LOGGER = logging.getLogger(__name__)
+
+
+SCENE_SUMMARY_TABLE = "bi_amz_scene_summary"
+SCENE_SUMMARY_VERSION = "v1.0"
 
 
 KEYWORD_SQL = """
@@ -68,6 +74,16 @@ LATEST_YEARWEEK_SQL = text(
     """
 )
 
+LATEST_SUMMARY_WEEK_SQL = text(
+    """
+    SELECT year, week_num, start_date
+    FROM bi_amz_scene_features
+    WHERE scene = :scene AND marketplace_id = :mk
+    ORDER BY year DESC, week_num DESC
+    LIMIT 1
+    """
+)
+
 
 def _compute_min_yrwk(weeks_back: int) -> int:
     today = date.today()
@@ -97,6 +113,136 @@ def _collect_week_index(facts: pd.DataFrame, coverage: pd.DataFrame) -> list[dat
         weeks.update(pd.to_datetime(coverage["start_date"]).dropna().dt.date.tolist())
     ordered = sorted(weeks)
     return ordered
+
+
+def _coerce_date(value: object) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime().date()
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):  # type: ignore[arg-type]
+            return None
+    except TypeError:
+        pass
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value).date()
+        except ValueError:
+            try:
+                parsed = pd.to_datetime(value, errors="coerce")
+            except Exception:  # pragma: no cover - defensive
+                return None
+            if pd.isna(parsed):
+                return None
+            return parsed.to_pydatetime().date()
+    return None
+
+
+def _sunday_from_yearweek(year: int, week_num: int) -> date:
+    return date.fromisocalendar(year, week_num, 1) - timedelta(days=1)
+
+
+def _resolve_summary_week(
+    outputs: Mapping[str, pd.DataFrame] | None,
+    engine: Engine,
+    scene: str,
+    marketplace_id: str,
+) -> tuple[str, date] | None:
+    outputs_mapping = outputs or {}
+    feature_frame = outputs_mapping.get("features") if isinstance(outputs_mapping, Mapping) else None
+    if feature_frame is not None and not feature_frame.empty:
+        latest = feature_frame.sort_values(["year", "week_num"]).iloc[-1]
+        year = int(latest["year"])
+        week_num = int(latest["week_num"])
+        sunday = _coerce_date(latest.get("start_date")) or _sunday_from_yearweek(year, week_num)
+        week_label = f"{year}W{week_num:02d}"
+        return week_label, sunday
+
+    with engine.connect() as conn:
+        fetched = pd.read_sql_query(
+            LATEST_SUMMARY_WEEK_SQL,
+            conn,
+            params={"scene": scene, "mk": marketplace_id},
+        )
+    if fetched.empty:
+        return None
+    row = fetched.iloc[0]
+    year = int(row["year"])
+    week_num = int(row["week_num"])
+    sunday = _coerce_date(row.get("start_date")) or _sunday_from_yearweek(year, week_num)
+    week_label = f"{year}W{week_num:02d}"
+    return week_label, sunday
+
+
+def _resolve_llm_metadata() -> tuple[str, str]:
+    model = "deepseek-chat"
+    version = SCENE_SUMMARY_VERSION
+    try:
+        settings = get_deepseek_settings()
+    except Exception as exc:  # pragma: no cover - environment dependent
+        LOGGER.debug("scene_pipeline_llm_settings_missing error=%s", exc)
+    else:
+        if getattr(settings, "model", None):
+            model = settings.model
+    try:
+        scene_config = summarize_scene_module._scene_forecast_config()
+    except Exception as exc:  # pragma: no cover - configuration errors
+        LOGGER.debug("scene_pipeline_llm_config_error error=%s", exc)
+    else:
+        override = scene_config.get("model") if isinstance(scene_config, Mapping) else None
+        if isinstance(override, str) and override.strip():
+            model = override.strip()
+        version_override = scene_config.get("prompt_version") if isinstance(scene_config, Mapping) else None
+        if isinstance(version_override, str) and version_override.strip():
+            version = version_override.strip()
+    return model, version
+
+
+def write_scene_summary_to_db(
+    engine: Engine,
+    *,
+    scene: str,
+    marketplace_id: str,
+    week: str,
+    sunday: date | datetime | pd.Timestamp,
+    summary_str: str,
+    confidence: float | None,
+    llm_model: str,
+    llm_version: str,
+) -> int:
+    sunday_date = sunday if isinstance(sunday, date) and not isinstance(sunday, datetime) else _coerce_date(sunday)
+    if sunday_date is None:
+        raise ValueError("sunday must be a valid date")
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    confidence_value: float | None
+    try:
+        confidence_value = float(confidence) if confidence is not None else None
+    except (TypeError, ValueError):
+        confidence_value = None
+
+    summary_text = str(summary_str)
+
+    record = {
+        "scene": scene,
+        "marketplace_id": marketplace_id,
+        "week": week,
+        "sunday": sunday_date,
+        "confidence": confidence_value,
+        "summary_str": summary_text,
+        "llm_model": llm_model,
+        "llm_version": llm_version,
+        "created_at": now,
+        "updated_at": now,
+    }
+    df = pd.DataFrame([record])
+    return replace_into(engine, SCENE_SUMMARY_TABLE, df)
 
 
 def _latest_yearweek(outputs: dict[str, pd.DataFrame]) -> int | None:
@@ -564,6 +710,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Driver TopN override",
     )
     parser.add_argument("--with-llm", action="store_true", help="Invoke LLM summarisation after ETL")
+    parser.add_argument("--write-summary", action="store_true", help="Persist LLM summary to Doris")
     parser.add_argument("--emit-json", action="store_true", help="Write scene summary JSON to disk")
     parser.add_argument("--emit-md", action="store_true", help="Write Markdown report to disk")
     parser.add_argument(
@@ -589,6 +736,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         namespace.with_llm = True
         if not namespace.emit_json and not namespace.emit_md:
             namespace.emit_json = True
+    if namespace.write_summary:
+        namespace.with_llm = True
     return namespace
 
 
@@ -712,6 +861,70 @@ def main(argv: Sequence[str] | None = None) -> None:
                         message,
                         extra={"scene": args.scene, "mk": args.mk, "call": "summarize_scene"},
                     )
+
+        if args.write_summary:
+            if summary_payload is None:
+                LOGGER.warning(
+                    "scene_pipeline_summary_write_skipped scene=%s mk=%s reason=no_summary",
+                    args.scene,
+                    args.mk,
+                    extra={"scene": args.scene, "mk": args.mk, "reason": "no_summary"},
+                )
+            else:
+                summary_text_raw = summary_payload.get("analysis_summary")
+                summary_text = str(summary_text_raw).strip() if summary_text_raw is not None else ""
+                if not summary_text:
+                    LOGGER.warning(
+                        "scene_pipeline_summary_write_skipped scene=%s mk=%s reason=no_analysis_summary",
+                        args.scene,
+                        args.mk,
+                        extra={
+                            "scene": args.scene,
+                            "mk": args.mk,
+                            "reason": "no_analysis_summary",
+                        },
+                    )
+                else:
+                    resolved = _resolve_summary_week(outputs, engine, args.scene, args.mk)
+                    if resolved is None:
+                        LOGGER.warning(
+                            "scene_pipeline_summary_write_skipped scene=%s mk=%s reason=no_week",
+                            args.scene,
+                            args.mk,
+                            extra={"scene": args.scene, "mk": args.mk, "reason": "no_week"},
+                        )
+                    else:
+                        week_label, sunday = resolved
+                        confidence_value = summary_payload.get("confidence")
+                        model_name, version = _resolve_llm_metadata()
+                        inserted = write_scene_summary_to_db(
+                            engine,
+                            scene=args.scene,
+                            marketplace_id=args.mk,
+                            week=week_label,
+                            sunday=sunday,
+                            summary_str=summary_text,
+                            confidence=confidence_value,
+                            llm_model=model_name,
+                            llm_version=version,
+                        )
+                        LOGGER.info(
+                            "scene_pipeline_summary_written scene=%s mk=%s week=%s sunday=%s inserted=%s",
+                            args.scene,
+                            args.mk,
+                            week_label,
+                            sunday,
+                            inserted,
+                            extra={
+                                "scene": args.scene,
+                                "mk": args.mk,
+                                "week": week_label,
+                                "sunday": str(sunday),
+                                "inserted": inserted,
+                                "llm_model": model_name,
+                                "llm_version": version,
+                            },
+                        )
 
         if args.with_llm and (args.emit_json or args.emit_md):
             yearweek = _latest_yearweek(outputs) if outputs else None
