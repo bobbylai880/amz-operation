@@ -7,10 +7,10 @@ import re
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
 import yaml
 from sqlalchemy import text
@@ -102,6 +102,50 @@ _STAGE2_GROUP_FIELDS = (
 
 _PAGE_LAG_TYPES = {"price", "rank", "content", "social", "badge", "confidence"}
 _TRAFFIC_LAG_TYPES = {"traffic_mix", "keyword"}
+
+_LAG_TYPE_FILENAME_ALIASES: Mapping[str, str] = {
+    "price": "pricing",
+    "rank": "rank",
+    "content": "content",
+    "social": "social",
+    "badge": "badge",
+    "confidence": "confidence",
+    "traffic_mix": "traffic_mix",
+    "keyword": "keyword",
+}
+
+_ROOT_CAUSE_TO_LAG: Mapping[str, str] = {
+    "pricing_misalignment": "price",
+    "promo_gap": "price",
+    "ads_underinvestment": "traffic_mix",
+    "keyword_gap": "keyword",
+    "content_quality": "content",
+    "assortment": "badge",
+}
+
+_ENTITY_DETAIL_FIELDS: tuple[str, ...] = (
+    "price_current",
+    "price_list",
+    "coupon_pct",
+    "price_net",
+    "rank_leaf",
+    "rank_root",
+    "rank_score",
+    "image_cnt",
+    "video_cnt",
+    "bullet_cnt",
+    "title_len",
+    "aplus_flag",
+    "content_score",
+    "rating",
+    "reviews",
+    "social_proof",
+    "badge_json",
+    "brand",
+)
+
+_KEYWORD_LOOKBACK_DAYS = 7
+_KEYWORD_PER_PAIR_LIMIT = 2
 
 _RULES_CONFIG_DEFAULT_PATH = Path("configs/competition_lag_rules.yaml")
 _RULES_CONFIG_SCHEMA_NAME = "competition_lag_rules.schema.json"
@@ -403,6 +447,8 @@ class CompetitionLLMOrchestrator:
         self._stage2_schema = load_schema("competition_stage2_aggregate.schema.json")
         self._stage2_prompt = load_prompt("competition_stage2_aggregate.md")
         self._current_marketplace_id: str | None = None
+        self._brand_cache: dict[str, str | None] = {}
+        self._brand_path_tokens: list[str] | None = None
 
     def run(
         self,
@@ -434,16 +480,28 @@ class CompetitionLLMOrchestrator:
 
         storage_paths: list[Path] = []
         stage1_outputs: Sequence[StageOneResult] = ()
+        stage1_llm_requested = stages is None or "stage1" in raw_stage_request
+        stage1_llm_enabled = bool(self._config.stage_1.enable_llm)
+        use_stage1_llm = run_stage1 and stage1_llm_requested and stage1_llm_enabled
         if run_stage1:
             stage1_inputs = self._collect_stage1_inputs(target_week, marketplace_id)
             rule_results = self._execute_stage1_code(stage1_inputs)
             stage1_payloads: list[StageOneResult] = []
+            if not use_stage1_llm:
+                reason = "config_disabled"
+                if stage1_llm_enabled:
+                    reason = "stage2_only"
+                LOGGER.info("competition_llm.stage1_llm_skipped reason=%s", reason)
             for index, rule_result in enumerate(rule_results):
                 overview_rows: Sequence[Mapping[str, Any]] = ()
                 traffic_rows: Sequence[Mapping[str, Any]] = ()
                 if index < len(stage1_inputs):
                     _, overview_rows, traffic_rows = stage1_inputs[index]
-                stage1_result = self._apply_stage1_llm(rule_result, overview_rows, traffic_rows)
+                stage1_result: StageOneResult
+                if use_stage1_llm:
+                    stage1_result = self._apply_stage1_llm(rule_result, overview_rows, traffic_rows)
+                else:
+                    stage1_result = rule_result
                 if isinstance(stage1_result, StageOneLLMResult) and stage1_result.prompt_path:
                     storage_paths.append(stage1_result.prompt_path)
                 storage_paths.append(self._write_stage1_output(stage1_result))
@@ -543,6 +601,7 @@ class CompetitionLLMOrchestrator:
         results: list[StageOneResult] = []
         has_applicable_rules = False
         for context, overview_rows, traffic_rows in inputs:
+            self._validate_stage1_context(context)
             rules = self._load_active_rules(context, config_data=rules_config)
             opp_type = str(context.get("opp_type") or "").lower()
             applicable_rules = [rule for rule in rules if rule.opp_type in ("any", opp_type)]
@@ -632,6 +691,15 @@ class CompetitionLLMOrchestrator:
         if not has_applicable_rules:
             LOGGER.warning("competition_llm.stage1_no_rules active=0")
         return tuple(results)
+
+    def _validate_stage1_context(self, context: Mapping[str, Any]) -> None:
+        missing = [field for field in _REQUIRED_CONTEXT_FIELDS if context.get(field) is None]
+        if missing:
+            asin = context.get("my_asin") or "unknown"
+            missing_fields = ",".join(missing)
+            raise ValueError(
+                f"Stage-1 context missing required fields [{missing_fields}] for ASIN {asin}"
+            )
 
     def _apply_stage1_llm(
         self,
@@ -907,6 +975,11 @@ class CompetitionLLMOrchestrator:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
         return path
 
+    def _build_stage1_storage_name(self, context: Mapping[str, Any]) -> str:
+        asin = str(context.get("my_asin") or "unknown")
+        opp_type = str(context.get("opp_type") or "na")
+        return f"{asin}_{opp_type}"
+
     def _prepare_stage2_candidates(self, stage1_results: Sequence[StageOneResult]) -> Sequence[StageTwoCandidate]:
         candidates: list[StageTwoCandidate] = []
         threshold = self._config.stage_1.conf_min
@@ -986,9 +1059,10 @@ class CompetitionLLMOrchestrator:
             human_markdown = llm_response.get("human_markdown")
             if not isinstance(machine_json, Mapping):
                 raise ValueError("Stage-2 machine_json missing or invalid")
+            machine_json = dict(machine_json)
             if not isinstance(machine_json.get("context"), Mapping):
-                machine_json = dict(machine_json)
                 machine_json["context"] = facts.get("context", {})
+            machine_json = self._materialize_evidence(machine_json, facts)
             self._validate_stage2_machine_json(machine_json)
             if not isinstance(human_markdown, str):
                 raise ValueError("Stage-2 human_markdown must be a string")
@@ -1023,7 +1097,11 @@ class CompetitionLLMOrchestrator:
             if not lag_type or not opp_type:
                 LOGGER.debug("competition_llm.stage2_skip_invalid_dimension dimension=%s", dimension)
                 continue
-            display_label = str(dimension.get("lag_type") or "").strip() or _LAG_TYPE_FILENAME_ALIASES.get(lag_type, lag_type)
+            display_label_raw = str(dimension.get("lag_type") or "").strip()
+            if display_label_raw and display_label_raw.lower() != lag_type:
+                display_label = display_label_raw
+            else:
+                display_label = _LAG_TYPE_FILENAME_ALIASES.get(lag_type, lag_type)
             severity_label = str(dimension.get("severity") or "low").lower()
             severity_rank = _SEVERITY_ORDER.get(severity_label, 1)
             opp_types_seen.add(opp_type)
@@ -1628,18 +1706,715 @@ class CompetitionLLMOrchestrator:
             raise last_error
         raise RuntimeError("LLM invocation failed without exception")
 
-    def _validate_stage2_machine_json(self, payload: Mapping[str, Any]) -> None:
-        validate_schema(self._stage2_schema, payload)
-        actions = payload.get("recommended_actions", [])
-        for action in actions:
-            code = action.get("action_code")
-            if self._config.stage_2.allowed_action_codes and code not in self._config.stage_2.allowed_action_codes:
-                raise ValueError(f"Action code {code!r} is not permitted")
-        root_causes = payload.get("root_causes", [])
+    def _materialize_evidence(
+        self,
+        payload: Mapping[str, Any],
+        facts: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        data = dict(payload)
+        root_causes = data.get("root_causes")
+        if not isinstance(root_causes, Sequence):
+            return data
+
+        lag_index = self._build_lag_index(facts)
+        if not lag_index:
+            cleaned = []
+            for cause in root_causes:
+                if isinstance(cause, Mapping):
+                    entry = dict(cause)
+                    entry.pop("evidence_refs", None)
+                    cleaned.append(entry)
+                else:
+                    cleaned.append(cause)
+            data["root_causes"] = cleaned
+            return data
+
+        cleaned_causes: list[Mapping[str, Any]] = []
         for cause in root_causes:
-            code = cause.get("root_cause_code")
-            if self._config.stage_2.allowed_root_cause_codes and code not in self._config.stage_2.allowed_root_cause_codes:
+            if not isinstance(cause, Mapping):
+                cleaned_causes.append(cause)
+                continue
+
+            entry = dict(cause)
+            raw_evidence: list[Any] = []
+            if entry.get("evidence"):
+                raw_evidence.extend(
+                    self._normalise_evidence_sequence(entry.get("evidence"))
+                )
+
+            inferred_lag = self._infer_root_cause_dimension(entry, lag_index)
+            lag_type = inferred_lag
+            lag_data = lag_index.get(lag_type)
+
+            hints = self._parse_evidence_refs(entry.get("evidence_refs"))
+            if lag_data is None and len(lag_index) == 1:
+                lag_type, lag_data = next(iter(lag_index.items()))
+            if lag_data is None:
+                for hint in hints:
+                    hinted_type = hint.get("lag_type")
+                    if hinted_type and hinted_type in lag_index:
+                        lag_type = hinted_type
+                        lag_data = lag_index.get(hinted_type)
+                        break
+
+            if lag_data is not None:
+                for hint in hints:
+                    raw_evidence.extend(
+                        self._build_evidence_from_hint(lag_index, lag_type, hint)
+                    )
+
+                if not raw_evidence:
+                    raw_evidence.extend(
+                        self._extract_pairwise_evidence(lag_type, lag_data)
+                    )
+
+                if not raw_evidence:
+                    raw_evidence.extend(
+                        self._extract_overview_evidence(lag_type, lag_data)
+                    )
+            else:
+                LOGGER.warning(
+                    "competition_llm.stage2_evidence_lag_not_found lag_hint=%s available=%s",
+                    inferred_lag,
+                    sorted(lag_index),
+                )
+
+            normalised = self._deduplicate_evidence(
+                self._normalise_evidence_sequence(raw_evidence)
+            )
+
+            if not normalised:
+                LOGGER.warning(
+                    "competition_llm.stage2_evidence_missing code=%s hints=%s",
+                    entry.get("root_cause_code"),
+                    hints,
+                )
+
+            entry["evidence"] = normalised[:3]
+            entry.pop("evidence_refs", None)
+            cleaned_causes.append(entry)
+
+        data["root_causes"] = cleaned_causes
+        return data
+
+    def _build_evidence_from_hint(
+        self,
+        lag_index: Mapping[str, Mapping[str, Any]],
+        default_lag: str,
+        hint: Mapping[str, Any],
+    ) -> list[Mapping[str, Any]]:
+        lag_type = hint.get("lag_type") or default_lag
+        lag_data = lag_index.get(lag_type)
+        if lag_data is None:
+            return []
+        kind = str(hint.get("kind") or "").lower()
+        metric = hint.get("metric")
+        opp_type = hint.get("opp_type")
+        opp_asin = hint.get("opp_asin")
+        if kind == "overview":
+            return self._extract_overview_evidence(
+                lag_type,
+                lag_data,
+                metric=metric,
+                opp_type=opp_type,
+            )
+        if kind == "pair":
+            return self._extract_pairwise_evidence(
+                lag_type,
+                lag_data,
+                metric=metric,
+                opp_asin=opp_asin,
+            )
+        return []
+
+    def _build_lag_index(self, facts: Mapping[str, Any]) -> Mapping[str, Mapping[str, Any]]:
+        lag_items = facts.get("lag_items")
+        if not isinstance(lag_items, Sequence):
+            return {}
+        index: dict[str, Mapping[str, Any]] = {}
+        for item in lag_items:
+            if not isinstance(item, Mapping):
+                continue
+            lag_label = item.get("lag_type")
+            normalized = _normalize_lag_type(lag_label)
+            if not normalized:
+                continue
+            overview = item.get("overview")
+            if not isinstance(overview, Mapping):
+                overview = {}
+            top_opps_raw = item.get("top_opps")
+            top_opps: list[Mapping[str, Any]] = []
+            if isinstance(top_opps_raw, Sequence):
+                for row in top_opps_raw:
+                    if isinstance(row, Mapping):
+                        top_opps.append(row)
+            index[normalized] = {
+                "lag_type": normalized,
+                "overview": overview,
+                "top_opps": top_opps,
+            }
+        return index
+
+    def _infer_root_cause_dimension(
+        self, cause: Mapping[str, Any], lag_index: Mapping[str, Mapping[str, Any]]
+    ) -> str:
+        lag_dimension = _normalize_lag_type(
+            cause.get("lag_dimension") or cause.get("lag_type")
+        )
+        if lag_dimension in lag_index:
+            return lag_dimension
+        code = str(cause.get("root_cause_code") or cause.get("code") or "").strip().lower()
+        mapped = _ROOT_CAUSE_TO_LAG.get(code, lag_dimension)
+        if mapped in lag_index:
+            return mapped
+        return mapped
+
+    def _parse_evidence_refs(self, refs: Any) -> list[Mapping[str, Any]]:
+        if not isinstance(refs, Sequence):
+            return []
+        hints: list[Mapping[str, Any]] = []
+        for ref in refs:
+            if isinstance(ref, Mapping):
+                metric = str(ref.get("metric") or "").strip()
+                if not metric:
+                    continue
+                hint: dict[str, Any] = {
+                    "kind": "overview",
+                    "metric": metric,
+                }
+                lag_type = _normalize_lag_type(ref.get("lag_type"))
+                if lag_type:
+                    hint["lag_type"] = lag_type
+                opp_type = str(ref.get("opp_type") or "").strip().lower()
+                if opp_type:
+                    hint["opp_type"] = opp_type
+                hints.append(hint)
+            elif isinstance(ref, str):
+                cleaned = ref.strip()
+                if not cleaned:
+                    continue
+                parts = cleaned.split(".")
+                if len(parts) >= 3 and parts[0] == "overview":
+                    hint = {
+                        "kind": "overview",
+                        "opp_type": parts[1].lower(),
+                        "metric": parts[2],
+                    }
+                    hints.append(hint)
+                elif len(parts) >= 2 and parts[0] == "top_opps":
+                    hint = {"kind": "pair"}
+                    if len(parts) >= 3:
+                        hint["metric"] = parts[-1]
+                    if len(parts) >= 2 and parts[1]:
+                        hint["opp_asin"] = parts[1]
+                    hints.append(hint)
+        return hints
+
+    def _extract_overview_evidence(
+        self,
+        lag_type: str,
+        lag_data: Mapping[str, Any],
+        *,
+        metric: Any = None,
+        opp_type: Any = None,
+    ) -> list[Mapping[str, Any]]:
+        overview = lag_data.get("overview")
+        if not isinstance(overview, Mapping):
+            return []
+        target_opp_types: Sequence[str]
+        if opp_type:
+            target_opp_types = (str(opp_type).lower(),)
+        else:
+            target_opp_types = tuple(overview.keys())
+        source = "page.overview" if lag_type in _PAGE_LAG_TYPES else "traffic.overview"
+        results: list[Mapping[str, Any]] = []
+        for opp in target_opp_types:
+            metrics_map = overview.get(opp)
+            if not isinstance(metrics_map, Mapping):
+                continue
+            for name, value in metrics_map.items():
+                if metric and name != metric:
+                    continue
+                entry = self._build_overview_evidence_entry(
+                    lag_type,
+                    str(opp),
+                    name,
+                    value,
+                    source,
+                )
+                if entry:
+                    results.append(entry)
+                if metric:
+                    break
+            if results and metric:
+                break
+        return results
+
+    def _build_overview_evidence_entry(
+        self,
+        lag_type: str,
+        opp_type: str,
+        metric: str,
+        value: Any,
+        source: str,
+    ) -> Mapping[str, Any] | None:
+        if value is None:
+            return None
+        against = opp_type.lower()
+        if against not in {"leader", "median"}:
+            return None
+        metric_lower = metric.lower()
+        unit = None
+        if "ratio" in metric_lower or "index" in metric_lower:
+            unit = "ratio"
+            opp_value: Any = 1.0
+        else:
+            return None
+        evidence = {
+            "metric": metric,
+            "against": against,
+            "my_value": self._format_evidence_value(value),
+            "opp_value": opp_value,
+            "unit": unit,
+            "source": source,
+        }
+        return evidence
+
+    def _extract_pairwise_evidence(
+        self,
+        lag_type: str,
+        lag_data: Mapping[str, Any],
+        *,
+        metric: Any = None,
+        opp_asin: Any = None,
+        limit: int = 3,
+    ) -> list[Mapping[str, Any]]:
+        rows = lag_data.get("top_opps")
+        if not isinstance(rows, Sequence):
+            return []
+        source = "pairs_each" if lag_type in _PAGE_LAG_TYPES else "traffic.pairs"
+        candidates: list[tuple[int, float, Mapping[str, Any]]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            row_opp_asin = row.get("opp_asin")
+            if opp_asin and row_opp_asin != opp_asin:
+                continue
+            for entry in self._build_pairwise_entries_from_row(
+                lag_type,
+                row,
+                source,
+            ):
+                if metric and entry.get("metric") != metric:
+                    continue
+                payload = dict(entry)
+                if row_opp_asin and "opp_asin" not in payload:
+                    payload["opp_asin"] = row_opp_asin
+                priority = int(payload.pop("_priority", 50))
+                impact = float(payload.pop("_impact", 0.0))
+                candidates.append((priority, impact, payload))
+
+        ordered = sorted(candidates, key=lambda item: (item[0], -abs(item[1])))
+        results: list[Mapping[str, Any]] = []
+        for _, _, entry in ordered:
+            results.append(entry)
+            if len(results) >= limit:
+                break
+        return results
+
+    def _build_pairwise_entries_from_row(
+        self,
+        lag_type: str,
+        row: Mapping[str, Any],
+        source: str,
+    ) -> list[Mapping[str, Any]]:
+        if not isinstance(row, Mapping):
+            return []
+        if lag_type == "rank":
+            entries = self._build_rank_entries(row, source)
+        elif lag_type == "content":
+            entries = self._build_content_entries(row, source)
+        elif lag_type == "social":
+            entries = self._build_social_entries(row, source)
+        elif lag_type == "keyword":
+            entries = self._build_keyword_entries(row, source)
+        else:
+            entries = []
+        if not entries:
+            entries = self._build_default_pairwise_entries(row, source)
+        return entries
+
+    def _build_rank_entries(
+        self, row: Mapping[str, Any], source: str
+    ) -> list[Mapping[str, Any]]:
+        entries: list[Mapping[str, Any]] = []
+        entry = self._build_metric_entry(
+            row,
+            "rank_leaf",
+            source,
+            priority=1,
+            unit="rank",
+            note_builder=_format_rank_leaf_note,
+        )
+        if entry:
+            entries.append(entry)
+        entry = self._build_metric_entry(
+            row,
+            "rank_pos_pct",
+            source,
+            priority=2,
+            unit="pct",
+            note_builder=_format_rank_pct_note,
+        )
+        if entry:
+            entries.append(entry)
+        return entries
+
+    def _build_content_entries(
+        self, row: Mapping[str, Any], source: str
+    ) -> list[Mapping[str, Any]]:
+        entries: list[Mapping[str, Any]] = []
+        entry = self._build_metric_entry(
+            row,
+            "image_cnt",
+            source,
+            priority=1,
+            note_builder=_format_image_note,
+        )
+        if entry:
+            entries.append(entry)
+        entry = self._build_metric_entry(
+            row,
+            "video_cnt",
+            source,
+            priority=2,
+            note_builder=_format_video_note,
+        )
+        if entry:
+            entries.append(entry)
+        entry = self._build_metric_entry(
+            row,
+            "content_score",
+            source,
+            priority=3,
+            note_builder=_format_content_score_note,
+        )
+        if entry:
+            entries.append(entry)
+        return entries
+
+    def _build_social_entries(
+        self, row: Mapping[str, Any], source: str
+    ) -> list[Mapping[str, Any]]:
+        entries: list[Mapping[str, Any]] = []
+        entry = self._build_metric_entry(
+            row,
+            "rating",
+            source,
+            priority=1,
+            note_builder=_format_rating_note,
+        )
+        if entry:
+            entries.append(entry)
+        entry = self._build_metric_entry(
+            row,
+            "reviews",
+            source,
+            priority=2,
+            note_builder=_format_reviews_note,
+        )
+        if entry:
+            entries.append(entry)
+        entry = self._build_metric_entry(
+            row,
+            "social_proof",
+            source,
+            priority=3,
+            note_builder=_format_social_proof_note,
+        )
+        if entry:
+            entries.append(entry)
+        return entries
+
+    def _build_keyword_entries(
+        self, row: Mapping[str, Any], source: str
+    ) -> list[Mapping[str, Any]]:
+        opp_asin = row.get("opp_asin")
+        if not opp_asin:
+            return []
+        pairs = row.get("keyword_pairs")
+        if not isinstance(pairs, Sequence):
+            return []
+        entries: list[Mapping[str, Any]] = []
+        for index, pair in enumerate(pairs):
+            if not isinstance(pair, Mapping):
+                continue
+            keyword = pair.get("keyword")
+            opp_rank = pair.get("opp_rank")
+            if not keyword or opp_rank is None:
+                continue
+            my_rank = pair.get("my_rank")
+            my_share = pair.get("my_share")
+            opp_share = pair.get("opp_share")
+            note = _format_keyword_note(
+                keyword,
+                my_rank,
+                opp_rank,
+                my_share,
+                opp_share,
+                pair.get("tag"),
+            )
+            entry: dict[str, Any] = {
+                "metric": "keyword_rank",
+                "against": "asin",
+                "my_value": my_rank if my_rank is not None else "无",
+                "opp_value": opp_rank,
+                "opp_asin": opp_asin,
+                "unit": "rank",
+                "source": "keywords.7d",
+                "note": note,
+                "_priority": 1 + index,
+                "_impact": float(pair.get("impact", 0.0) or 0.0),
+            }
+            entries.append(entry)
+        return entries
+
+    def _build_default_pairwise_entries(
+        self, row: Mapping[str, Any], source: str
+    ) -> list[Mapping[str, Any]]:
+        entries: list[Mapping[str, Any]] = []
+        for key in row.keys():
+            if not key.startswith("my_"):
+                continue
+            suffix = key[3:]
+            entry = self._build_metric_entry(
+                row,
+                suffix,
+                source,
+                priority=50,
+            )
+            if entry:
+                entries.append(entry)
+        return entries
+
+    def _build_metric_entry(
+        self,
+        row: Mapping[str, Any],
+        suffix: str,
+        source: str,
+        *,
+        priority: int,
+        unit: str | None = None,
+        note_builder: Callable[[Any, Any, Mapping[str, Any]], str | None] | None = None,
+    ) -> Mapping[str, Any] | None:
+        opp_asin = row.get("opp_asin")
+        if not opp_asin:
+            return None
+        my_key = f"my_{suffix}"
+        opp_key = f"opp_{suffix}"
+        if my_key not in row or opp_key not in row:
+            return None
+        my_value = row.get(my_key)
+        opp_value = row.get(opp_key)
+        if my_value in (None, "") or opp_value in (None, ""):
+            return None
+        entry: dict[str, Any] = {
+            "metric": suffix,
+            "against": "asin",
+            "my_value": self._format_evidence_value(my_value),
+            "opp_value": self._format_evidence_value(opp_value),
+            "opp_asin": opp_asin,
+            "source": source,
+            "_priority": priority,
+            "_impact": _compute_pair_gap(my_value, opp_value),
+        }
+        if unit:
+            entry["unit"] = unit
+        else:
+            inferred = self._infer_metric_unit(suffix)
+            if inferred:
+                entry["unit"] = inferred
+        if note_builder:
+            note = note_builder(my_value, opp_value, row)
+            if note:
+                entry["note"] = note
+        return entry
+
+    def _normalise_evidence_sequence(self, items: Any) -> list[Mapping[str, Any]]:
+        if not isinstance(items, Sequence):
+            return []
+        result: list[Mapping[str, Any]] = []
+        for item in items:
+            normalised = self._normalise_evidence_entry(item)
+            if normalised:
+                result.append(normalised)
+        return result
+
+    def _normalise_evidence_entry(self, item: Any) -> Mapping[str, Any] | None:
+        if not isinstance(item, Mapping):
+            return None
+        metric = str(item.get("metric") or "").strip()
+        if not metric:
+            return None
+        against_raw = item.get("against") or item.get("opp_type")
+        against = str(against_raw or "").strip().lower()
+        if against not in {"leader", "median", "asin"}:
+            return None
+        my_value = item.get("my_value")
+        opp_value = item.get("opp_value")
+        if my_value is None or opp_value is None:
+            return None
+        opp_asin = item.get("opp_asin")
+        if against == "asin" and not opp_asin:
+            return None
+        normalised: dict[str, Any] = {
+            "metric": metric,
+            "against": against,
+            "my_value": self._format_evidence_value(my_value),
+            "opp_value": self._format_evidence_value(opp_value),
+        }
+        if against == "asin":
+            normalised["opp_asin"] = str(opp_asin)
+        unit = item.get("unit")
+        if unit is not None:
+            normalised["unit"] = unit
+        source = item.get("source")
+        if source is not None:
+            normalised["source"] = source
+        note = item.get("note")
+        if note is not None:
+            normalised["note"] = note
+        return normalised
+
+    def _deduplicate_evidence(
+        self, entries: Sequence[Mapping[str, Any]]
+    ) -> list[Mapping[str, Any]]:
+        seen: set[tuple[Any, ...]] = set()
+        result: list[Mapping[str, Any]] = []
+        for entry in entries:
+            key = (
+                entry.get("metric"),
+                entry.get("against"),
+                entry.get("opp_asin"),
+                self._format_evidence_value(entry.get("my_value")),
+                self._format_evidence_value(entry.get("opp_value")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(entry)
+        return result
+
+    def _format_evidence_value(self, value: Any) -> Any:
+        numeric = _coerce_float(value)
+        if numeric is None:
+            return value
+        return round(numeric, 4)
+
+    def _infer_metric_unit(self, metric: str) -> str | None:
+        lower = metric.lower()
+        if lower.endswith("_pct") or "pct" in lower or lower.endswith("_share") or "share" in lower:
+            return "pct"
+        if "ratio" in lower or "index" in lower:
+            return "ratio"
+        if "price" in lower or lower.endswith("_usd"):
+            return "USD"
+        return None
+
+    def _validate_stage2_machine_json(self, payload: Mapping[str, Any]) -> None:
+        if isinstance(payload, MutableMapping):
+            mutable_payload: MutableMapping[str, Any] = payload
+        else:
+            mutable_payload = dict(payload)
+
+        if "actions" not in mutable_payload and "recommended_actions" in mutable_payload:
+            mutable_payload["actions"] = mutable_payload.get("recommended_actions") or []
+
+        raw_actions = mutable_payload.get("actions") or []
+        if not isinstance(raw_actions, Sequence):
+            LOGGER.warning(
+                "competition_llm.stage2_drop_actions_invalid_container type=%s",
+                type(raw_actions).__name__,
+            )
+            raw_actions = []
+
+        allowed_actions = tuple(self._config.stage_2.allowed_action_codes or ())
+        allowed_actions_set = {code for code in allowed_actions if code}
+        cleaned_actions: list[dict[str, Any]] = []
+        for index, action in enumerate(raw_actions):
+            if not isinstance(action, Mapping):
+                LOGGER.warning(
+                    "competition_llm.stage2_drop_action_invalid_item index=%s type=%s",
+                    index,
+                    type(action).__name__,
+                )
+                continue
+            code_raw = action.get("code")
+            if code_raw is None:
+                code_raw = action.get("action_code")
+            code = str(code_raw).strip() if code_raw is not None else ""
+            if not code:
+                LOGGER.warning(
+                    "competition_llm.stage2_drop_action_missing_code index=%s item=%s",
+                    index,
+                    action,
+                )
+                continue
+            if allowed_actions_set and code not in allowed_actions_set:
+                raise ValueError(f"Action code {code!r} is not permitted")
+            normalized = dict(action)
+            normalized["code"] = code
+            cleaned_actions.append(normalized)
+
+        mutable_payload["actions"] = cleaned_actions
+        if "recommended_actions" in mutable_payload:
+            mutable_payload["recommended_actions"] = cleaned_actions
+
+        root_causes_raw = mutable_payload.get("root_causes") or []
+        if not isinstance(root_causes_raw, Sequence):
+            LOGGER.warning(
+                "competition_llm.stage2_root_causes_invalid_container type=%s",
+                type(root_causes_raw).__name__,
+            )
+            root_causes = []
+        else:
+            root_causes = list(root_causes_raw)
+        mutable_payload["root_causes"] = root_causes
+
+        allowed_root_causes = tuple(self._config.stage_2.allowed_root_cause_codes or ())
+        allowed_root_causes_set = {code for code in allowed_root_causes if code}
+        for index, cause in enumerate(root_causes):
+            if not isinstance(cause, Mapping):
+                LOGGER.warning(
+                    "competition_llm.stage2_root_cause_invalid_item type=%s",
+                    type(cause).__name__,
+                )
+                continue
+            code_raw = cause.get("root_cause_code")
+            if code_raw is None:
+                code_raw = cause.get("code")
+            code = str(code_raw).strip() if code_raw is not None else ""
+            if not code:
+                raise ValueError("Root cause code is required")
+            if allowed_root_causes_set and code not in allowed_root_causes_set:
                 raise ValueError(f"Root cause code {code!r} is not permitted")
+            evidence_list = self._normalise_evidence_sequence(cause.get("evidence"))
+            if not evidence_list:
+                raise ValueError("Root cause evidence is required")
+            evidence_list = self._deduplicate_evidence(evidence_list)[:3]
+            if isinstance(cause, MutableMapping):
+                cause.setdefault("root_cause_code", code)
+                cause["evidence"] = evidence_list
+                if "evidence_refs" in cause:
+                    cause.pop("evidence_refs", None)
+            else:
+                updated = dict(cause)
+                updated["root_cause_code"] = code
+                updated["evidence"] = evidence_list
+                updated.pop("evidence_refs", None)
+                root_causes[index] = updated
+
+        validate_schema(self._stage2_schema, mutable_payload)
 
     def _build_page_evidence(
         self, ctx: Mapping[str, Any], lag_type: str, opp_type: str
@@ -1679,22 +2454,9 @@ class CompetitionLLMOrchestrator:
         }
         metric_col, score_col = metric_map.get(lag_type, ("pressure", "pressure"))
 
-        select_columns = [
-            "opp_asin",
-            "opp_parent_asin",
-            "price_gap_each",
-            "price_ratio_each",
-            "rank_pos_delta",
-            "content_gap_each",
-            "social_gap_each",
-            "badge_delta_sum",
-        ]
-        if lag_type == "confidence":
-            select_columns.append("confidence")
-        select_columns.append(f"{score_col} AS score")
-        select_clause = ",\n                 ".join(select_columns)
         sql_each = f"""
-          SELECT {select_clause}
+          SELECT *,
+                 {score_col} AS score
           FROM bi_amz_comp_pairs_each
           WHERE scene_tag=:scene_tag AND base_scene=:base_scene
             AND COALESCE(morphology,'') = COALESCE(:morphology,'')
@@ -1714,6 +2476,8 @@ class CompetitionLLMOrchestrator:
                 exc,
             )
             top_each = []
+        if top_each:
+            self._attach_page_entity_details(ctx, top_each)
         comparison_reasons = _build_comparison_reasons(lag_type, top_each)
 
         return {
@@ -1729,6 +2493,398 @@ class CompetitionLLMOrchestrator:
             "reason_code": f"{lag_type}_by_pairs",
             "prompt_hint": "优先解释 overview 与 top_opps 中的差异来源；引用已给字段名即可；不要推导新指标。",
         }
+
+    def _attach_page_entity_details(
+        self,
+        ctx: Mapping[str, Any],
+        rows: Sequence[MutableMapping[str, Any]] | Sequence[Mapping[str, Any]],
+    ) -> None:
+        if not rows:
+            return
+
+        my_detail = self._get_entity_detail(ctx, ctx.get("my_asin"))
+        opponent_cache: dict[str, Mapping[str, Any] | None] = {}
+
+        for row in rows:
+            if not isinstance(row, MutableMapping):
+                continue
+            opp_asin = row.get("opp_asin")
+            if not opp_asin or opp_asin in opponent_cache:
+                continue
+            opponent_cache[opp_asin] = self._get_entity_detail(ctx, opp_asin)
+
+        for row in rows:
+            if not isinstance(row, MutableMapping):
+                continue
+            if my_detail:
+                self._inject_entity_fields(row, my_detail, prefix="my_")
+            opp_asin = row.get("opp_asin")
+            if not opp_asin:
+                continue
+            opp_detail = opponent_cache.get(opp_asin)
+            if opp_detail:
+                self._inject_entity_fields(row, opp_detail, prefix="opp_")
+
+    def _get_entity_detail(
+        self, ctx: Mapping[str, Any], asin: Any
+    ) -> Mapping[str, Any] | None:
+        if not asin:
+            return None
+        sql = """
+          SELECT price_current, price_list, coupon_pct, price_net,
+                 rank_leaf, rank_root, rank_score,
+                 image_cnt, video_cnt, bullet_cnt, title_len, aplus_flag, content_score,
+                 rating, reviews, social_proof, badge_json, brand
+          FROM bi_amz_comp_entities_clean
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND asin=:asin
+          LIMIT 1
+        """
+        params = {
+            "scene_tag": ctx.get("scene_tag"),
+            "base_scene": ctx.get("base_scene"),
+            "morphology": ctx.get("morphology"),
+            "marketplace_id": ctx.get("marketplace_id"),
+            "week": ctx.get("week"),
+            "sunday": ctx.get("sunday"),
+            "asin": asin,
+        }
+        try:
+            detail = self._fetch_one(sql, params)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_entity_lookup_failed asin=%s error=%s",
+                asin,
+                exc,
+            )
+            detail = None
+
+        if detail:
+            result = dict(detail)
+        else:
+            result = {}
+
+        if not result.get("brand"):
+            brand = self._lookup_brand(ctx, asin)
+            if brand:
+                result["brand"] = brand
+
+        return result or None
+
+    def _inject_entity_fields(
+        self,
+        target: MutableMapping[str, Any],
+        source: Mapping[str, Any],
+        *,
+        prefix: str,
+    ) -> None:
+        for field in _ENTITY_DETAIL_FIELDS:
+            key = f"{prefix}{field}"
+            if key in target and target[key] not in (None, ""):
+                continue
+            value = source.get(field)
+            if value in (None, ""):
+                continue
+            target[key] = value
+
+    def _lookup_brand(self, ctx: Mapping[str, Any], asin: Any) -> str | None:
+        if not asin:
+            return None
+        asin_key = str(asin)
+        if asin_key in self._brand_cache:
+            return self._brand_cache[asin_key]
+
+        brand = self._fetch_brand_from_snapshot(ctx, asin_key)
+        self._brand_cache[asin_key] = brand
+        return brand
+
+    def _fetch_brand_from_snapshot(
+        self, ctx: Mapping[str, Any], asin: str
+    ) -> str | None:
+        marketplace_id = ctx.get("marketplace_id")
+        week = ctx.get("week")
+        params = {
+            "marketplace_id": marketplace_id,
+            "week": week,
+            "asin": asin,
+        }
+        sql = """
+          SELECT brand, payload
+          FROM bi_amz_asin_product_snapshot
+          WHERE marketplace_id=:marketplace_id
+            AND week=:week
+            AND asin=:asin
+          LIMIT 1
+        """
+        try:
+            row = self._fetch_one(sql, params)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_brand_lookup_failed asin=%s error=%s",
+                asin,
+                exc,
+            )
+            row = None
+
+        if not row:
+            return None
+
+        brand_value = row.get("brand")
+        if isinstance(brand_value, str) and brand_value.strip():
+            return brand_value.strip()
+
+        payload = row.get("payload")
+        if payload in (None, ""):
+            return None
+        if isinstance(payload, (bytes, bytearray)):
+            payload = payload.decode("utf-8", errors="ignore")
+        if isinstance(payload, str):
+            try:
+                payload_obj = json.loads(payload)
+            except json.JSONDecodeError:
+                LOGGER.debug(
+                    "competition_llm.stage2_brand_payload_invalid asin=%s", asin
+                )
+                return None
+        elif isinstance(payload, Mapping):
+            payload_obj = payload
+        else:
+            return None
+
+        tokens = self._resolve_brand_path_tokens()
+        brand = _extract_json_path(payload_obj, tokens)
+        if not brand:
+            brand = _extract_json_path(payload_obj, ["brand"])
+        if isinstance(brand, str):
+            return brand.strip() or None
+        return None
+
+    def _resolve_brand_path_tokens(self) -> list[str]:
+        if self._brand_path_tokens is not None:
+            return self._brand_path_tokens
+
+        sql = """
+          SELECT json_path, path, field_path
+          FROM bi_amz_comp_payload_path
+          WHERE field_name = :field_name
+          LIMIT 1
+        """
+        try:
+            row = self._fetch_one(sql, {"field_name": "brand"})
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_brand_path_lookup_failed error=%s",
+                exc,
+            )
+            row = None
+
+        path = None
+        if row:
+            path = (
+                row.get("json_path")
+                or row.get("path")
+                or row.get("field_path")
+                or ""
+            )
+        tokens = _parse_json_path_tokens(str(path or "")) if path else []
+        if not tokens:
+            tokens = ["brand"]
+        self._brand_path_tokens = tokens
+        return tokens
+
+    def _attach_keyword_details(
+        self,
+        ctx: Mapping[str, Any],
+        rows: Sequence[MutableMapping[str, Any]] | Sequence[Mapping[str, Any]],
+    ) -> None:
+        if not rows:
+            return
+        my_asin = ctx.get("my_asin")
+        asins: set[str] = {str(my_asin)} if my_asin else set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            opp_asin = row.get("opp_asin")
+            if opp_asin:
+                asins.add(str(opp_asin))
+        keyword_rankings = self._fetch_keyword_rankings(ctx, asins)
+        if not keyword_rankings:
+            return
+        my_keywords = keyword_rankings.get(str(my_asin), []) if my_asin else []
+        my_index = {item["keyword"]: item for item in my_keywords if item.get("keyword")}
+
+        for row in rows:
+            if not isinstance(row, MutableMapping):
+                continue
+            opp_asin = row.get("opp_asin")
+            if not opp_asin:
+                continue
+            opp_keywords = keyword_rankings.get(str(opp_asin), [])
+            row["keyword_pairs"] = self._compose_keyword_pairs(my_index, opp_keywords)
+
+    def _fetch_keyword_rankings(
+        self,
+        ctx: Mapping[str, Any],
+        asins: Sequence[str],
+    ) -> Mapping[str, list[dict[str, Any]]]:
+        if not asins:
+            return {}
+        marketplace_id = ctx.get("marketplace_id")
+        sunday = ctx.get("sunday")
+        if not marketplace_id or not sunday:
+            return {}
+        try:
+            sunday_date = datetime.fromisoformat(str(sunday)).date()
+        except ValueError:
+            return {}
+        start_date = sunday_date - timedelta(days=_KEYWORD_LOOKBACK_DAYS - 1)
+        asin_list = sorted({str(asin) for asin in asins if asin})
+        if not asin_list:
+            return {}
+        asin_params = {
+            f"asin_{index}": asin for index, asin in enumerate(asin_list)
+        }
+        asin_placeholders = ", ".join(
+            f":asin_{index}" for index in range(len(asin_list))
+        )
+        sql = f"""
+          SELECT asin, keyword, AVG(ratio_score) AS ratio_score
+          FROM vw_sif_keyword_daily_std
+          WHERE marketplace_id=:marketplace_id
+            AND asin IN ({asin_placeholders})
+            AND snapshot_date BETWEEN :start_date AND :end_date
+          GROUP BY asin, keyword
+        """
+        params: dict[str, Any] = {
+            "marketplace_id": marketplace_id,
+            "start_date": start_date.isoformat(),
+            "end_date": sunday_date.isoformat(),
+        }
+        params.update(asin_params)
+        try:
+            rows = self._fetch_all(sql, params)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_keyword_lookup_failed error=%s",
+                exc,
+            )
+            return {}
+
+        rankings: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            asin_value = str(row.get("asin") or "").strip()
+            keyword = str(row.get("keyword") or "").strip()
+            if not asin_value or not keyword:
+                continue
+            share = _coerce_float(row.get("ratio_score"))
+            rankings[asin_value].append(
+                {"keyword": keyword, "share": share if share is not None else 0.0}
+            )
+
+        if not rankings:
+            return {}
+
+        tag_lookup = self._fetch_keyword_tags(
+            {item["keyword"] for items in rankings.values() for item in items}
+        )
+
+        for asin_value, items in rankings.items():
+            items.sort(key=lambda item: item.get("share") or 0.0, reverse=True)
+            limited = items[:10]
+            for index, item in enumerate(limited, start=1):
+                item["rank"] = index
+                if item.get("keyword") in tag_lookup:
+                    item["tag"] = tag_lookup[item["keyword"]]
+            rankings[asin_value] = limited
+
+        return rankings
+
+    def _fetch_keyword_tags(self, keywords: set[str]) -> Mapping[str, str]:
+        if not keywords:
+            return {}
+        keyword_list = sorted({kw for kw in keywords if kw})
+        if not keyword_list:
+            return {}
+        params: dict[str, Any] = {
+            f"kw_{index}": keyword_list[index]
+            for index in range(len(keyword_list))
+        }
+        placeholders = ", ".join(f":kw_{index}" for index in range(len(keyword_list)))
+        sql = f"""
+          SELECT keyword, tag
+          FROM bi_amz_comp_kw_tag
+          WHERE keyword IN ({placeholders})
+        """
+        try:
+            rows = self._fetch_all(sql, params)
+        except SQLAlchemyError:
+            return {}
+        return {
+            str(row.get("keyword") or ""): str(row.get("tag") or "")
+            for row in rows
+            if row.get("keyword")
+        }
+
+    def _compose_keyword_pairs(
+        self,
+        my_index: Mapping[str, Mapping[str, Any]],
+        opponent_keywords: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        pairs: list[dict[str, Any]] = []
+        used: set[str] = set()
+        for item in opponent_keywords:
+            keyword = item.get("keyword")
+            if not keyword:
+                continue
+            my_item = my_index.get(keyword)
+            if not my_item:
+                continue
+            pairs.append(self._build_keyword_pair(keyword, my_item, item))
+            used.add(keyword)
+            if len(pairs) >= _KEYWORD_PER_PAIR_LIMIT:
+                return pairs
+        for item in opponent_keywords:
+            if len(pairs) >= _KEYWORD_PER_PAIR_LIMIT:
+                break
+            keyword = item.get("keyword")
+            if not keyword or keyword in used:
+                continue
+            my_item = my_index.get(keyword)
+            pairs.append(self._build_keyword_pair(keyword, my_item, item))
+            used.add(keyword)
+        return pairs
+
+    def _build_keyword_pair(
+        self,
+        keyword: str,
+        my_item: Mapping[str, Any] | None,
+        opp_item: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        my_rank = _coerce_float(my_item.get("rank")) if my_item else None
+        opp_rank = _coerce_float(opp_item.get("rank"))
+        my_share = _coerce_float(my_item.get("share")) if my_item else None
+        opp_share = _coerce_float(opp_item.get("share"))
+        tag = (
+            my_item.get("tag")
+            if my_item and my_item.get("tag")
+            else opp_item.get("tag")
+        )
+        impact = abs((opp_share or 0.0) - (my_share or 0.0))
+        if my_rank is None:
+            impact = (opp_share or 0.0) + 1.0
+        pair = {
+            "keyword": keyword,
+            "my_rank": int(my_rank) if my_rank is not None else None,
+            "opp_rank": int(opp_rank) if opp_rank is not None else None,
+            "my_share": my_share,
+            "opp_share": opp_share,
+            "tag": tag,
+            "impact": impact,
+        }
+        return pair
 
     def _build_traffic_evidence(
         self, ctx: Mapping[str, Any], lag_type: str, opp_type: str
@@ -1793,6 +2949,10 @@ class CompetitionLLMOrchestrator:
                 exc,
             )
             top_each = []
+        if top_each:
+            self._attach_page_entity_details(ctx, top_each)
+            if lag_type == "keyword":
+                self._attach_keyword_details(ctx, top_each)
         comparison_reasons = _build_comparison_reasons(lag_type, top_each)
 
         return {
@@ -1991,6 +3151,193 @@ def _compute_top_impact(lag_type: str, row: Mapping[str, Any]) -> float:
     return 0.0
 
 
+def _parse_json_path_tokens(path: str) -> list[str]:
+    cleaned = str(path or "").strip()
+    if not cleaned:
+        return []
+    if cleaned.startswith("$"):
+        cleaned = cleaned[1:]
+    tokens: list[str] = []
+    buffer = cleaned
+    while buffer:
+        if buffer.startswith("."):
+            buffer = buffer[1:]
+            continue
+        bracket_index = buffer.find("[")
+        dot_index = buffer.find(".")
+        if bracket_index == -1 and dot_index == -1:
+            tokens.append(buffer)
+            break
+        if bracket_index != -1 and (dot_index == -1 or bracket_index < dot_index):
+            if bracket_index > 0:
+                tokens.append(buffer[:bracket_index])
+            buffer = buffer[bracket_index:]
+            match = re.match(r"\[(\d+)\](.*)", buffer)
+            if match:
+                tokens.append(match.group(1))
+                buffer = match.group(2)
+            else:
+                break
+        else:
+            tokens.append(buffer[:dot_index])
+            buffer = buffer[dot_index:]
+    return [token for token in tokens if token]
+
+
+def _extract_json_path(obj: Any, tokens: Sequence[str]) -> Any:
+    current: Any = obj
+    for token in tokens:
+        if isinstance(current, Mapping):
+            current = current.get(token)
+        elif isinstance(current, Sequence) and not isinstance(current, (str, bytes)):
+            try:
+                index = int(token)
+            except ValueError:
+                return None
+            if index < 0 or index >= len(current):
+                return None
+            current = current[index]
+        else:
+            return None
+    return current
+
+
+def _compute_pair_gap(my_value: Any, opp_value: Any) -> float:
+    my_num = _coerce_float(my_value)
+    opp_num = _coerce_float(opp_value)
+    if my_num is None or opp_num is None:
+        return 0.0
+    return abs(my_num - opp_num)
+
+
+def _format_integer_text(value: Any) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "缺失"
+    return f"{int(round(number)):,}"
+
+
+def _format_decimal_text(value: Any, decimals: int = 2) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "缺失"
+    format_spec = f"{{:.{decimals}f}}"
+    return format_spec.format(number)
+
+
+def _format_percentage_text(value: Any) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "缺失"
+    return f"{number * 100:.2f}%"
+
+
+def _format_rank_leaf_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    my_text = _format_integer_text(my_value)
+    opp_text = _format_integer_text(opp_value)
+    my_num = _coerce_float(my_value)
+    opp_num = _coerce_float(opp_value)
+    gap_text = ""
+    if my_num is not None and opp_num is not None:
+        gap = my_num - opp_num
+        if abs(gap) >= 1:
+            direction = "落后" if gap > 0 else "领先"
+            gap_text = f"，{direction} {abs(int(round(gap)))} 位"
+    return f"类目排名：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_rank_pct_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    my_text = _format_percentage_text(my_value)
+    opp_text = _format_percentage_text(opp_value)
+    my_num = _coerce_float(my_value)
+    opp_num = _coerce_float(opp_value)
+    gap_text = ""
+    if my_num is not None and opp_num is not None:
+        gap = my_num - opp_num
+        if abs(gap) >= 0.005:
+            direction = "落后" if gap > 0 else "领先"
+            gap_text = f"，{direction} {abs(gap) * 100:.2f}%"
+    return f"排名百分位：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_image_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    return _format_count_note("图片数", my_value, opp_value, "张")
+
+
+def _format_video_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    return _format_count_note("视频数", my_value, opp_value, "个")
+
+
+def _format_count_note(label: str, my_value: Any, opp_value: Any, unit: str) -> str:
+    my_text = _format_integer_text(my_value)
+    opp_text = _format_integer_text(opp_value)
+    my_num = _coerce_float(my_value)
+    opp_num = _coerce_float(opp_value)
+    gap_text = ""
+    if my_num is not None and opp_num is not None:
+        gap = opp_num - my_num
+        if abs(gap) >= 1:
+            if gap > 0:
+                gap_text = f"，缺少 {int(round(abs(gap)))}{unit}"
+            else:
+                gap_text = f"，多出 {int(round(abs(gap)))}{unit}"
+    return f"{label}：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_content_score_note(
+    my_value: Any, opp_value: Any, _: Mapping[str, Any]
+) -> str:
+    my_text = _format_decimal_text(my_value)
+    opp_text = _format_decimal_text(opp_value)
+    gap = _compute_pair_gap(my_value, opp_value)
+    gap_text = f"，差距 {gap:.2f}" if gap >= 0.01 else ""
+    return f"内容得分：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_rating_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    my_text = _format_decimal_text(my_value)
+    opp_text = _format_decimal_text(opp_value)
+    gap = _compute_pair_gap(my_value, opp_value)
+    gap_text = f"，相差 {gap:.2f}" if gap >= 0.01 else ""
+    return f"评分：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_reviews_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    note = _format_count_note("评论数", my_value, opp_value, "条")
+    return note
+
+
+def _format_social_proof_note(
+    my_value: Any, opp_value: Any, _: Mapping[str, Any]
+) -> str:
+    my_text = _format_decimal_text(my_value)
+    opp_text = _format_decimal_text(opp_value)
+    gap = _compute_pair_gap(my_value, opp_value)
+    gap_text = f"，差距 {gap:.2f}" if gap >= 0.01 else ""
+    return f"社交证明：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_keyword_note(
+    keyword: str,
+    my_rank: Any,
+    opp_rank: Any,
+    my_share: Any,
+    opp_share: Any,
+    tag: Any,
+) -> str:
+    my_rank_text = f"TOP{int(my_rank)}" if my_rank is not None else "无"
+    opp_rank_text = f"TOP{int(opp_rank)}" if opp_rank is not None else "缺失"
+    my_share_text = _format_percentage_text(my_share)
+    opp_share_text = _format_percentage_text(opp_share)
+    keyword_label = str(keyword)
+    if tag:
+        keyword_label = f"{keyword_label}（{tag}）"
+    return (
+        f"关键词 {keyword_label}：我方{my_rank_text}，对手{opp_rank_text}；"
+        f"7天份额 我方{my_share_text} 对手{opp_share_text}"
+    )
+
+
 def _compose_overview_summary(
     overview: Mapping[str, Any], metrics: Sequence[tuple[str, str]]
 ) -> Mapping[str, Any]:
@@ -2079,11 +3426,16 @@ def _format_metric_value(value: Any) -> str:
 
 
 def _format_opp_label(row: Mapping[str, Any]) -> str:
+    brand = row.get("opp_brand")
     opp_parent = row.get("opp_parent_asin") or ""
     opp_asin = row.get("opp_asin") or "未知ASIN"
+    parts: list[str] = []
+    if brand:
+        parts.append(str(brand))
     if opp_parent and opp_parent != opp_asin:
-        return f"{opp_parent} {opp_asin}"
-    return str(opp_asin)
+        parts.append(str(opp_parent))
+    parts.append(str(opp_asin))
+    return " ".join(part for part in parts if part)
 
 
 def _json_default(obj: Any) -> Any:

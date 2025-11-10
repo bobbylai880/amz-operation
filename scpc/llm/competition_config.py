@@ -17,6 +17,7 @@ class StageOneConfig:
     severity_thresholds: Mapping[str, float]
     max_retries: int = 2
     rules_config_path: str | None = None
+    enable_llm: bool = False
 
 
 @dataclass(slots=True)
@@ -86,6 +87,7 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         severity_thresholds=severity_thresholds,
         max_retries=int(stage1_raw.get("max_retries", 2)),
         rules_config_path=rules_config_path,
+        enable_llm=bool(stage1_raw.get("enable_llm", False)),
     )
 
     trigger_status_raw = stage2_raw.get("trigger_status")
