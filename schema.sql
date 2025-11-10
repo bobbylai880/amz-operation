@@ -207,6 +207,8 @@ CREATE TABLE IF NOT EXISTS bi_amz_scene_summary (
   sunday            DATE         COMMENT "该周的起始日（周日）",
   confidence        DOUBLE                COMMENT "LLM 输出置信度（可选）",
   summary_str       STRING                COMMENT "LLM 最终总结文本内容",
+  summary_md        STRING                COMMENT "LLM 最终总结Markdown 格式",
+  summary_json      JSON                  COMMENT "LLM 最终总结JSON格式",
   llm_model         STRING                COMMENT "生成使用的模型名，如 deepseek-chat",
   llm_version       STRING                COMMENT "Prompt/Schema 版本号，用于溯源",
   updated_at        DATETIME     DEFAULT CURRENT_TIMESTAMP  COMMENT "更新时间戳（更新时）"

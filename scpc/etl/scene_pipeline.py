@@ -203,6 +203,71 @@ def _resolve_llm_metadata() -> tuple[str, str]:
     return model, version
 
 
+def _normalise_summary_json(
+    summary_json: str | bytes | Mapping[str, Any] | Sequence[object] | None,
+    *,
+    scene: str,
+    marketplace_id: str,
+) -> str | None:
+    if summary_json is None:
+        return None
+
+    if isinstance(summary_json, (bytes, bytearray)):
+        try:
+            decoded = summary_json.decode("utf-8")
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.warning(
+                "scene_pipeline_summary_json_decode_failed scene=%s mk=%s error=%s",
+                scene,
+                marketplace_id,
+                exc,
+                extra={
+                    "scene": scene,
+                    "mk": marketplace_id,
+                    "reason": "json_decode_failed",
+                },
+            )
+            return None
+        return _normalise_summary_json(decoded, scene=scene, marketplace_id=marketplace_id)
+
+    if isinstance(summary_json, str):
+        trimmed = summary_json.strip()
+        if not trimmed:
+            return None
+        try:
+            parsed = json.loads(trimmed)
+        except json.JSONDecodeError as exc:
+            LOGGER.warning(
+                "scene_pipeline_summary_json_invalid scene=%s mk=%s error=%s",
+                scene,
+                marketplace_id,
+                exc,
+                extra={
+                    "scene": scene,
+                    "mk": marketplace_id,
+                    "reason": "json_invalid",
+                },
+            )
+            return None
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+    try:
+        return json.dumps(summary_json, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        LOGGER.warning(
+            "scene_pipeline_summary_json_normalize_failed scene=%s mk=%s error=%s",
+            scene,
+            marketplace_id,
+            exc,
+            extra={
+                "scene": scene,
+                "mk": marketplace_id,
+                "reason": "json_normalize_failed",
+            },
+        )
+        return None
+
+
 def write_scene_summary_to_db(
     engine: Engine,
     *,
@@ -211,6 +276,8 @@ def write_scene_summary_to_db(
     week: str,
     sunday: date | datetime | pd.Timestamp,
     summary_str: str,
+    summary_md: str | None,
+    summary_json: str | Mapping[str, Any] | Sequence[object] | None,
     confidence: float | None,
     llm_model: str,
     llm_version: str,
@@ -227,6 +294,14 @@ def write_scene_summary_to_db(
 
     summary_text = str(summary_str)
 
+    markdown_text: str | None
+    if summary_md is None:
+        markdown_text = None
+    else:
+        markdown_text = str(summary_md)
+
+    json_text = _normalise_summary_json(summary_json, scene=scene, marketplace_id=marketplace_id)
+
     record = {
         "scene": scene,
         "marketplace_id": marketplace_id,
@@ -234,11 +309,46 @@ def write_scene_summary_to_db(
         "sunday": sunday_date,
         "confidence": confidence_value,
         "summary_str": summary_text,
+        "summary_md": markdown_text,
+        "summary_json": json_text,
         "llm_model": llm_model,
         "llm_version": llm_version,
     }
     df = pd.DataFrame([record])
     return replace_into(engine, SCENE_SUMMARY_TABLE, df)
+
+
+def _build_summary_markdown(
+    summary_payload: Mapping[str, Any], *, scene: str, marketplace_id: str
+) -> str | None:
+    try:
+        return build_scene_markdown(summary_payload)
+    except Exception:  # pragma: no cover - defensive guard
+        LOGGER.warning(
+            "scene_pipeline_markdown_failed scene=%s mk=%s call=%s",
+            scene,
+            marketplace_id,
+            "build_scene_markdown",
+            extra={"scene": scene, "mk": marketplace_id, "call": "build_scene_markdown"},
+            exc_info=True,
+        )
+        return None
+
+
+def _serialize_summary_payload(
+    summary_payload: Mapping[str, Any], *, scene: str, marketplace_id: str
+) -> str | None:
+    try:
+        return json.dumps(summary_payload, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:  # pragma: no cover - defensive guard
+        LOGGER.warning(
+            "scene_pipeline_summary_json_failed scene=%s mk=%s error=%s",
+            scene,
+            marketplace_id,
+            exc,
+            extra={"scene": scene, "mk": marketplace_id, "reason": "json_serialize_failed"},
+        )
+        return None
 
 
 def _latest_yearweek(outputs: dict[str, pd.DataFrame]) -> int | None:
@@ -797,6 +907,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(json.dumps(summary, default=str))
 
         summary_payload: Mapping[str, Any] | None = None
+        summary_markdown: str | None = None
+        summary_json_text: str | None = None
         summary_error: SceneSummarizationError | None = None
         if args.with_llm:
             features_df = outputs.get("features", pd.DataFrame())
@@ -822,6 +934,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                         mk=args.mk,
                         topn=topn,
                     )
+                    summary_json_text = _serialize_summary_payload(
+                        summary_payload,
+                        scene=args.scene,
+                        marketplace_id=args.mk,
+                    )
+                    if args.write_summary or args.emit_md:
+                        summary_markdown = _build_summary_markdown(
+                            summary_payload,
+                            scene=args.scene,
+                            marketplace_id=args.mk,
+                        )
                     LOGGER.info(
                         "scene_pipeline_llm_complete scene=%s mk=%s call=%s",
                         args.scene,
@@ -900,6 +1023,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                             week=week_label,
                             sunday=sunday,
                             summary_str=summary_text,
+                            summary_md=summary_markdown,
+                            summary_json=summary_json_text,
                             confidence=confidence_value,
                             llm_model=model_name,
                             llm_version=version,
@@ -964,18 +1089,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                             error_payload["raw"] = raw
                         _write_json_output(outdir / "scene_summary.errors.json", error_payload)
                 if args.emit_md and summary_payload is not None:
-                    try:
-                        markdown = build_scene_markdown(summary_payload)
-                        _write_text_output(outdir / "scene_report.md", markdown)
-                    except Exception:  # pragma: no cover - defensive guard
-                        LOGGER.warning(
-                            "scene_pipeline_markdown_failed scene=%s mk=%s call=%s",
-                            args.scene,
-                            args.mk,
-                            "build_scene_markdown",
-                            extra={"scene": args.scene, "mk": args.mk, "call": "build_scene_markdown"},
-                            exc_info=True,
+                    if summary_markdown is None:
+                        summary_markdown = _build_summary_markdown(
+                            summary_payload,
+                            scene=args.scene,
+                            marketplace_id=args.mk,
                         )
+                    if summary_markdown is not None:
+                        _write_text_output(outdir / "scene_report.md", summary_markdown)
         elif args.emit_json or args.emit_md:
             LOGGER.info(
                 "scene_pipeline_emit_skipped scene=%s mk=%s reason=llm_disabled",
