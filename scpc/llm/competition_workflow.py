@@ -2510,6 +2510,7 @@ class CompetitionLLMOrchestrator:
 
         my_detail = self._get_entity_detail(ctx, ctx.get("my_asin"))
         opponent_cache: dict[str, Mapping[str, Any] | None] = {}
+        missing_logged: set[tuple[str, str]] = set()
 
         for row in rows:
             if not isinstance(row, MutableMapping):
@@ -2524,12 +2525,18 @@ class CompetitionLLMOrchestrator:
                 continue
             if my_detail:
                 self._inject_entity_fields(row, my_detail, prefix="my_")
+            else:
+                self._log_missing_entity_detail(
+                    "my", ctx.get("my_asin"), ctx, missing_logged
+                )
             opp_asin = row.get("opp_asin")
             if not opp_asin:
                 continue
             opp_detail = opponent_cache.get(opp_asin)
             if opp_detail:
                 self._inject_entity_fields(row, opp_detail, prefix="opp_")
+            else:
+                self._log_missing_entity_detail("opp", opp_asin, ctx, missing_logged)
 
     def _get_entity_detail(
         self, ctx: Mapping[str, Any], asin: Any
@@ -2540,7 +2547,7 @@ class CompetitionLLMOrchestrator:
           SELECT price_current, price_list, coupon_pct, price_net,
                  rank_leaf, rank_root, rank_score,
                  image_cnt, video_cnt, bullet_cnt, title_len, aplus_flag, content_score,
-                 rating, reviews, social_proof, badge_json, brand
+                 rating, reviews, social_proof, badge_json
           FROM bi_amz_comp_entities_clean
           WHERE scene_tag=:scene_tag AND base_scene=:base_scene
             AND COALESCE(morphology,'') = COALESCE(:morphology,'')
@@ -2580,6 +2587,29 @@ class CompetitionLLMOrchestrator:
 
         return result or None
 
+    def _log_missing_entity_detail(
+        self,
+        side: str,
+        asin: Any,
+        ctx: Mapping[str, Any],
+        logged: set[tuple[str, str]] | None = None,
+    ) -> None:
+        asin_key = str(asin) if asin else ""
+        if not asin_key:
+            return
+        cache = logged if logged is not None else set()
+        key = (side, asin_key)
+        if key in cache:
+            return
+        cache.add(key)
+        LOGGER.debug(
+            "stage2_entity_detail_missing side=%s asin=%s week=%s marketplace_id=%s",
+            side,
+            asin_key,
+            ctx.get("week"),
+            ctx.get("marketplace_id"),
+        )
+
     def _inject_entity_fields(
         self,
         target: MutableMapping[str, Any],
@@ -2604,6 +2634,13 @@ class CompetitionLLMOrchestrator:
             return self._brand_cache[asin_key]
 
         brand = self._fetch_brand_from_snapshot(ctx, asin_key)
+        if not brand:
+            LOGGER.debug(
+                "competition_llm.stage2_brand_missing asin=%s week=%s marketplace_id=%s",
+                asin_key,
+                ctx.get("week"),
+                ctx.get("marketplace_id"),
+            )
         self._brand_cache[asin_key] = brand
         return brand
 

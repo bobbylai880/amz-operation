@@ -915,6 +915,7 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
         "week": "2025-W10",
         "sunday": "2025-03-09",
         "my_asin": "B0MYASIN",
+        "opp_type": "leader",
     }
 
     with sqlite_engine.begin() as conn:
@@ -1010,8 +1011,32 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                     rating REAL,
                     reviews INTEGER,
                     social_proof REAL,
-                    badge_json TEXT,
-                    brand TEXT
+                    badge_json TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS bi_amz_asin_product_snapshot (
+                    marketplace_id TEXT,
+                    week TEXT,
+                    asin TEXT,
+                    brand TEXT,
+                    payload TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS bi_amz_comp_payload_path (
+                    field_name TEXT,
+                    json_path TEXT,
+                    path TEXT,
+                    field_path TEXT
                 )
                 """
             )
@@ -1099,6 +1124,20 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                 "score_badge": 0.2,
             },
         )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS bi_amz_asin_product_snapshot (
+                    marketplace_id TEXT,
+                    week TEXT,
+                    asin TEXT,
+                    brand TEXT,
+                    payload TEXT
+                )
+                """
+            )
+        )
+        conn.execute(text("DELETE FROM bi_amz_asin_product_snapshot"))
         for asin, price_current, price_net, content_score, social_proof, badge_json in (
             ("B0MYASIN", 21.99, 19.99, 0.62, 2.3, '{"badges": ["Prime"]}'),
             ("B0OPPASIN", 13.49, 12.99, 0.78, 2.9, '{"badges": []}')
@@ -1110,11 +1149,11 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                     (scene_tag, base_scene, morphology, marketplace_id, week, sunday, asin,
                      price_current, price_list, coupon_pct, price_net, rank_leaf, rank_root, rank_score,
                      image_cnt, video_cnt, bullet_cnt, title_len, aplus_flag, content_score,
-                     rating, reviews, social_proof, badge_json, brand)
+                     rating, reviews, social_proof, badge_json)
                     VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :asin,
                             :price_current, :price_list, :coupon_pct, :price_net, :rank_leaf, :rank_root, :rank_score,
                             :image_cnt, :video_cnt, :bullet_cnt, :title_len, :aplus_flag, :content_score,
-                            :rating, :reviews, :social_proof, :badge_json, :brand)
+                            :rating, :reviews, :social_proof, :badge_json)
                     """
                 ),
                 {
@@ -1142,7 +1181,22 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                     "reviews": 1200,
                     "social_proof": social_proof,
                     "badge_json": badge_json,
+                },
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO bi_amz_asin_product_snapshot
+                    (marketplace_id, week, asin, brand, payload)
+                    VALUES (:marketplace_id, :week, :asin, :brand, :payload)
+                    """
+                ),
+                {
+                    "marketplace_id": ctx["marketplace_id"],
+                    "week": ctx["week"],
+                    "asin": asin,
                     "brand": "MyBrand" if asin == "B0MYASIN" else "OppBrand",
+                    "payload": '{"brand": "MyBrand"}' if asin == "B0MYASIN" else '{"brand": "OppBrand"}',
                 },
             )
 
@@ -1163,6 +1217,179 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
     metrics = {entry["metric"] for entry in entries}
     assert "price_net" in metrics
     assert "price_current" in metrics
+
+
+def test_brand_fallback_snapshot_column(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+    ctx = {"marketplace_id": "US", "week": "2024-W10"}
+    asin = "B0BRANDSNAP"
+    with sqlite_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS bi_amz_asin_product_snapshot (
+                    marketplace_id TEXT,
+                    week TEXT,
+                    asin TEXT,
+                    brand TEXT,
+                    payload TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS bi_amz_comp_payload_path (
+                    field_name TEXT,
+                    json_path TEXT,
+                    path TEXT,
+                    field_path TEXT
+                )
+                """
+            )
+        )
+        conn.execute(text("DELETE FROM bi_amz_asin_product_snapshot"))
+        conn.execute(text("DELETE FROM bi_amz_comp_payload_path"))
+        conn.execute(
+            text(
+                """
+                INSERT INTO bi_amz_asin_product_snapshot
+                (marketplace_id, week, asin, brand, payload)
+                VALUES (:marketplace_id, :week, :asin, :brand, :payload)
+                """
+            ),
+            {
+                "marketplace_id": ctx["marketplace_id"],
+                "week": ctx["week"],
+                "asin": asin,
+                "brand": "SnapshotBrand",
+                "payload": '{"brand": "SnapshotBrand"}',
+            },
+        )
+
+    brand = orchestrator._lookup_brand(ctx, asin)
+    assert brand == "SnapshotBrand"
+
+
+def test_brand_fallback_payload_json(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+    ctx = {"marketplace_id": "US", "week": "2024-W11"}
+    asin = "B0BRANDJSON"
+    payload = json.dumps({"product": {"meta": {"brand_name": "PayloadBrand"}}})
+    with sqlite_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS bi_amz_asin_product_snapshot (
+                    marketplace_id TEXT,
+                    week TEXT,
+                    asin TEXT,
+                    brand TEXT,
+                    payload TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS bi_amz_comp_payload_path (
+                    field_name TEXT,
+                    json_path TEXT,
+                    path TEXT,
+                    field_path TEXT
+                )
+                """
+            )
+        )
+        conn.execute(text("DELETE FROM bi_amz_asin_product_snapshot"))
+        conn.execute(text("DELETE FROM bi_amz_comp_payload_path"))
+        conn.execute(
+            text(
+                """
+                INSERT INTO bi_amz_comp_payload_path
+                (field_name, json_path, path, field_path)
+                VALUES (:field_name, :json_path, NULL, NULL)
+                """
+            ),
+            {"field_name": "brand", "json_path": "$.product.meta.brand_name"},
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO bi_amz_asin_product_snapshot
+                (marketplace_id, week, asin, brand, payload)
+                VALUES (:marketplace_id, :week, :asin, :brand, :payload)
+                """
+            ),
+            {
+                "marketplace_id": ctx["marketplace_id"],
+                "week": ctx["week"],
+                "asin": asin,
+                "brand": None,
+                "payload": payload,
+            },
+        )
+
+    brand = orchestrator._lookup_brand(ctx, asin)
+    assert brand == "PayloadBrand"
+
+
+def test_missing_brand_no_fail(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+    ctx = {"marketplace_id": "US", "week": "2024-W12"}
+    asin = "B0UNKNOWN"
+    with sqlite_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS bi_amz_asin_product_snapshot (
+                    marketplace_id TEXT,
+                    week TEXT,
+                    asin TEXT,
+                    brand TEXT,
+                    payload TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS bi_amz_comp_payload_path (
+                    field_name TEXT,
+                    json_path TEXT,
+                    path TEXT,
+                    field_path TEXT
+                )
+                """
+            )
+        )
+        conn.execute(text("DELETE FROM bi_amz_asin_product_snapshot"))
+        conn.execute(text("DELETE FROM bi_amz_comp_payload_path"))
+
+    brand = orchestrator._lookup_brand(ctx, asin)
+    assert brand is None
+    assert orchestrator._lookup_brand(ctx, asin) is None
 
 
 def test_pairwise_evidence_notes_and_units(sqlite_engine, tmp_path):
