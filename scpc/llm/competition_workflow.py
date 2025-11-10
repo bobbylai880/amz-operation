@@ -7,10 +7,10 @@ import re
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
 import yaml
 from sqlalchemy import text
@@ -130,7 +130,11 @@ _ENTITY_DETAIL_FIELDS: tuple[str, ...] = (
     "reviews",
     "social_proof",
     "badge_json",
+    "brand",
 )
+
+_KEYWORD_LOOKBACK_DAYS = 7
+_KEYWORD_PER_PAIR_LIMIT = 2
 
 _RULES_CONFIG_DEFAULT_PATH = Path("configs/competition_lag_rules.yaml")
 _RULES_CONFIG_SCHEMA_NAME = "competition_lag_rules.schema.json"
@@ -432,6 +436,8 @@ class CompetitionLLMOrchestrator:
         self._stage2_schema = load_schema("competition_stage2_aggregate.schema.json")
         self._stage2_prompt = load_prompt("competition_stage2_aggregate.md")
         self._current_marketplace_id: str | None = None
+        self._brand_cache: dict[str, str | None] = {}
+        self._brand_path_tokens: list[str] | None = None
 
     def run(
         self,
@@ -1945,7 +1951,7 @@ class CompetitionLLMOrchestrator:
         if not isinstance(rows, Sequence):
             return []
         source = "pairs_each" if lag_type in _PAGE_LAG_TYPES else "traffic.pairs"
-        results: list[Mapping[str, Any]] = []
+        candidates: list[tuple[int, float, Mapping[str, Any]]] = []
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
@@ -1953,49 +1959,244 @@ class CompetitionLLMOrchestrator:
             if opp_asin and row_opp_asin != opp_asin:
                 continue
             for entry in self._build_pairwise_entries_from_row(
+                lag_type,
                 row,
                 source,
             ):
                 if metric and entry.get("metric") != metric:
                     continue
-                if row_opp_asin and "opp_asin" not in entry:
-                    entry["opp_asin"] = row_opp_asin
-                results.append(entry)
-                if len(results) >= limit:
-                    return results
+                payload = dict(entry)
+                if row_opp_asin and "opp_asin" not in payload:
+                    payload["opp_asin"] = row_opp_asin
+                priority = int(payload.pop("_priority", 50))
+                impact = float(payload.pop("_impact", 0.0))
+                candidates.append((priority, impact, payload))
+
+        ordered = sorted(candidates, key=lambda item: (item[0], -abs(item[1])))
+        results: list[Mapping[str, Any]] = []
+        for _, _, entry in ordered:
+            results.append(entry)
+            if len(results) >= limit:
+                break
         return results
 
     def _build_pairwise_entries_from_row(
         self,
+        lag_type: str,
         row: Mapping[str, Any],
         source: str,
     ) -> list[Mapping[str, Any]]:
-        opp_asin = row.get("opp_asin")
+        if not isinstance(row, Mapping):
+            return []
+        if lag_type == "rank":
+            entries = self._build_rank_entries(row, source)
+        elif lag_type == "content":
+            entries = self._build_content_entries(row, source)
+        elif lag_type == "social":
+            entries = self._build_social_entries(row, source)
+        elif lag_type == "keyword":
+            entries = self._build_keyword_entries(row, source)
+        else:
+            entries = []
+        if not entries:
+            entries = self._build_default_pairwise_entries(row, source)
+        return entries
+
+    def _build_rank_entries(
+        self, row: Mapping[str, Any], source: str
+    ) -> list[Mapping[str, Any]]:
         entries: list[Mapping[str, Any]] = []
-        for key, value in row.items():
+        entry = self._build_metric_entry(
+            row,
+            "rank_leaf",
+            source,
+            priority=1,
+            unit="rank",
+            note_builder=_format_rank_leaf_note,
+        )
+        if entry:
+            entries.append(entry)
+        entry = self._build_metric_entry(
+            row,
+            "rank_pos_pct",
+            source,
+            priority=2,
+            unit="pct",
+            note_builder=_format_rank_pct_note,
+        )
+        if entry:
+            entries.append(entry)
+        return entries
+
+    def _build_content_entries(
+        self, row: Mapping[str, Any], source: str
+    ) -> list[Mapping[str, Any]]:
+        entries: list[Mapping[str, Any]] = []
+        entry = self._build_metric_entry(
+            row,
+            "image_cnt",
+            source,
+            priority=1,
+            note_builder=_format_image_note,
+        )
+        if entry:
+            entries.append(entry)
+        entry = self._build_metric_entry(
+            row,
+            "video_cnt",
+            source,
+            priority=2,
+            note_builder=_format_video_note,
+        )
+        if entry:
+            entries.append(entry)
+        entry = self._build_metric_entry(
+            row,
+            "content_score",
+            source,
+            priority=3,
+            note_builder=_format_content_score_note,
+        )
+        if entry:
+            entries.append(entry)
+        return entries
+
+    def _build_social_entries(
+        self, row: Mapping[str, Any], source: str
+    ) -> list[Mapping[str, Any]]:
+        entries: list[Mapping[str, Any]] = []
+        entry = self._build_metric_entry(
+            row,
+            "rating",
+            source,
+            priority=1,
+            note_builder=_format_rating_note,
+        )
+        if entry:
+            entries.append(entry)
+        entry = self._build_metric_entry(
+            row,
+            "reviews",
+            source,
+            priority=2,
+            note_builder=_format_reviews_note,
+        )
+        if entry:
+            entries.append(entry)
+        entry = self._build_metric_entry(
+            row,
+            "social_proof",
+            source,
+            priority=3,
+            note_builder=_format_social_proof_note,
+        )
+        if entry:
+            entries.append(entry)
+        return entries
+
+    def _build_keyword_entries(
+        self, row: Mapping[str, Any], source: str
+    ) -> list[Mapping[str, Any]]:
+        opp_asin = row.get("opp_asin")
+        if not opp_asin:
+            return []
+        pairs = row.get("keyword_pairs")
+        if not isinstance(pairs, Sequence):
+            return []
+        entries: list[Mapping[str, Any]] = []
+        for index, pair in enumerate(pairs):
+            if not isinstance(pair, Mapping):
+                continue
+            keyword = pair.get("keyword")
+            opp_rank = pair.get("opp_rank")
+            if not keyword or opp_rank is None:
+                continue
+            my_rank = pair.get("my_rank")
+            my_share = pair.get("my_share")
+            opp_share = pair.get("opp_share")
+            note = _format_keyword_note(
+                keyword,
+                my_rank,
+                opp_rank,
+                my_share,
+                opp_share,
+                pair.get("tag"),
+            )
+            entry: dict[str, Any] = {
+                "metric": "keyword_rank",
+                "against": "asin",
+                "my_value": my_rank if my_rank is not None else "无",
+                "opp_value": opp_rank,
+                "opp_asin": opp_asin,
+                "unit": "rank",
+                "source": "keywords.7d",
+                "note": note,
+                "_priority": 1 + index,
+                "_impact": float(pair.get("impact", 0.0) or 0.0),
+            }
+            entries.append(entry)
+        return entries
+
+    def _build_default_pairwise_entries(
+        self, row: Mapping[str, Any], source: str
+    ) -> list[Mapping[str, Any]]:
+        entries: list[Mapping[str, Any]] = []
+        for key in row.keys():
             if not key.startswith("my_"):
                 continue
             suffix = key[3:]
-            opp_key = f"opp_{suffix}"
-            if opp_key not in row:
-                continue
-            if value is None or row.get(opp_key) is None:
-                continue
-            if not opp_asin:
-                continue
-            entry: dict[str, Any] = {
-                "metric": suffix,
-                "against": "asin",
-                "my_value": self._format_evidence_value(value),
-                "opp_value": self._format_evidence_value(row.get(opp_key)),
-                "opp_asin": opp_asin,
-                "source": source,
-            }
-            unit = self._infer_metric_unit(suffix)
-            if unit:
-                entry["unit"] = unit
-            entries.append(entry)
+            entry = self._build_metric_entry(
+                row,
+                suffix,
+                source,
+                priority=50,
+            )
+            if entry:
+                entries.append(entry)
         return entries
+
+    def _build_metric_entry(
+        self,
+        row: Mapping[str, Any],
+        suffix: str,
+        source: str,
+        *,
+        priority: int,
+        unit: str | None = None,
+        note_builder: Callable[[Any, Any, Mapping[str, Any]], str | None] | None = None,
+    ) -> Mapping[str, Any] | None:
+        opp_asin = row.get("opp_asin")
+        if not opp_asin:
+            return None
+        my_key = f"my_{suffix}"
+        opp_key = f"opp_{suffix}"
+        if my_key not in row or opp_key not in row:
+            return None
+        my_value = row.get(my_key)
+        opp_value = row.get(opp_key)
+        if my_value in (None, "") or opp_value in (None, ""):
+            return None
+        entry: dict[str, Any] = {
+            "metric": suffix,
+            "against": "asin",
+            "my_value": self._format_evidence_value(my_value),
+            "opp_value": self._format_evidence_value(opp_value),
+            "opp_asin": opp_asin,
+            "source": source,
+            "_priority": priority,
+            "_impact": _compute_pair_gap(my_value, opp_value),
+        }
+        if unit:
+            entry["unit"] = unit
+        else:
+            inferred = self._infer_metric_unit(suffix)
+            if inferred:
+                entry["unit"] = inferred
+        if note_builder:
+            note = note_builder(my_value, opp_value, row)
+            if note:
+                entry["note"] = note
+        return entry
 
     def _normalise_evidence_sequence(self, items: Any) -> list[Mapping[str, Any]]:
         if not isinstance(items, Sequence):
@@ -2291,7 +2492,7 @@ class CompetitionLLMOrchestrator:
           SELECT price_current, price_list, coupon_pct, price_net,
                  rank_leaf, rank_root, rank_score,
                  image_cnt, video_cnt, bullet_cnt, title_len, aplus_flag, content_score,
-                 rating, reviews, social_proof, badge_json
+                 rating, reviews, social_proof, badge_json, brand
           FROM bi_amz_comp_entities_clean
           WHERE scene_tag=:scene_tag AND base_scene=:base_scene
             AND COALESCE(morphology,'') = COALESCE(:morphology,'')
@@ -2310,14 +2511,26 @@ class CompetitionLLMOrchestrator:
             "asin": asin,
         }
         try:
-            return self._fetch_one(sql, params)
+            detail = self._fetch_one(sql, params)
         except SQLAlchemyError as exc:  # pragma: no cover - optional table
             LOGGER.debug(
                 "competition_llm.stage2_entity_lookup_failed asin=%s error=%s",
                 asin,
                 exc,
             )
-            return None
+            detail = None
+
+        if detail:
+            result = dict(detail)
+        else:
+            result = {}
+
+        if not result.get("brand"):
+            brand = self._lookup_brand(ctx, asin)
+            if brand:
+                result["brand"] = brand
+
+        return result or None
 
     def _inject_entity_fields(
         self,
@@ -2334,6 +2547,302 @@ class CompetitionLLMOrchestrator:
             if value in (None, ""):
                 continue
             target[key] = value
+
+    def _lookup_brand(self, ctx: Mapping[str, Any], asin: Any) -> str | None:
+        if not asin:
+            return None
+        asin_key = str(asin)
+        if asin_key in self._brand_cache:
+            return self._brand_cache[asin_key]
+
+        brand = self._fetch_brand_from_snapshot(ctx, asin_key)
+        self._brand_cache[asin_key] = brand
+        return brand
+
+    def _fetch_brand_from_snapshot(
+        self, ctx: Mapping[str, Any], asin: str
+    ) -> str | None:
+        marketplace_id = ctx.get("marketplace_id")
+        week = ctx.get("week")
+        params = {
+            "marketplace_id": marketplace_id,
+            "week": week,
+            "asin": asin,
+        }
+        sql = """
+          SELECT brand, payload
+          FROM bi_amz_asin_product_snapshot
+          WHERE marketplace_id=:marketplace_id
+            AND week=:week
+            AND asin=:asin
+          LIMIT 1
+        """
+        try:
+            row = self._fetch_one(sql, params)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_brand_lookup_failed asin=%s error=%s",
+                asin,
+                exc,
+            )
+            row = None
+
+        if not row:
+            return None
+
+        brand_value = row.get("brand")
+        if isinstance(brand_value, str) and brand_value.strip():
+            return brand_value.strip()
+
+        payload = row.get("payload")
+        if payload in (None, ""):
+            return None
+        if isinstance(payload, (bytes, bytearray)):
+            payload = payload.decode("utf-8", errors="ignore")
+        if isinstance(payload, str):
+            try:
+                payload_obj = json.loads(payload)
+            except json.JSONDecodeError:
+                LOGGER.debug(
+                    "competition_llm.stage2_brand_payload_invalid asin=%s", asin
+                )
+                return None
+        elif isinstance(payload, Mapping):
+            payload_obj = payload
+        else:
+            return None
+
+        tokens = self._resolve_brand_path_tokens()
+        brand = _extract_json_path(payload_obj, tokens)
+        if not brand:
+            brand = _extract_json_path(payload_obj, ["brand"])
+        if isinstance(brand, str):
+            return brand.strip() or None
+        return None
+
+    def _resolve_brand_path_tokens(self) -> list[str]:
+        if self._brand_path_tokens is not None:
+            return self._brand_path_tokens
+
+        sql = """
+          SELECT json_path, path, field_path
+          FROM bi_amz_comp_payload_path
+          WHERE field_name = :field_name
+          LIMIT 1
+        """
+        try:
+            row = self._fetch_one(sql, {"field_name": "brand"})
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_brand_path_lookup_failed error=%s",
+                exc,
+            )
+            row = None
+
+        path = None
+        if row:
+            path = (
+                row.get("json_path")
+                or row.get("path")
+                or row.get("field_path")
+                or ""
+            )
+        tokens = _parse_json_path_tokens(str(path or "")) if path else []
+        if not tokens:
+            tokens = ["brand"]
+        self._brand_path_tokens = tokens
+        return tokens
+
+    def _attach_keyword_details(
+        self,
+        ctx: Mapping[str, Any],
+        rows: Sequence[MutableMapping[str, Any]] | Sequence[Mapping[str, Any]],
+    ) -> None:
+        if not rows:
+            return
+        my_asin = ctx.get("my_asin")
+        asins: set[str] = {str(my_asin)} if my_asin else set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            opp_asin = row.get("opp_asin")
+            if opp_asin:
+                asins.add(str(opp_asin))
+        keyword_rankings = self._fetch_keyword_rankings(ctx, asins)
+        if not keyword_rankings:
+            return
+        my_keywords = keyword_rankings.get(str(my_asin), []) if my_asin else []
+        my_index = {item["keyword"]: item for item in my_keywords if item.get("keyword")}
+
+        for row in rows:
+            if not isinstance(row, MutableMapping):
+                continue
+            opp_asin = row.get("opp_asin")
+            if not opp_asin:
+                continue
+            opp_keywords = keyword_rankings.get(str(opp_asin), [])
+            row["keyword_pairs"] = self._compose_keyword_pairs(my_index, opp_keywords)
+
+    def _fetch_keyword_rankings(
+        self,
+        ctx: Mapping[str, Any],
+        asins: Sequence[str],
+    ) -> Mapping[str, list[dict[str, Any]]]:
+        if not asins:
+            return {}
+        marketplace_id = ctx.get("marketplace_id")
+        sunday = ctx.get("sunday")
+        if not marketplace_id or not sunday:
+            return {}
+        try:
+            sunday_date = datetime.fromisoformat(str(sunday)).date()
+        except ValueError:
+            return {}
+        start_date = sunday_date - timedelta(days=_KEYWORD_LOOKBACK_DAYS - 1)
+        asin_list = sorted({str(asin) for asin in asins if asin})
+        if not asin_list:
+            return {}
+        asin_params = {
+            f"asin_{index}": asin for index, asin in enumerate(asin_list)
+        }
+        asin_placeholders = ", ".join(
+            f":asin_{index}" for index in range(len(asin_list))
+        )
+        sql = f"""
+          SELECT asin, keyword, AVG(ratio_score) AS ratio_score
+          FROM vw_sif_keyword_daily_std
+          WHERE marketplace_id=:marketplace_id
+            AND asin IN ({asin_placeholders})
+            AND snapshot_date BETWEEN :start_date AND :end_date
+          GROUP BY asin, keyword
+        """
+        params: dict[str, Any] = {
+            "marketplace_id": marketplace_id,
+            "start_date": start_date.isoformat(),
+            "end_date": sunday_date.isoformat(),
+        }
+        params.update(asin_params)
+        try:
+            rows = self._fetch_all(sql, params)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_keyword_lookup_failed error=%s",
+                exc,
+            )
+            return {}
+
+        rankings: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            asin_value = str(row.get("asin") or "").strip()
+            keyword = str(row.get("keyword") or "").strip()
+            if not asin_value or not keyword:
+                continue
+            share = _coerce_float(row.get("ratio_score"))
+            rankings[asin_value].append(
+                {"keyword": keyword, "share": share if share is not None else 0.0}
+            )
+
+        if not rankings:
+            return {}
+
+        tag_lookup = self._fetch_keyword_tags(
+            {item["keyword"] for items in rankings.values() for item in items}
+        )
+
+        for asin_value, items in rankings.items():
+            items.sort(key=lambda item: item.get("share") or 0.0, reverse=True)
+            limited = items[:10]
+            for index, item in enumerate(limited, start=1):
+                item["rank"] = index
+                if item.get("keyword") in tag_lookup:
+                    item["tag"] = tag_lookup[item["keyword"]]
+            rankings[asin_value] = limited
+
+        return rankings
+
+    def _fetch_keyword_tags(self, keywords: set[str]) -> Mapping[str, str]:
+        if not keywords:
+            return {}
+        keyword_list = sorted({kw for kw in keywords if kw})
+        if not keyword_list:
+            return {}
+        params: dict[str, Any] = {
+            f"kw_{index}": keyword_list[index]
+            for index in range(len(keyword_list))
+        }
+        placeholders = ", ".join(f":kw_{index}" for index in range(len(keyword_list)))
+        sql = f"""
+          SELECT keyword, tag
+          FROM bi_amz_comp_kw_tag
+          WHERE keyword IN ({placeholders})
+        """
+        try:
+            rows = self._fetch_all(sql, params)
+        except SQLAlchemyError:
+            return {}
+        return {
+            str(row.get("keyword") or ""): str(row.get("tag") or "")
+            for row in rows
+            if row.get("keyword")
+        }
+
+    def _compose_keyword_pairs(
+        self,
+        my_index: Mapping[str, Mapping[str, Any]],
+        opponent_keywords: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        pairs: list[dict[str, Any]] = []
+        used: set[str] = set()
+        for item in opponent_keywords:
+            keyword = item.get("keyword")
+            if not keyword:
+                continue
+            my_item = my_index.get(keyword)
+            if not my_item:
+                continue
+            pairs.append(self._build_keyword_pair(keyword, my_item, item))
+            used.add(keyword)
+            if len(pairs) >= _KEYWORD_PER_PAIR_LIMIT:
+                return pairs
+        for item in opponent_keywords:
+            if len(pairs) >= _KEYWORD_PER_PAIR_LIMIT:
+                break
+            keyword = item.get("keyword")
+            if not keyword or keyword in used:
+                continue
+            my_item = my_index.get(keyword)
+            pairs.append(self._build_keyword_pair(keyword, my_item, item))
+            used.add(keyword)
+        return pairs
+
+    def _build_keyword_pair(
+        self,
+        keyword: str,
+        my_item: Mapping[str, Any] | None,
+        opp_item: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        my_rank = _coerce_float(my_item.get("rank")) if my_item else None
+        opp_rank = _coerce_float(opp_item.get("rank"))
+        my_share = _coerce_float(my_item.get("share")) if my_item else None
+        opp_share = _coerce_float(opp_item.get("share"))
+        tag = (
+            my_item.get("tag")
+            if my_item and my_item.get("tag")
+            else opp_item.get("tag")
+        )
+        impact = abs((opp_share or 0.0) - (my_share or 0.0))
+        if my_rank is None:
+            impact = (opp_share or 0.0) + 1.0
+        pair = {
+            "keyword": keyword,
+            "my_rank": int(my_rank) if my_rank is not None else None,
+            "opp_rank": int(opp_rank) if opp_rank is not None else None,
+            "my_share": my_share,
+            "opp_share": opp_share,
+            "tag": tag,
+            "impact": impact,
+        }
+        return pair
 
     def _build_traffic_evidence(
         self, ctx: Mapping[str, Any], lag_type: str, opp_type: str
@@ -2398,6 +2907,10 @@ class CompetitionLLMOrchestrator:
                 exc,
             )
             top_each = []
+        if top_each:
+            self._attach_page_entity_details(ctx, top_each)
+            if lag_type == "keyword":
+                self._attach_keyword_details(ctx, top_each)
         comparison_reasons = _build_comparison_reasons(lag_type, top_each)
 
         return {
@@ -2596,6 +3109,193 @@ def _compute_top_impact(lag_type: str, row: Mapping[str, Any]) -> float:
     return 0.0
 
 
+def _parse_json_path_tokens(path: str) -> list[str]:
+    cleaned = str(path or "").strip()
+    if not cleaned:
+        return []
+    if cleaned.startswith("$"):
+        cleaned = cleaned[1:]
+    tokens: list[str] = []
+    buffer = cleaned
+    while buffer:
+        if buffer.startswith("."):
+            buffer = buffer[1:]
+            continue
+        bracket_index = buffer.find("[")
+        dot_index = buffer.find(".")
+        if bracket_index == -1 and dot_index == -1:
+            tokens.append(buffer)
+            break
+        if bracket_index != -1 and (dot_index == -1 or bracket_index < dot_index):
+            if bracket_index > 0:
+                tokens.append(buffer[:bracket_index])
+            buffer = buffer[bracket_index:]
+            match = re.match(r"\[(\d+)\](.*)", buffer)
+            if match:
+                tokens.append(match.group(1))
+                buffer = match.group(2)
+            else:
+                break
+        else:
+            tokens.append(buffer[:dot_index])
+            buffer = buffer[dot_index:]
+    return [token for token in tokens if token]
+
+
+def _extract_json_path(obj: Any, tokens: Sequence[str]) -> Any:
+    current: Any = obj
+    for token in tokens:
+        if isinstance(current, Mapping):
+            current = current.get(token)
+        elif isinstance(current, Sequence) and not isinstance(current, (str, bytes)):
+            try:
+                index = int(token)
+            except ValueError:
+                return None
+            if index < 0 or index >= len(current):
+                return None
+            current = current[index]
+        else:
+            return None
+    return current
+
+
+def _compute_pair_gap(my_value: Any, opp_value: Any) -> float:
+    my_num = _coerce_float(my_value)
+    opp_num = _coerce_float(opp_value)
+    if my_num is None or opp_num is None:
+        return 0.0
+    return abs(my_num - opp_num)
+
+
+def _format_integer_text(value: Any) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "缺失"
+    return f"{int(round(number)):,}"
+
+
+def _format_decimal_text(value: Any, decimals: int = 2) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "缺失"
+    format_spec = f"{{:.{decimals}f}}"
+    return format_spec.format(number)
+
+
+def _format_percentage_text(value: Any) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "缺失"
+    return f"{number * 100:.2f}%"
+
+
+def _format_rank_leaf_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    my_text = _format_integer_text(my_value)
+    opp_text = _format_integer_text(opp_value)
+    my_num = _coerce_float(my_value)
+    opp_num = _coerce_float(opp_value)
+    gap_text = ""
+    if my_num is not None and opp_num is not None:
+        gap = my_num - opp_num
+        if abs(gap) >= 1:
+            direction = "落后" if gap > 0 else "领先"
+            gap_text = f"，{direction} {abs(int(round(gap)))} 位"
+    return f"类目排名：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_rank_pct_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    my_text = _format_percentage_text(my_value)
+    opp_text = _format_percentage_text(opp_value)
+    my_num = _coerce_float(my_value)
+    opp_num = _coerce_float(opp_value)
+    gap_text = ""
+    if my_num is not None and opp_num is not None:
+        gap = my_num - opp_num
+        if abs(gap) >= 0.005:
+            direction = "落后" if gap > 0 else "领先"
+            gap_text = f"，{direction} {abs(gap) * 100:.2f}%"
+    return f"排名百分位：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_image_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    return _format_count_note("图片数", my_value, opp_value, "张")
+
+
+def _format_video_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    return _format_count_note("视频数", my_value, opp_value, "个")
+
+
+def _format_count_note(label: str, my_value: Any, opp_value: Any, unit: str) -> str:
+    my_text = _format_integer_text(my_value)
+    opp_text = _format_integer_text(opp_value)
+    my_num = _coerce_float(my_value)
+    opp_num = _coerce_float(opp_value)
+    gap_text = ""
+    if my_num is not None and opp_num is not None:
+        gap = opp_num - my_num
+        if abs(gap) >= 1:
+            if gap > 0:
+                gap_text = f"，缺少 {int(round(abs(gap)))}{unit}"
+            else:
+                gap_text = f"，多出 {int(round(abs(gap)))}{unit}"
+    return f"{label}：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_content_score_note(
+    my_value: Any, opp_value: Any, _: Mapping[str, Any]
+) -> str:
+    my_text = _format_decimal_text(my_value)
+    opp_text = _format_decimal_text(opp_value)
+    gap = _compute_pair_gap(my_value, opp_value)
+    gap_text = f"，差距 {gap:.2f}" if gap >= 0.01 else ""
+    return f"内容得分：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_rating_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    my_text = _format_decimal_text(my_value)
+    opp_text = _format_decimal_text(opp_value)
+    gap = _compute_pair_gap(my_value, opp_value)
+    gap_text = f"，相差 {gap:.2f}" if gap >= 0.01 else ""
+    return f"评分：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_reviews_note(my_value: Any, opp_value: Any, _: Mapping[str, Any]) -> str:
+    note = _format_count_note("评论数", my_value, opp_value, "条")
+    return note
+
+
+def _format_social_proof_note(
+    my_value: Any, opp_value: Any, _: Mapping[str, Any]
+) -> str:
+    my_text = _format_decimal_text(my_value)
+    opp_text = _format_decimal_text(opp_value)
+    gap = _compute_pair_gap(my_value, opp_value)
+    gap_text = f"，差距 {gap:.2f}" if gap >= 0.01 else ""
+    return f"社交证明：我方 {my_text}，对手 {opp_text}{gap_text}"
+
+
+def _format_keyword_note(
+    keyword: str,
+    my_rank: Any,
+    opp_rank: Any,
+    my_share: Any,
+    opp_share: Any,
+    tag: Any,
+) -> str:
+    my_rank_text = f"TOP{int(my_rank)}" if my_rank is not None else "无"
+    opp_rank_text = f"TOP{int(opp_rank)}" if opp_rank is not None else "缺失"
+    my_share_text = _format_percentage_text(my_share)
+    opp_share_text = _format_percentage_text(opp_share)
+    keyword_label = str(keyword)
+    if tag:
+        keyword_label = f"{keyword_label}（{tag}）"
+    return (
+        f"关键词 {keyword_label}：我方{my_rank_text}，对手{opp_rank_text}；"
+        f"7天份额 我方{my_share_text} 对手{opp_share_text}"
+    )
+
+
 def _compose_overview_summary(
     overview: Mapping[str, Any], metrics: Sequence[tuple[str, str]]
 ) -> Mapping[str, Any]:
@@ -2684,11 +3384,16 @@ def _format_metric_value(value: Any) -> str:
 
 
 def _format_opp_label(row: Mapping[str, Any]) -> str:
+    brand = row.get("opp_brand")
     opp_parent = row.get("opp_parent_asin") or ""
     opp_asin = row.get("opp_asin") or "未知ASIN"
+    parts: list[str] = []
+    if brand:
+        parts.append(str(brand))
     if opp_parent and opp_parent != opp_asin:
-        return f"{opp_parent} {opp_asin}"
-    return str(opp_asin)
+        parts.append(str(opp_parent))
+    parts.append(str(opp_asin))
+    return " ".join(part for part in parts if part)
 
 
 def _json_default(obj: Any) -> Any:

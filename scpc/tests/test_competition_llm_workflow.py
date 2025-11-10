@@ -768,7 +768,8 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                     rating REAL,
                     reviews INTEGER,
                     social_proof REAL,
-                    badge_json TEXT
+                    badge_json TEXT,
+                    brand TEXT
                 )
                 """
             )
@@ -867,11 +868,11 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                     (scene_tag, base_scene, morphology, marketplace_id, week, sunday, asin,
                      price_current, price_list, coupon_pct, price_net, rank_leaf, rank_root, rank_score,
                      image_cnt, video_cnt, bullet_cnt, title_len, aplus_flag, content_score,
-                     rating, reviews, social_proof, badge_json)
+                     rating, reviews, social_proof, badge_json, brand)
                     VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :asin,
                             :price_current, :price_list, :coupon_pct, :price_net, :rank_leaf, :rank_root, :rank_score,
                             :image_cnt, :video_cnt, :bullet_cnt, :title_len, :aplus_flag, :content_score,
-                            :rating, :reviews, :social_proof, :badge_json)
+                            :rating, :reviews, :social_proof, :badge_json, :brand)
                     """
                 ),
                 {
@@ -899,6 +900,7 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                     "reviews": 1200,
                     "social_proof": social_proof,
                     "badge_json": badge_json,
+                    "brand": "MyBrand" if asin == "B0MYASIN" else "OppBrand",
                 },
             )
 
@@ -911,12 +913,98 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
     assert row["opp_price_current"] == pytest.approx(13.49)
     assert row["my_badge_json"] == '{"badges": ["Prime"]}'
     assert row["opp_badge_json"] == '{"badges": []}'
+    assert row["my_brand"] == "MyBrand"
+    assert row["opp_brand"] == "OppBrand"
 
     lag_data = {"top_opps": [row]}
     entries = orchestrator._extract_pairwise_evidence("price", lag_data, limit=6)
     metrics = {entry["metric"] for entry in entries}
     assert "price_net" in metrics
     assert "price_current" in metrics
+
+
+def test_pairwise_evidence_notes_and_units(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    rank_row = {
+        "opp_asin": "B0OPP1",
+        "opp_brand": "BrandX",
+        "my_rank_leaf": 35,
+        "opp_rank_leaf": 12,
+        "my_rank_pos_pct": 0.42,
+        "opp_rank_pos_pct": 0.18,
+    }
+    rank_entries = orchestrator._extract_pairwise_evidence(
+        "rank", {"top_opps": [rank_row]}, limit=2
+    )
+    assert rank_entries[0]["metric"] == "rank_leaf"
+    assert rank_entries[0]["unit"] == "rank"
+    assert "类目排名" in rank_entries[0]["note"]
+    assert rank_entries[1]["metric"] == "rank_pos_pct"
+    assert rank_entries[1]["unit"] == "pct"
+    assert "排名百分位" in rank_entries[1]["note"]
+
+    content_row = {
+        "opp_asin": "B0OPP2",
+        "my_image_cnt": 5,
+        "opp_image_cnt": 8,
+        "my_video_cnt": 1,
+        "opp_video_cnt": 3,
+        "my_content_score": 0.62,
+        "opp_content_score": 0.78,
+    }
+    content_entries = orchestrator._extract_pairwise_evidence(
+        "content", {"top_opps": [content_row]}, limit=3
+    )
+    notes = [entry["note"] for entry in content_entries]
+    assert any("图片数" in note for note in notes)
+    assert any("视频数" in note for note in notes)
+    assert any("内容得分" in note for note in notes)
+
+    social_row = {
+        "opp_asin": "B0OPP3",
+        "my_rating": 4.3,
+        "opp_rating": 4.7,
+        "my_reviews": 1200,
+        "opp_reviews": 2000,
+        "my_social_proof": 2.31,
+        "opp_social_proof": 2.46,
+    }
+    social_entries = orchestrator._extract_pairwise_evidence(
+        "social", {"top_opps": [social_row]}, limit=3
+    )
+    assert any("评分" in entry["note"] for entry in social_entries)
+    assert any("评论数" in entry["note"] for entry in social_entries)
+
+    keyword_row = {
+        "opp_asin": "B0OPP4",
+        "keyword_pairs": [
+            {
+                "keyword": "bath bag",
+                "my_rank": None,
+                "opp_rank": 1,
+                "my_share": 0.05,
+                "opp_share": 0.22,
+                "impact": 0.22,
+            }
+        ],
+    }
+    keyword_entries = orchestrator._extract_pairwise_evidence(
+        "keyword", {"top_opps": [keyword_row]}, limit=2
+    )
+    assert keyword_entries
+    first_keyword = keyword_entries[0]
+    assert first_keyword["metric"] == "keyword_rank"
+    assert first_keyword["unit"] == "rank"
+    assert first_keyword["my_value"] == "无"
+    assert "关键词" in first_keyword["note"]
+    assert "7天份额" in first_keyword["note"]
 
 
 def test_stage2_validation_enforces_allowed_codes(sqlite_engine, tmp_path):

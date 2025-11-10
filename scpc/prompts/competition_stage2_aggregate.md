@@ -21,6 +21,12 @@
       - top_opps[] 已直接提供来自数据库的客观值：例如 my_price_net/opp_price_net、my_price_current/opp_price_current、my_rank_pos_pct/opp_rank_pos_pct、my_content_score/opp_content_score、my_social_proof/opp_social_proof、my_badge_json/opp_badge_json；请优先引用这些成对字段，避免只描述差值；
       - 流量维度同理可使用 my_ad_ratio/opp_ad_ratio、my_kw_top3_share_7d_avg/opp_kw_top3_share_7d_avg 等字段，确保每条证据展示“我 vs 对手”的客观数值；
       - evidence_refs 仅作为回溯提示，禁止单独输出。
+      - 页面维度补充约束：
+        - 排名：输出 rank_leaf 与 rank_pos_pct 的成对数值，并在 note 中直述“类目排名/排名百分位”差距。
+        - 内容：输出 image_cnt、video_cnt（缺多少张/个）以及 content_score 对比。
+        - 社交：输出 rating、reviews（评论条数差距）；必要时补充 social_proof。
+      - 关键词维度：使用 keywords.7d 提供的 keyword_pairs，至少列出 1 条关键词证据（每个对手最多 2 条）；note 中包含“关键词 + 双方 TOP 位次 + 7 天份额”。
+      - 所有带 opp_asin 的证据会附带品牌信息（top_opps[].opp_brand）；可在 note 中引用品牌以增强可读性。
    - 每个 root_cause 的 evidence 至少包含 1 条“我 vs 对手”数值证据，确保来自 overview 或 top_opps 的事实数据。
 4. actions（推荐动作）：
    - 严格从 allowed_action_codes 中选择 code，区分大小写；
