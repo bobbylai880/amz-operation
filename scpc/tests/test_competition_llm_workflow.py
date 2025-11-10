@@ -115,6 +115,13 @@ def sqlite_engine():
                     opp_type TEXT,
                     asin_priority INTEGER,
                     price_gap REAL,
+                    price_gap_leader REAL,
+                    price_index_med REAL,
+                    price_z REAL,
+                    rank_pos_pct REAL,
+                    content_gap REAL,
+                    social_gap REAL,
+                    badge_delta_sum REAL,
                     confidence REAL
                 )
                 """
@@ -135,6 +142,12 @@ def sqlite_engine():
                     opp_type TEXT,
                     asin_priority INTEGER,
                     traffic_gap REAL,
+                    ad_ratio_index_med REAL,
+                    ad_to_natural_gap REAL,
+                    sp_share_in_ad_gap REAL,
+                    kw_top3_share_gap REAL,
+                    kw_brand_share_gap REAL,
+                    kw_competitor_share_gap REAL,
                     t_confidence REAL
                 )
                 """
@@ -219,6 +232,32 @@ def test_competition_workflow_end_to_end(sqlite_engine, tmp_path):
         conn.execute(
             text(
                 """
+                UPDATE vw_amz_comp_llm_overview
+                SET price_gap_leader=:price_gap_leader,
+                    price_index_med=:price_index_med,
+                    price_z=:price_z,
+                    rank_pos_pct=:rank_pos_pct,
+                    content_gap=:content_gap,
+                    social_gap=:social_gap,
+                    badge_delta_sum=:badge_delta_sum
+                WHERE my_asin=:my_asin AND week=:week
+                """
+            ),
+            {
+                "price_gap_leader": 2.0,
+                "price_index_med": 1.2,
+                "price_z": 0.65,
+                "rank_pos_pct": 0.45,
+                "content_gap": -0.1,
+                "social_gap": -0.05,
+                "badge_delta_sum": 1.0,
+                "my_asin": "B012345",
+                "week": "2025-W01",
+            },
+        )
+        conn.execute(
+            text(
+                """
                 INSERT INTO vw_amz_comp_llm_overview_traffic
                 (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_parent_asin, my_asin, opp_type, asin_priority, traffic_gap, t_confidence)
                 VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_parent_asin, :my_asin, :opp_type, :asin_priority, :traffic_gap, :t_confidence)
@@ -237,6 +276,30 @@ def test_competition_workflow_end_to_end(sqlite_engine, tmp_path):
                 "asin_priority": 1,
                 "traffic_gap": 0.05,
                 "t_confidence": 0.76,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE vw_amz_comp_llm_overview_traffic
+                SET ad_ratio_index_med=:ad_ratio_index_med,
+                    ad_to_natural_gap=:ad_to_natural_gap,
+                    sp_share_in_ad_gap=:sp_share_in_ad_gap,
+                    kw_top3_share_gap=:kw_top3_share_gap,
+                    kw_brand_share_gap=:kw_brand_share_gap,
+                    kw_competitor_share_gap=:kw_competitor_share_gap
+                WHERE my_asin=:my_asin AND week=:week
+                """
+            ),
+            {
+                "ad_ratio_index_med": 0.95,
+                "ad_to_natural_gap": -0.1,
+                "sp_share_in_ad_gap": -0.05,
+                "kw_top3_share_gap": -0.05,
+                "kw_brand_share_gap": -0.02,
+                "kw_competitor_share_gap": 0.03,
+                "my_asin": "B012345",
+                "week": "2025-W01",
             },
         )
         conn.execute(
@@ -300,7 +363,7 @@ def test_competition_workflow_end_to_end(sqlite_engine, tmp_path):
     assert result.stage2_processed == 1
 
     stage1_file = tmp_path / "2025-W01" / "stage1" / "B012345_page.json"
-    stage2_file = tmp_path / "2025-W01" / "stage2" / "B012345_pricing_page.json"
+    stage2_file = tmp_path / "2025-W01" / "stage2" / "B012345_ALL.json"
     assert stage1_file.exists()
     assert stage2_file.exists()
 
@@ -312,8 +375,114 @@ def test_competition_workflow_end_to_end(sqlite_engine, tmp_path):
     assert stage2_payload["machine_json"]["lag_type"] == "pricing"
     assert "调整售价" in stage2_payload["human_markdown"]
 
-    assert stub_llm.stage1_requests
+    assert not stub_llm.stage1_requests
     assert stub_llm.stage2_requests
+
+
+def test_stage1_missing_context_fields_raise(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    with sqlite_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO vw_amz_comp_llm_overview
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_parent_asin, my_asin, opp_type, asin_priority, price_gap, confidence)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_parent_asin, :my_asin, :opp_type, :asin_priority, :price_gap, :confidence)
+                """
+            ),
+            {
+                "scene_tag": "SCN-ERR",
+                "base_scene": "base",
+                "morphology": "standard",
+                "marketplace_id": "US",
+                "week": "2025-W05",
+                "sunday": "2025-02-02",
+                "my_parent_asin": None,
+                "my_asin": "B0MISSING",
+                "opp_type": "leader",
+                "asin_priority": 1,
+                "price_gap": 0.2,
+                "confidence": 0.7,
+            },
+        )
+
+    with pytest.raises(ValueError, match="Stage-1 context missing required fields"):
+        orchestrator.run("2025-W05", marketplace_id="US")
+
+
+def test_stage1_llm_skipped_when_stage2_only(sqlite_engine, tmp_path):
+    base_config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    config = replace(base_config, stage_1=replace(base_config.stage_1, enable_llm=True))
+    stub_llm = StubLLM()
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=stub_llm,
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    with sqlite_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO vw_amz_comp_llm_overview
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_parent_asin, my_asin, opp_type, asin_priority, price_gap, confidence)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_parent_asin, :my_asin, :opp_type, :asin_priority, :price_gap, :confidence)
+                """
+            ),
+            {
+                "scene_tag": "SCN-SKIP",
+                "base_scene": "base",
+                "morphology": "standard",
+                "marketplace_id": "US",
+                "week": "2025-W06",
+                "sunday": "2025-02-09",
+                "my_parent_asin": "PARENT3",
+                "my_asin": "B0SKIPLLM",
+                "opp_type": "leader",
+                "asin_priority": 1,
+                "price_gap": 0.25,
+                "confidence": 0.75,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE vw_amz_comp_llm_overview
+                SET price_gap_leader=:price_gap_leader,
+                    price_index_med=:price_index_med,
+                    price_z=:price_z,
+                    rank_pos_pct=:rank_pos_pct,
+                    content_gap=:content_gap,
+                    social_gap=:social_gap,
+                    badge_delta_sum=:badge_delta_sum
+                WHERE my_asin=:my_asin AND week=:week
+                """
+            ),
+            {
+                "price_gap_leader": 2.5,
+                "price_index_med": 1.3,
+                "price_z": 0.8,
+                "rank_pos_pct": 0.7,
+                "content_gap": -0.2,
+                "social_gap": -0.15,
+                "badge_delta_sum": -0.5,
+                "my_asin": "B0SKIPLLM",
+                "week": "2025-W06",
+            },
+        )
+
+    result = orchestrator.run("2025-W06", marketplace_id="US", stages=("stage2",))
+
+    assert result.stage1_processed == 1
+    assert not stub_llm.stage1_requests
 
 
 def test_stage2_packet_lookup_handles_blank_morphology(sqlite_engine, tmp_path):
@@ -353,6 +522,32 @@ def test_stage2_packet_lookup_handles_blank_morphology(sqlite_engine, tmp_path):
         conn.execute(
             text(
                 """
+                UPDATE vw_amz_comp_llm_overview
+                SET price_gap_leader=:price_gap_leader,
+                    price_index_med=:price_index_med,
+                    price_z=:price_z,
+                    rank_pos_pct=:rank_pos_pct,
+                    content_gap=:content_gap,
+                    social_gap=:social_gap,
+                    badge_delta_sum=:badge_delta_sum
+                WHERE my_asin=:my_asin AND week=:week
+                """
+            ),
+            {
+                "price_gap_leader": 3.0,
+                "price_index_med": 1.25,
+                "price_z": 0.7,
+                "rank_pos_pct": 0.4,
+                "content_gap": -0.05,
+                "social_gap": -0.02,
+                "badge_delta_sum": 0.5,
+                "my_asin": "B012346",
+                "week": "2025-W02",
+            },
+        )
+        conn.execute(
+            text(
+                """
                 INSERT INTO vw_amz_comp_llm_overview_traffic
                 (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_parent_asin, my_asin, opp_type, asin_priority, traffic_gap, t_confidence)
                 VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_parent_asin, :my_asin, :opp_type, :asin_priority, :traffic_gap, :t_confidence)
@@ -371,6 +566,30 @@ def test_stage2_packet_lookup_handles_blank_morphology(sqlite_engine, tmp_path):
                 "asin_priority": 1,
                 "traffic_gap": 0.08,
                 "t_confidence": 0.85,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE vw_amz_comp_llm_overview_traffic
+                SET ad_ratio_index_med=:ad_ratio_index_med,
+                    ad_to_natural_gap=:ad_to_natural_gap,
+                    sp_share_in_ad_gap=:sp_share_in_ad_gap,
+                    kw_top3_share_gap=:kw_top3_share_gap,
+                    kw_brand_share_gap=:kw_brand_share_gap,
+                    kw_competitor_share_gap=:kw_competitor_share_gap
+                WHERE my_asin=:my_asin AND week=:week
+                """
+            ),
+            {
+                "ad_ratio_index_med": 0.9,
+                "ad_to_natural_gap": -0.12,
+                "sp_share_in_ad_gap": -0.08,
+                "kw_top3_share_gap": -0.04,
+                "kw_brand_share_gap": -0.01,
+                "kw_competitor_share_gap": 0.02,
+                "my_asin": "B012346",
+                "week": "2025-W02",
             },
         )
         conn.execute(
@@ -534,6 +753,32 @@ def test_stage1_outputs_summary_for_leading_dimensions(sqlite_engine, tmp_path):
         conn.execute(
             text(
                 """
+                UPDATE vw_amz_comp_llm_overview
+                SET price_gap_leader=:price_gap_leader,
+                    price_index_med=:price_index_med,
+                    price_z=:price_z,
+                    rank_pos_pct=:rank_pos_pct,
+                    content_gap=:content_gap,
+                    social_gap=:social_gap,
+                    badge_delta_sum=:badge_delta_sum
+                WHERE my_asin=:my_asin AND week=:week
+                """
+            ),
+            {
+                "price_gap_leader": -1.5,
+                "price_index_med": 0.95,
+                "price_z": -0.4,
+                "rank_pos_pct": 0.3,
+                "content_gap": 0.2,
+                "social_gap": 0.1,
+                "badge_delta_sum": 1.0,
+                "my_asin": "B0LEADASIN",
+                "week": "2025-W03",
+            },
+        )
+        conn.execute(
+            text(
+                """
                 INSERT INTO vw_amz_comp_llm_overview_traffic
                 (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_parent_asin, my_asin, opp_type, asin_priority, traffic_gap, t_confidence)
                 VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_parent_asin, :my_asin, :opp_type, :asin_priority, :traffic_gap, :t_confidence)
@@ -554,45 +799,42 @@ def test_stage1_outputs_summary_for_leading_dimensions(sqlite_engine, tmp_path):
                 "t_confidence": 0.85,
             },
         )
-
-    stub_llm.set_stage1_override(
-        "B0LEADASIN",
-        {
-            "summary": "整体诊断：所有关键维度领先或与竞对持平，请保持现有策略。",
-            "dimensions": [
-                {
-                    "lag_type": "pricing",
-                    "status": "lead",
-                    "severity": "low",
-                    "source_opp_type": "page",
-                    "source_confidence": 0.92,
-                    "notes": "定价相对竞对低 5%，具备价格优势。",
-                },
-                {
-                    "lag_type": "traffic",
-                    "status": "lead",
-                    "severity": "low",
-                    "source_opp_type": "traffic",
-                    "source_confidence": 0.88,
-                    "notes": "流量较竞对高出 12%，持续扩大曝光。",
-                },
-            ],
-        },
-    )
+        conn.execute(
+            text(
+                """
+                UPDATE vw_amz_comp_llm_overview_traffic
+                SET ad_ratio_index_med=:ad_ratio_index_med,
+                    ad_to_natural_gap=:ad_to_natural_gap,
+                    sp_share_in_ad_gap=:sp_share_in_ad_gap,
+                    kw_top3_share_gap=:kw_top3_share_gap,
+                    kw_brand_share_gap=:kw_brand_share_gap,
+                    kw_competitor_share_gap=:kw_competitor_share_gap
+                WHERE my_asin=:my_asin AND week=:week
+                """
+            ),
+            {
+                "ad_ratio_index_med": 1.1,
+                "ad_to_natural_gap": 0.2,
+                "sp_share_in_ad_gap": 0.15,
+                "kw_top3_share_gap": 0.12,
+                "kw_brand_share_gap": 0.08,
+                "kw_competitor_share_gap": -0.02,
+                "my_asin": "B0LEADASIN",
+                "week": "2025-W03",
+            },
+        )
 
     result = orchestrator.run("2025-W03", marketplace_id="US")
 
-    assert result.stage2_candidates == 2
+    assert result.stage2_candidates == 0
     assert result.stage2_processed == 0
 
     stage1_paths = [p for p in result.storage_paths if "stage1" in str(p)]
     assert stage1_paths, "Stage-1 output should be persisted even without Stage-2"
     target_path = next(p for p in stage1_paths if "B0LEADASIN" in p.name)
     payload = json.loads(target_path.read_text(encoding="utf-8"))
-    assert payload["summary"].startswith("整体诊断")
-    for dim in payload["dimensions"]:
-        assert dim["status"] in {"lead", "parity"}
-        assert dim.get("notes")
+    assert payload["summary"] == "未检测到落后维度"
+    assert payload["dimensions"] == []
 
 
 def test_stage2_trigger_status_configuration(sqlite_engine, tmp_path):

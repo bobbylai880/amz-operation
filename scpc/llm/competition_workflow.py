@@ -103,6 +103,17 @@ _STAGE2_GROUP_FIELDS = (
 _PAGE_LAG_TYPES = {"price", "rank", "content", "social", "badge", "confidence"}
 _TRAFFIC_LAG_TYPES = {"traffic_mix", "keyword"}
 
+_LAG_TYPE_FILENAME_ALIASES: Mapping[str, str] = {
+    "price": "pricing",
+    "rank": "rank",
+    "content": "content",
+    "social": "social",
+    "badge": "badge",
+    "confidence": "confidence",
+    "traffic_mix": "traffic_mix",
+    "keyword": "keyword",
+}
+
 _ROOT_CAUSE_TO_LAG: Mapping[str, str] = {
     "pricing_misalignment": "price",
     "promo_gap": "price",
@@ -469,16 +480,28 @@ class CompetitionLLMOrchestrator:
 
         storage_paths: list[Path] = []
         stage1_outputs: Sequence[StageOneResult] = ()
+        stage1_llm_requested = stages is None or "stage1" in raw_stage_request
+        stage1_llm_enabled = bool(self._config.stage_1.enable_llm)
+        use_stage1_llm = run_stage1 and stage1_llm_requested and stage1_llm_enabled
         if run_stage1:
             stage1_inputs = self._collect_stage1_inputs(target_week, marketplace_id)
             rule_results = self._execute_stage1_code(stage1_inputs)
             stage1_payloads: list[StageOneResult] = []
+            if not use_stage1_llm:
+                reason = "config_disabled"
+                if stage1_llm_enabled:
+                    reason = "stage2_only"
+                LOGGER.info("competition_llm.stage1_llm_skipped reason=%s", reason)
             for index, rule_result in enumerate(rule_results):
                 overview_rows: Sequence[Mapping[str, Any]] = ()
                 traffic_rows: Sequence[Mapping[str, Any]] = ()
                 if index < len(stage1_inputs):
                     _, overview_rows, traffic_rows = stage1_inputs[index]
-                stage1_result = self._apply_stage1_llm(rule_result, overview_rows, traffic_rows)
+                stage1_result: StageOneResult
+                if use_stage1_llm:
+                    stage1_result = self._apply_stage1_llm(rule_result, overview_rows, traffic_rows)
+                else:
+                    stage1_result = rule_result
                 if isinstance(stage1_result, StageOneLLMResult) and stage1_result.prompt_path:
                     storage_paths.append(stage1_result.prompt_path)
                 storage_paths.append(self._write_stage1_output(stage1_result))
@@ -578,6 +601,7 @@ class CompetitionLLMOrchestrator:
         results: list[StageOneResult] = []
         has_applicable_rules = False
         for context, overview_rows, traffic_rows in inputs:
+            self._validate_stage1_context(context)
             rules = self._load_active_rules(context, config_data=rules_config)
             opp_type = str(context.get("opp_type") or "").lower()
             applicable_rules = [rule for rule in rules if rule.opp_type in ("any", opp_type)]
@@ -667,6 +691,15 @@ class CompetitionLLMOrchestrator:
         if not has_applicable_rules:
             LOGGER.warning("competition_llm.stage1_no_rules active=0")
         return tuple(results)
+
+    def _validate_stage1_context(self, context: Mapping[str, Any]) -> None:
+        missing = [field for field in _REQUIRED_CONTEXT_FIELDS if context.get(field) is None]
+        if missing:
+            asin = context.get("my_asin") or "unknown"
+            missing_fields = ",".join(missing)
+            raise ValueError(
+                f"Stage-1 context missing required fields [{missing_fields}] for ASIN {asin}"
+            )
 
     def _apply_stage1_llm(
         self,
@@ -942,6 +975,11 @@ class CompetitionLLMOrchestrator:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
         return path
 
+    def _build_stage1_storage_name(self, context: Mapping[str, Any]) -> str:
+        asin = str(context.get("my_asin") or "unknown")
+        opp_type = str(context.get("opp_type") or "na")
+        return f"{asin}_{opp_type}"
+
     def _prepare_stage2_candidates(self, stage1_results: Sequence[StageOneResult]) -> Sequence[StageTwoCandidate]:
         candidates: list[StageTwoCandidate] = []
         threshold = self._config.stage_1.conf_min
@@ -1059,7 +1097,11 @@ class CompetitionLLMOrchestrator:
             if not lag_type or not opp_type:
                 LOGGER.debug("competition_llm.stage2_skip_invalid_dimension dimension=%s", dimension)
                 continue
-            display_label = str(dimension.get("lag_type") or "").strip() or _LAG_TYPE_FILENAME_ALIASES.get(lag_type, lag_type)
+            display_label_raw = str(dimension.get("lag_type") or "").strip()
+            if display_label_raw and display_label_raw.lower() != lag_type:
+                display_label = display_label_raw
+            else:
+                display_label = _LAG_TYPE_FILENAME_ALIASES.get(lag_type, lag_type)
             severity_label = str(dimension.get("severity") or "low").lower()
             severity_rank = _SEVERITY_ORDER.get(severity_label, 1)
             opp_types_seen.add(opp_type)
