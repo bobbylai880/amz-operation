@@ -986,8 +986,8 @@ class CompetitionLLMOrchestrator:
             human_markdown = llm_response.get("human_markdown")
             if not isinstance(machine_json, Mapping):
                 raise ValueError("Stage-2 machine_json missing or invalid")
+            machine_json = dict(machine_json)
             if not isinstance(machine_json.get("context"), Mapping):
-                machine_json = dict(machine_json)
                 machine_json["context"] = facts.get("context", {})
             self._validate_stage2_machine_json(machine_json)
             if not isinstance(human_markdown, str):
@@ -1629,17 +1629,83 @@ class CompetitionLLMOrchestrator:
         raise RuntimeError("LLM invocation failed without exception")
 
     def _validate_stage2_machine_json(self, payload: Mapping[str, Any]) -> None:
-        validate_schema(self._stage2_schema, payload)
-        actions = payload.get("recommended_actions", [])
-        for action in actions:
-            code = action.get("action_code")
-            if self._config.stage_2.allowed_action_codes and code not in self._config.stage_2.allowed_action_codes:
+        if isinstance(payload, MutableMapping):
+            mutable_payload: MutableMapping[str, Any] = payload
+        else:
+            mutable_payload = dict(payload)
+
+        if "actions" not in mutable_payload and "recommended_actions" in mutable_payload:
+            mutable_payload["actions"] = mutable_payload.get("recommended_actions") or []
+
+        raw_actions = mutable_payload.get("actions") or []
+        if not isinstance(raw_actions, Sequence):
+            LOGGER.warning(
+                "competition_llm.stage2_drop_actions_invalid_container type=%s",
+                type(raw_actions).__name__,
+            )
+            raw_actions = []
+
+        allowed_actions = tuple(self._config.stage_2.allowed_action_codes or ())
+        allowed_actions_set = {code for code in allowed_actions if code}
+        cleaned_actions: list[dict[str, Any]] = []
+        for index, action in enumerate(raw_actions):
+            if not isinstance(action, Mapping):
+                LOGGER.warning(
+                    "competition_llm.stage2_drop_action_invalid_item index=%s type=%s",
+                    index,
+                    type(action).__name__,
+                )
+                continue
+            code_raw = action.get("code")
+            if code_raw is None:
+                code_raw = action.get("action_code")
+            code = str(code_raw).strip() if code_raw is not None else ""
+            if not code:
+                LOGGER.warning(
+                    "competition_llm.stage2_drop_action_missing_code index=%s item=%s",
+                    index,
+                    action,
+                )
+                continue
+            if allowed_actions_set and code not in allowed_actions_set:
                 raise ValueError(f"Action code {code!r} is not permitted")
-        root_causes = payload.get("root_causes", [])
+            normalized = dict(action)
+            normalized["code"] = code
+            cleaned_actions.append(normalized)
+
+        mutable_payload["actions"] = cleaned_actions
+        if "recommended_actions" in mutable_payload:
+            mutable_payload["recommended_actions"] = cleaned_actions
+
+        root_causes = mutable_payload.get("root_causes") or []
+        if not isinstance(root_causes, Sequence):
+            LOGGER.warning(
+                "competition_llm.stage2_root_causes_invalid_container type=%s",
+                type(root_causes).__name__,
+            )
+            root_causes = []
+
+        allowed_root_causes = tuple(self._config.stage_2.allowed_root_cause_codes or ())
+        allowed_root_causes_set = {code for code in allowed_root_causes if code}
         for cause in root_causes:
-            code = cause.get("root_cause_code")
-            if self._config.stage_2.allowed_root_cause_codes and code not in self._config.stage_2.allowed_root_cause_codes:
+            if not isinstance(cause, Mapping):
+                LOGGER.warning(
+                    "competition_llm.stage2_root_cause_invalid_item type=%s",
+                    type(cause).__name__,
+                )
+                continue
+            code_raw = cause.get("root_cause_code")
+            if code_raw is None:
+                code_raw = cause.get("code")
+            code = str(code_raw).strip() if code_raw is not None else ""
+            if not code:
+                raise ValueError("Root cause code is required")
+            if allowed_root_causes_set and code not in allowed_root_causes_set:
                 raise ValueError(f"Root cause code {code!r} is not permitted")
+            if isinstance(cause, MutableMapping):
+                cause.setdefault("root_cause_code", code)
+
+        validate_schema(self._stage2_schema, mutable_payload)
 
     def _build_page_evidence(
         self, ctx: Mapping[str, Any], lag_type: str, opp_type: str
