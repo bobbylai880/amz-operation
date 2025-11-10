@@ -436,9 +436,19 @@ class CompetitionLLMOrchestrator:
         stage1_outputs: Sequence[StageOneResult] = ()
         if run_stage1:
             stage1_inputs = self._collect_stage1_inputs(target_week, marketplace_id)
-            stage1_outputs = self._execute_stage1_code(stage1_inputs)
-            for item in stage1_outputs:
-                storage_paths.append(self._write_stage1_output(item))
+            rule_results = self._execute_stage1_code(stage1_inputs)
+            stage1_payloads: list[StageOneResult] = []
+            for index, rule_result in enumerate(rule_results):
+                overview_rows: Sequence[Mapping[str, Any]] = ()
+                traffic_rows: Sequence[Mapping[str, Any]] = ()
+                if index < len(stage1_inputs):
+                    _, overview_rows, traffic_rows = stage1_inputs[index]
+                stage1_result = self._apply_stage1_llm(rule_result, overview_rows, traffic_rows)
+                if isinstance(stage1_result, StageOneLLMResult) and stage1_result.prompt_path:
+                    storage_paths.append(stage1_result.prompt_path)
+                storage_paths.append(self._write_stage1_output(stage1_result))
+                stage1_payloads.append(stage1_result)
+            stage1_outputs = tuple(stage1_payloads)
         else:
             LOGGER.info("competition_llm.stage1_skipped")
 
