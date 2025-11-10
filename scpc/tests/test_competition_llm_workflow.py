@@ -1367,6 +1367,53 @@ def test_stage2_validation_drops_missing_code_actions(sqlite_engine, tmp_path):
     assert payload["actions"] == []
 
 
+def test_stage2_validation_accepts_social_gap_root_cause(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    payload = {
+        "context": {
+            "scene_tag": "SCN-2",
+            "base_scene": "base",
+            "morphology": "standard",
+            "marketplace_id": "US",
+            "week": "2025-W01",
+            "sunday": "2025-01-05",
+            "my_parent_asin": "PARENT2",
+            "my_asin": "B067890",
+            "opp_type": "page",
+        },
+        "lag_type": "mixed",
+        "root_causes": [
+            {
+                "root_cause_code": "social_gap",
+                "summary": "社交口碑落后头部对手",
+                "priority": 1,
+                "evidence": [
+                    {
+                        "metric": "rating",
+                        "against": "asin",
+                        "my_value": 4.1,
+                        "opp_value": 4.8,
+                        "unit": None,
+                        "opp_asin": "B0OPP1234",
+                    }
+                ],
+            }
+        ],
+        "actions": [],
+    }
+
+    orchestrator._validate_stage2_machine_json(payload)
+
+    assert payload["root_causes"][0]["root_cause_code"] == "social_gap"
+
+
 def test_materialize_evidence_converts_legacy_refs(sqlite_engine, tmp_path):
     config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
     orchestrator = CompetitionLLMOrchestrator(

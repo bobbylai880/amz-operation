@@ -117,10 +117,16 @@ _LAG_TYPE_FILENAME_ALIASES: Mapping[str, str] = {
 _ROOT_CAUSE_TO_LAG: Mapping[str, str] = {
     "pricing_misalignment": "price",
     "promo_gap": "price",
+    "price_gap": "price",
     "ads_underinvestment": "traffic_mix",
+    "traffic_mix_gap": "traffic_mix",
     "keyword_gap": "keyword",
     "content_quality": "content",
+    "content_gap": "content",
     "assortment": "badge",
+    "badge_gap": "badge",
+    "rank_gap": "rank",
+    "social_gap": "social",
 }
 
 _ENTITY_DETAIL_FIELDS: tuple[str, ...] = (

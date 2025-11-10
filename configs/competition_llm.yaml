@@ -36,6 +36,12 @@ stage_2:
     - keyword_gap
     - content_quality
     - assortment
+    - price_gap
+    - rank_gap
+    - content_gap
+    - social_gap
+    - badge_gap
+    - traffic_mix_gap
 llm:
   model: deepseek-chat
   temperature: 0.1
