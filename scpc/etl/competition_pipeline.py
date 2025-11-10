@@ -1134,6 +1134,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Skip ETL/compare and only run the competition LLM workflow",
     )
     parser.add_argument(
+        "--llm-stage",
+        choices=("both", "stage1", "stage2"),
+        default="both",
+        help="Select which LLM stages to execute when running the competition workflow (default: both)",
+    )
+    parser.add_argument(
         "--llm-config",
         default="configs/competition_llm.yaml",
         help="Path to the competition LLM configuration YAML",
@@ -1257,9 +1263,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                     storage_root=args.llm_storage_root,
                 )
                 target_week = resolved_week or args.week
+                if args.llm_stage == "both":
+                    stage_selection: Sequence[str] | None = ("stage1", "stage2")
+                else:
+                    stage_selection = (args.llm_stage,)
                 result = competition_orchestrator.run(
                     target_week,
                     marketplace_id=args.mk,
+                    stages=stage_selection,
                 )
                 LOGGER.info(
                     "competition_pipeline_llm_completed week=%s stage1=%s stage2_candidates=%s stage2=%s storage=%s",
