@@ -28,6 +28,11 @@ class StageTwoConfig:
     allowed_action_codes: Sequence[str]
     allowed_root_cause_codes: Sequence[str]
     trigger_status: Sequence[str]
+    require_unfavorable_evidence: bool
+    keyword_max_pairs_per_opp: int
+    min_reviews_for_rating_priority: int
+    rating_margin: float
+    always_include_metrics: Mapping[str, tuple[str, ...]]
 
 
 @dataclass(slots=True)
@@ -100,6 +105,57 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
     if not trigger_status:
         trigger_status = ("lag",)
 
+    keyword_section = stage2_raw.get("keyword")
+    if not isinstance(keyword_section, Mapping):
+        keyword_section = {}
+    keyword_limit_raw = keyword_section.get("max_pairs_per_opp", 2)
+    try:
+        keyword_limit = int(keyword_limit_raw)
+    except (TypeError, ValueError):
+        keyword_limit = 2
+    if keyword_limit < 1:
+        keyword_limit = 2
+
+    min_reviews_raw = stage2_raw.get("min_reviews_for_rating_priority", 200)
+    try:
+        min_reviews = int(min_reviews_raw)
+    except (TypeError, ValueError):
+        min_reviews = 200
+    if min_reviews < 0:
+        min_reviews = 0
+
+    rating_margin_raw = stage2_raw.get("rating_margin", 0.05)
+    try:
+        rating_margin = float(rating_margin_raw)
+    except (TypeError, ValueError):
+        rating_margin = 0.05
+    if rating_margin < 0:
+        rating_margin = 0.0
+
+    always_include_raw = stage2_raw.get("always_include_metrics")
+    always_include: dict[str, tuple[str, ...]] = {}
+    if isinstance(always_include_raw, Mapping):
+        for lag_key, metrics_raw in always_include_raw.items():
+            if not isinstance(lag_key, str):
+                continue
+            lag_type = lag_key.strip().lower()
+            if not lag_type:
+                continue
+            metric_values: list[str] = []
+            if isinstance(metrics_raw, Sequence) and not isinstance(metrics_raw, (str, bytes)):
+                candidates = metrics_raw
+            else:
+                candidates = (metrics_raw,)
+            for metric in candidates:
+                if not isinstance(metric, str):
+                    metric = str(metric) if metric is not None else ""
+                metric_name = metric.strip().lower()
+                if metric_name:
+                    metric_values.append(metric_name)
+            if metric_values:
+                deduped = tuple(dict.fromkeys(metric_values))
+                always_include[lag_type] = deduped
+
     stage2 = StageTwoConfig(
         enabled=bool(stage2_raw.get("enabled", True)),
         aggregate_per_asin=bool(stage2_raw.get("aggregate_per_asin", True)),
@@ -107,6 +163,11 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         allowed_action_codes=tuple(stage2_raw.get("allowed_action_codes", [])),
         allowed_root_cause_codes=tuple(stage2_raw.get("allowed_root_cause_codes", [])),
         trigger_status=trigger_status,
+        require_unfavorable_evidence=bool(stage2_raw.get("require_unfavorable_evidence", True)),
+        keyword_max_pairs_per_opp=keyword_limit,
+        min_reviews_for_rating_priority=min_reviews,
+        rating_margin=rating_margin,
+        always_include_metrics=always_include,
     )
 
     if not llm_raw.get("model"):

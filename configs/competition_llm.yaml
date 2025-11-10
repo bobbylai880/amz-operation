@@ -22,13 +22,7 @@ stage_2:
     - neutral
     - parity
   max_retries: 2
-  allowed_action_codes:
-    - price_adjust
-    - coupon_update
-    - ads_increase
-    - keyword_mining
-    - creative_refresh
-    - merchandising
+  allowed_action_codes: []
   allowed_root_cause_codes:
     - pricing_misalignment
     - promo_gap
@@ -42,6 +36,18 @@ stage_2:
     - social_gap
     - badge_gap
     - traffic_mix_gap
+  require_unfavorable_evidence: true
+  min_reviews_for_rating_priority: 200
+  rating_margin: 0.05
+  always_include_metrics:
+    rank:
+      - rank_leaf
+      - rank_pos_pct
+    social:
+      - rating
+      - reviews
+  keyword:
+    max_pairs_per_opp: 2
 llm:
   model: deepseek-chat
   temperature: 0.1
