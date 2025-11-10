@@ -18,7 +18,9 @@
    - 优先使用 facts.lag_items[*].overview.{leader|median} 和 facts.lag_items[*].top_opps[] 中的字段：
      - 若概览提供指数/比率（如 price_index_med），请设置 my_value=指数值、opp_value=1.00、against="median"、unit="ratio"；
      - 若需要绝对值对比，请从 top_opps[] 选择含 my_*/opp_* 字段的对手，设置 against="asin" 并填 opp_asin；
-     - evidence_refs 仅作为回溯提示，禁止单独输出。
+      - top_opps[] 已直接提供来自数据库的客观值：例如 my_price_net/opp_price_net、my_price_current/opp_price_current、my_rank_pos_pct/opp_rank_pos_pct、my_content_score/opp_content_score、my_social_proof/opp_social_proof、my_badge_json/opp_badge_json；请优先引用这些成对字段，避免只描述差值；
+      - 流量维度同理可使用 my_ad_ratio/opp_ad_ratio、my_kw_top3_share_7d_avg/opp_kw_top3_share_7d_avg 等字段，确保每条证据展示“我 vs 对手”的客观数值；
+      - evidence_refs 仅作为回溯提示，禁止单独输出。
    - 每个 root_cause 的 evidence 至少包含 1 条“我 vs 对手”数值证据，确保来自 overview 或 top_opps 的事实数据。
 4. actions（推荐动作）：
    - 严格从 allowed_action_codes 中选择 code，区分大小写；

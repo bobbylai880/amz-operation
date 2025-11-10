@@ -112,6 +112,26 @@ _ROOT_CAUSE_TO_LAG: Mapping[str, str] = {
     "assortment": "badge",
 }
 
+_ENTITY_DETAIL_FIELDS: tuple[str, ...] = (
+    "price_current",
+    "price_list",
+    "coupon_pct",
+    "price_net",
+    "rank_leaf",
+    "rank_root",
+    "rank_score",
+    "image_cnt",
+    "video_cnt",
+    "bullet_cnt",
+    "title_len",
+    "aplus_flag",
+    "content_score",
+    "rating",
+    "reviews",
+    "social_proof",
+    "badge_json",
+)
+
 _RULES_CONFIG_DEFAULT_PATH = Path("configs/competition_lag_rules.yaml")
 _RULES_CONFIG_SCHEMA_NAME = "competition_lag_rules.schema.json"
 _DEFAULT_RULES_CONFIG = {
@@ -2191,22 +2211,9 @@ class CompetitionLLMOrchestrator:
         }
         metric_col, score_col = metric_map.get(lag_type, ("pressure", "pressure"))
 
-        select_columns = [
-            "opp_asin",
-            "opp_parent_asin",
-            "price_gap_each",
-            "price_ratio_each",
-            "rank_pos_delta",
-            "content_gap_each",
-            "social_gap_each",
-            "badge_delta_sum",
-        ]
-        if lag_type == "confidence":
-            select_columns.append("confidence")
-        select_columns.append(f"{score_col} AS score")
-        select_clause = ",\n                 ".join(select_columns)
         sql_each = f"""
-          SELECT {select_clause}
+          SELECT *,
+                 {score_col} AS score
           FROM bi_amz_comp_pairs_each
           WHERE scene_tag=:scene_tag AND base_scene=:base_scene
             AND COALESCE(morphology,'') = COALESCE(:morphology,'')
@@ -2226,6 +2233,8 @@ class CompetitionLLMOrchestrator:
                 exc,
             )
             top_each = []
+        if top_each:
+            self._attach_page_entity_details(ctx, top_each)
         comparison_reasons = _build_comparison_reasons(lag_type, top_each)
 
         return {
@@ -2241,6 +2250,90 @@ class CompetitionLLMOrchestrator:
             "reason_code": f"{lag_type}_by_pairs",
             "prompt_hint": "优先解释 overview 与 top_opps 中的差异来源；引用已给字段名即可；不要推导新指标。",
         }
+
+    def _attach_page_entity_details(
+        self,
+        ctx: Mapping[str, Any],
+        rows: Sequence[MutableMapping[str, Any]] | Sequence[Mapping[str, Any]],
+    ) -> None:
+        if not rows:
+            return
+
+        my_detail = self._get_entity_detail(ctx, ctx.get("my_asin"))
+        opponent_cache: dict[str, Mapping[str, Any] | None] = {}
+
+        for row in rows:
+            if not isinstance(row, MutableMapping):
+                continue
+            opp_asin = row.get("opp_asin")
+            if not opp_asin or opp_asin in opponent_cache:
+                continue
+            opponent_cache[opp_asin] = self._get_entity_detail(ctx, opp_asin)
+
+        for row in rows:
+            if not isinstance(row, MutableMapping):
+                continue
+            if my_detail:
+                self._inject_entity_fields(row, my_detail, prefix="my_")
+            opp_asin = row.get("opp_asin")
+            if not opp_asin:
+                continue
+            opp_detail = opponent_cache.get(opp_asin)
+            if opp_detail:
+                self._inject_entity_fields(row, opp_detail, prefix="opp_")
+
+    def _get_entity_detail(
+        self, ctx: Mapping[str, Any], asin: Any
+    ) -> Mapping[str, Any] | None:
+        if not asin:
+            return None
+        sql = """
+          SELECT price_current, price_list, coupon_pct, price_net,
+                 rank_leaf, rank_root, rank_score,
+                 image_cnt, video_cnt, bullet_cnt, title_len, aplus_flag, content_score,
+                 rating, reviews, social_proof, badge_json
+          FROM bi_amz_comp_entities_clean
+          WHERE scene_tag=:scene_tag AND base_scene=:base_scene
+            AND COALESCE(morphology,'') = COALESCE(:morphology,'')
+            AND marketplace_id=:marketplace_id
+            AND week=:week AND sunday=:sunday
+            AND asin=:asin
+          LIMIT 1
+        """
+        params = {
+            "scene_tag": ctx.get("scene_tag"),
+            "base_scene": ctx.get("base_scene"),
+            "morphology": ctx.get("morphology"),
+            "marketplace_id": ctx.get("marketplace_id"),
+            "week": ctx.get("week"),
+            "sunday": ctx.get("sunday"),
+            "asin": asin,
+        }
+        try:
+            return self._fetch_one(sql, params)
+        except SQLAlchemyError as exc:  # pragma: no cover - optional table
+            LOGGER.debug(
+                "competition_llm.stage2_entity_lookup_failed asin=%s error=%s",
+                asin,
+                exc,
+            )
+            return None
+
+    def _inject_entity_fields(
+        self,
+        target: MutableMapping[str, Any],
+        source: Mapping[str, Any],
+        *,
+        prefix: str,
+    ) -> None:
+        for field in _ENTITY_DETAIL_FIELDS:
+            key = f"{prefix}{field}"
+            if key in target and target[key] not in (None, ""):
+                continue
+            value = source.get(field)
+            if value in (None, ""):
+                continue
+            target[key] = value
 
     def _build_traffic_evidence(
         self, ctx: Mapping[str, Any], lag_type: str, opp_type: str
