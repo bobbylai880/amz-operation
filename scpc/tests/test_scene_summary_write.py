@@ -1,5 +1,4 @@
-import time
-from datetime import date, datetime
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -55,8 +54,6 @@ def test_write_scene_summary_to_db_builds_dataframe(monkeypatch):
         "summary_str",
         "llm_model",
         "llm_version",
-        "created_at",
-        "updated_at",
     ]
     row = df.iloc[0]
     assert row["scene"] == "Storage Rack"
@@ -67,47 +64,8 @@ def test_write_scene_summary_to_db_builds_dataframe(monkeypatch):
     assert row["summary_str"] == "需求回暖，建议保持广告投入节奏。"
     assert row["llm_model"] == "deepseek-pro"
     assert row["llm_version"] == "v1.0"
-    assert isinstance(row["created_at"], datetime)
-    assert isinstance(row["updated_at"], datetime)
-    assert row["created_at"] == row["updated_at"]
-
-
-def test_write_scene_summary_to_db_updates_timestamps(monkeypatch):
-    timestamps: list[datetime] = []
-
-    def _capture(_engine, _table, df, chunk_size=500):
-        timestamps.append(df.iloc[0]["updated_at"])
-        return len(df)
-
-    monkeypatch.setattr("scpc.etl.scene_pipeline.replace_into", _capture)
-
-    engine = object()
-    write_scene_summary_to_db(
-        engine,
-        scene="Storage Rack",
-        marketplace_id="US",
-        week="2024W12",
-        sunday=date(2024, 3, 17),
-        summary_str="需求回暖，建议保持广告投入节奏。",
-        confidence=0.83,
-        llm_model="deepseek-pro",
-        llm_version="v1.0",
-    )
-    time.sleep(0.01)
-    write_scene_summary_to_db(
-        engine,
-        scene="Storage Rack",
-        marketplace_id="US",
-        week="2024W12",
-        sunday=date(2024, 3, 17),
-        summary_str="需求回暖，建议保持广告投入节奏。",
-        confidence=0.83,
-        llm_model="deepseek-pro",
-        llm_version="v1.0",
-    )
-
-    assert len(timestamps) == 2
-    assert timestamps[0] < timestamps[1]
+    assert "created_at" not in df.columns
+    assert "updated_at" not in df.columns
 
 
 def test_resolve_summary_week_prefers_features(monkeypatch):

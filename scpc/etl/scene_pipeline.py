@@ -8,7 +8,7 @@ import os
 import re
 import sys
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Mapping, Sequence
@@ -219,8 +219,6 @@ def write_scene_summary_to_db(
     if sunday_date is None:
         raise ValueError("sunday must be a valid date")
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-
     confidence_value: float | None
     try:
         confidence_value = float(confidence) if confidence is not None else None
@@ -238,8 +236,6 @@ def write_scene_summary_to_db(
         "summary_str": summary_text,
         "llm_model": llm_model,
         "llm_version": llm_version,
-        "created_at": now,
-        "updated_at": now,
     }
     df = pd.DataFrame([record])
     return replace_into(engine, SCENE_SUMMARY_TABLE, df)

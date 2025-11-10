@@ -201,24 +201,22 @@ PROPERTIES (
 
 -- 4.4 场景级 LLM 总结表（含周起始日）
 CREATE TABLE IF NOT EXISTS bi_amz_scene_summary (
-  scene             VARCHAR(512) NOT NULL COMMENT "场景名称",
-  marketplace_id    VARCHAR(8)   NOT NULL COMMENT "站点",
-  week              VARCHAR(16)  NOT NULL COMMENT "ISO周，例如 2025W45",
-  sunday            DATE         NOT NULL COMMENT "该周起始日（周日）",
-  confidence        DOUBLE                COMMENT "LLM 输出置信度",
-  summary_str       STRING                COMMENT "LLM 最终总结文本",
-  llm_model         VARCHAR(64)           COMMENT "LLM 模型名称",
-  llm_version       VARCHAR(32)           COMMENT "Prompt/Schema 版本",
-  created_at        DATETIME     DEFAULT CURRENT_TIMESTAMP COMMENT "生成时间 (UTC)",
-  updated_at        DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT "更新时间 (UTC)",
-  PRIMARY KEY (scene, marketplace_id, week)
+  scene             VARCHAR(255) COMMENT "场景名称",
+  marketplace_id    VARCHAR(8)   COMMENT "站点，如 US/UK/DE",
+  week              VARCHAR(16)  COMMENT "周标识，如 2025W45",
+  sunday            DATE         COMMENT "该周的起始日（周日）",
+  confidence        DOUBLE                COMMENT "LLM 输出置信度（可选）",
+  summary_str       STRING                COMMENT "LLM 最终总结文本内容",
+  llm_model         STRING                COMMENT "生成使用的模型名，如 deepseek-chat",
+  llm_version       STRING                COMMENT "Prompt/Schema 版本号，用于溯源",
+  updated_at        DATETIME     DEFAULT CURRENT_TIMESTAMP  COMMENT "更新时间戳（更新时）"
 )
 ENGINE=OLAP
-UNIQUE KEY(scene, marketplace_id, week)
-DISTRIBUTED BY HASH(scene, marketplace_id) BUCKETS 16
+UNIQUE KEY(scene, marketplace_id, week, sunday)
+COMMENT '场景级 LLM 总结输出'
+DISTRIBUTED BY HASH(scene)
 PROPERTIES (
-  "replication_allocation" = "tag.location.default: 3",
-  "enable_unique_key_merge_on_write" = "true"
+"replication_allocation" = "tag.location.default: 3"
 );
 
 /* =========================
