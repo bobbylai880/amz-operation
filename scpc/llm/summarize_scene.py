@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 logger = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT_TEMPLATE = """你是一位资深亚马逊跨境电商总监，负责场景级预测。\n严格遵守：\n1. 仅基于输入 JSON，禁止引入额外数据或假设。\n2. 引用任意时间必须同时包含 year、week_num、start_date（周日）。\n3. 输出必须使用中文，并严格匹配 response_schema。\n4. 在 analysis_summary 中，用不超过400字的中文总结场景与主要关键词未来趋势及驱动原因，并引用至少两个具体指标数值作为依据（例如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）。\n5. 预测规则：\n   • 本年最近{history_window}周 WoW 中位数 = 短期趋势项 r。\n   • 去年“过去{history_window}周 + 未来{history_window}周”体量计算季节先验：s[h] = (LY_future_window[h].vol / LY_pivot.vol) - 1。\n   • 组合增速：w[h] = α * r + (1-α) * s[h]，默认 α=0.6，可由 blend_weights 覆盖。\n   • 逐周滚动：pred[0] = 当前最后一周 vol；pred[h] = pred[h-1] * (1 + w[h])。\n   • 方向阈值：pct_change ≥ +1% → up；≤ −1% → down；其余 flat，pct_change 对“最后观测周”计算并保留1位小数。\n   • 关键词预测与场景同法、独立计算。\n6. 数据不足或缺行 → insufficient_data=true，并在 notes 说明原因。\n"""
+SYSTEM_PROMPT_TEMPLATE = """你是一位资深亚马逊跨境电商总监，负责场景级定性诊断。\n严格遵守：\n1. 仅基于输入 JSON，禁止引入额外数据或假设。\n2. 输出必须使用中文，并严格匹配 response_schema。\n3. 在 analysis_summary 中，用不超过400字的中文给出整体判断与关键原因，并引用至少两个具体指标数值作为依据（例如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）。\n4. 若数据覆盖不足，则设置 insufficient_data=true，并在 notes 中用简短中文说明原因。\n5. 所有事实数据（逐周时序、环比/同比、TopN 关键词、预测结果）均由系统拼接，禁止在输出中创建 scene_forecast、top_keywords_forecast 或其他明细字段；预测规则如下（供理解趋势，勿在输出中直接填报预测字段）：\n   • 本年最近{history_window}周 WoW 中位数 = 短期趋势项 r。\n   • 去年“过去{history_window}周 + 未来{history_window}周”体量计算季节先验：s[h] = (LY_future_window[h].vol / LY_pivot.vol) - 1。\n   • 组合增速：w[h] = α * r + (1-α) * s[h]，默认 α=0.6，可由 blend_weights 覆盖。\n   • 逐周滚动：pred[0] = 当前最后一周 vol；pred[h] = pred[h-1] * (1 + w[h])。\n   • 方向阈值：pct_change ≥ +1% → up；≤ −1% → down；其余 flat，pct_change 对“最后观测周”计算并保留1位小数。\n   • 关键词预测与场景同法、独立计算。\n"""
 
 
 def _build_system_prompt(history_window: int) -> str:
@@ -41,20 +41,13 @@ DEFAULT_HISTORY_WINDOW_WEEKS = 4
 SYSTEM_PROMPT = _build_system_prompt(DEFAULT_HISTORY_WINDOW_WEEKS)
 
 
-def _build_output_instructions(limit: int, horizon: int) -> list[str]:
-    limit = max(1, int(limit))
-    horizon = max(1, int(horizon))
+def _build_output_instructions() -> list[str]:
     instructions = [
         "仅返回一个 JSON 对象，UTF-8 编码，无额外解释或 Markdown。",
-        "必须包含字段 scene_forecast、top_keywords_forecast、confidence、insufficient_data、analysis_summary；可选 notes（为空请输出 null）。",
-        f"scene_forecast.weeks 与 top_keywords_forecast[*].weeks 均需列出未来{horizon}周的 direction、projected_vol、pct_change（百分号字符串，保留两位小数）",
-        "scene_forecast.weeks[*].pct_change 同时需要提供 pct_change_value（小数形式，便于系统后续计算）。",
-        f"top_keywords_forecast 数量不超过 {limit}，且需覆盖输入 facts.top_keywords 中的全部关键词（若不足{limit}个则全部输出）。",
+        "必须包含字段 confidence、insufficient_data、analysis_summary；可选 notes（为空请输出 null）。",
         "analysis_summary 需以中文总结场景与主要关键词的趋势及主因，长度不超过400字。",
-        "若提供 bounds.p10/p90，则最后一周累计相对变化需落在该区间，越界时取边界值。",
-        "若 facts.forecast_guidance.scene.forecast_weeks 非空，则 scene_forecast 的 direction、projected_vol、pct_change_value 必须与之保持一致，pct_change 需为 pct_change_value×100 后按四舍五入保留两位小数并追加%符号。",
-        "若 facts.forecast_guidance.keywords[*].forecast_weeks 非空，则对应 keyword 的 direction、projected_vol、pct_change_value 需与之保持一致，pct_change 同样需输出百分号字符串。",
         "analysis_summary 必须引用 facts.analysis_evidence 中至少两个具体指标值（如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）作为结论依据。",
+        "不要输出 scene_forecast、top_keywords_forecast 或其他事实明细字段，这些由系统自动拼接。",
     ]
     return instructions
 
@@ -896,12 +889,57 @@ def _build_scene_summary_payload(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": json.dumps(facts, ensure_ascii=False)},
     ]
-    instructions = _build_output_instructions(top_keywords_limit, forecast_horizon)
+    instructions = _build_output_instructions()
     return SceneSummaryPayload(
         messages=messages,
         raw=facts,
         output_instructions=instructions,
     )
+
+
+def _extract_forecast_weeks(entries: Any) -> list[dict[str, Any]]:
+    weeks: list[dict[str, Any]] = []
+    if not isinstance(entries, Sequence):
+        return weeks
+    for item in entries:
+        if not isinstance(item, Mapping):
+            continue
+        target = item.get("target_week")
+        target_map = target if isinstance(target, Mapping) else {}
+        week = {
+            "year": target_map.get("year"),
+            "week_num": target_map.get("week_num"),
+            "start_date": target_map.get("start_date"),
+            "direction": item.get("direction"),
+            "projected_vol": item.get("projected_vol"),
+            "pct_change": item.get("pct_change"),
+            "pct_change_value": item.get("pct_change_value"),
+        }
+        weeks.append(week)
+    return weeks
+
+
+def _attach_programmatic_forecasts(
+    payload: Mapping[str, Any], forecast_guidance: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    result = dict(payload)
+    scene_weeks: list[dict[str, Any]] = []
+    keyword_forecast: list[dict[str, Any]] = []
+    if isinstance(forecast_guidance, Mapping):
+        scene_guidance = forecast_guidance.get("scene")
+        if isinstance(scene_guidance, Mapping):
+            scene_weeks = _extract_forecast_weeks(scene_guidance.get("forecast_weeks"))
+        keyword_entries = forecast_guidance.get("keywords")
+        if isinstance(keyword_entries, Sequence):
+            for entry in keyword_entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                keyword = entry.get("keyword")
+                weeks = _extract_forecast_weeks(entry.get("forecast_weeks"))
+                keyword_forecast.append({"keyword": keyword, "weeks": weeks})
+    result["scene_forecast"] = {"weeks": scene_weeks}
+    result["top_keywords_forecast"] = keyword_forecast
+    return result
 
 
 def _compose_user_content(
@@ -1250,7 +1288,7 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
                 if attempt < max_attempts:
                     continue
                 raise SceneSummarizationError(failure_message, raw=raw_content, details=errors) from exc
-            return parsed
+            return _attach_programmatic_forecasts(parsed, forecast_guidance)
     finally:
         client.close()
     if failure_message:
