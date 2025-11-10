@@ -1,13 +1,15 @@
 """Feature engineering utilities for the competition module."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from math import log
 import json
 import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+import logging
 
 from scpc.utils.dependencies import ensure_packages
 
@@ -21,6 +23,9 @@ import yaml
 BadgeValue = list[str]
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 @dataclass(slots=True)
 class TrafficScoringContext:
     """Container describing how traffic gaps should be scored."""
@@ -31,6 +36,31 @@ class TrafficScoringContext:
     pressure_weights: dict[str, float]
     coverage_threshold: int = 5
     eps: float = 1e-6
+
+
+@dataclass(slots=True)
+class LeaderSelectionConfig:
+    """Configuration controlling how leader opponents are selected."""
+
+    strategy: str = "rank_leaf_min"
+    tie_breakers: list[tuple[str, bool]] = field(
+        default_factory=lambda: [
+            ("rank_pos_pct", False),
+            ("rating", False),
+            ("reviews", False),
+            ("price_net", True),
+        ]
+    )
+    allow_missing_rank: bool = True
+
+
+@dataclass(slots=True)
+class LeaderSelectionResult:
+    """Outcome of selecting a leader opponent for a given ASIN."""
+
+    row: pd.Series
+    stage: str
+    fallback_reasons: tuple[str, ...]
 
 _SCORING_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "competition_scoring.yaml"
 
@@ -61,6 +91,13 @@ _FALLBACK_TRAFFIC_RULES: dict[str, dict[str, dict[str, float]]] = {
     "bands": {"traffic_intensity": {"C1": 0.25, "C2": 0.50, "C3": 0.75, "C4": 1.00}},
     "pressure_weights": {"mix": 0.5, "keyword": 0.5},
 }
+
+_DEFAULT_TIE_BREAKERS: list[tuple[str, bool]] = [
+    ("rank_pos_pct", False),
+    ("rating", False),
+    ("reviews", False),
+    ("price_net", True),
+]
 
 
 def _clone_feature_rules(source: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
@@ -331,11 +368,72 @@ def _prepare_traffic_scoring(
     )
 
 
+def _parse_tie_breakers(raw: Any) -> list[tuple[str, bool]]:
+    """Normalise tie-breaker configuration entries."""
+
+    if not isinstance(raw, Sequence):
+        return []
+
+    parsed: list[tuple[str, bool]] = []
+    for entry in raw:
+        if isinstance(entry, Mapping):
+            for metric, direction in entry.items():
+                metric_key = str(metric).strip().lower()
+                if not metric_key:
+                    continue
+                dir_value = "desc" if direction is None else str(direction).strip().lower()
+                ascending = dir_value in {"asc", "ascending", "min", "smallest"}
+                parsed.append((metric_key, ascending))
+        elif isinstance(entry, str):
+            parts = entry.split()
+            if not parts:
+                continue
+            metric_key = parts[0].strip().lower()
+            direction = parts[1].strip().lower() if len(parts) > 1 else "desc"
+            ascending = direction in {"asc", "ascending", "min", "smallest"}
+            if metric_key:
+                parsed.append((metric_key, ascending))
+    return parsed
+
+
+def _parse_leader_config(config: Mapping[str, Any] | None) -> LeaderSelectionConfig:
+    """Extract leader selection configuration from YAML."""
+
+    if not isinstance(config, Mapping):
+        return LeaderSelectionConfig()
+
+    section = config.get("leader")
+    if not isinstance(section, Mapping):
+        return LeaderSelectionConfig()
+
+    parsed = LeaderSelectionConfig()
+
+    strategy = section.get("strategy")
+    if isinstance(strategy, str):
+        strategy_key = strategy.strip().lower()
+        if strategy_key in {"rank_leaf_min", "rank_pos_pct_max", "score_max"}:
+            parsed.strategy = strategy_key
+
+    allow_missing = section.get("allow_missing_rank")
+    if allow_missing is not None:
+        parsed.allow_missing_rank = _coerce_bool(allow_missing)
+
+    tie_breakers = _parse_tie_breakers(section.get("tie_breakers"))
+    if tie_breakers:
+        parsed.tie_breakers = tie_breakers
+    else:
+        parsed.tie_breakers = list(_DEFAULT_TIE_BREAKERS)
+
+    return parsed
+
+
 _SCORING_CONFIG = _load_scoring_config()
 
 DEFAULT_SCORING_RULES, DEFAULT_BAND_CUTS = _extract_rule_from_config(
     "default", config=_SCORING_CONFIG
 )
+
+LEADER_CONFIG = _parse_leader_config(_SCORING_CONFIG)
 
 
 @dataclass(slots=True)
@@ -402,6 +500,217 @@ def _iso_week_label(ts: pd.Timestamp | None) -> str | None:
         return None
     iso = ts.isocalendar()
     return f"{iso.year}W{iso.week:02d}"
+
+
+def _leader_metric_series(df: pd.DataFrame, metric: str) -> pd.Series:
+    metric_key = metric.strip().lower()
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    def _series_or_nan(column: str) -> pd.Series:
+        if column in df:
+            return df[column]
+        return pd.Series(np.nan, index=df.index)
+
+    if metric_key == "rank_leaf":
+        series = _series_or_nan("rank_leaf").map(_clean_int)
+        return pd.Series(series, index=df.index, dtype=float)
+    if metric_key in {"rank_pos_pct", "rank_pct"}:
+        base = "rank_pos_pct" if "rank_pos_pct" in df else "rank_score"
+        series = _series_or_nan(base).map(_clean_float)
+        return pd.Series(series, index=df.index, dtype=float)
+    if metric_key in {"rank_score", "score"}:
+        series = _series_or_nan("rank_score").map(_clean_float)
+        return pd.Series(series, index=df.index, dtype=float)
+    if metric_key == "rank_root":
+        series = _series_or_nan("rank_root").map(_clean_int)
+        return pd.Series(series, index=df.index, dtype=float)
+
+    series = _series_or_nan(metric_key).map(_clean_float)
+    return pd.Series(series, index=df.index, dtype=float)
+
+
+def _leader_metric_value(row: Mapping[str, Any], metric: str) -> float | None:
+    metric_key = metric.strip().lower()
+    if metric_key == "rank_leaf":
+        return _clean_int(row.get("rank_leaf"))
+    if metric_key in {"rank_pos_pct", "rank_pct"}:
+        value = row.get("rank_pos_pct")
+        if value is None:
+            value = row.get("rank_score")
+        return _clean_float(value)
+    if metric_key in {"rank_score", "score"}:
+        return _clean_float(row.get("rank_score"))
+    if metric_key == "rank_root":
+        return _clean_int(row.get("rank_root"))
+    if metric_key == "reviews":
+        return _clean_float(row.get("reviews"))
+    return _clean_float(row.get(metric))
+
+
+def _select_by_rank_leaf(df: pd.DataFrame) -> pd.Index:
+    series = _leader_metric_series(df, "rank_leaf")
+    mask = series.notna() & (series > 0)
+    if not mask.any():
+        return pd.Index([], dtype=object)
+    min_value = float(series[mask].min())
+    return pd.Index(series.index[mask & (series == min_value)])
+
+
+def _select_by_rank_pos_pct(df: pd.DataFrame) -> pd.Index:
+    series = _leader_metric_series(df, "rank_pos_pct")
+    mask = series.notna()
+    if not mask.any():
+        return pd.Index([], dtype=object)
+    max_value = float(series[mask].max())
+    return pd.Index(series.index[mask & (series == max_value)])
+
+
+def _select_by_score_max(df: pd.DataFrame) -> pd.Index:
+    score_series = _leader_metric_series(df, "rank_score")
+    mask = score_series.notna()
+    if mask.any():
+        max_score = float(score_series[mask].max())
+        candidates = pd.Index(score_series.index[mask & (score_series == max_score)])
+    else:
+        candidates = pd.Index(df.index)
+    if len(candidates) <= 1:
+        return candidates
+    root_series = _leader_metric_series(df.loc[candidates], "rank_root")
+    root_mask = root_series.notna()
+    if root_mask.any():
+        min_root = float(root_series[root_mask].min())
+        return pd.Index(root_series.index[root_mask & (root_series == min_root)])
+    return candidates
+
+
+def _apply_leader_tie_breakers(
+    df: pd.DataFrame, candidates: pd.Index, tie_breakers: Sequence[tuple[str, bool]]
+) -> pd.Index:
+    if len(candidates) <= 1:
+        return candidates
+    subset = df.loc[candidates]
+    remaining = pd.Index(candidates)
+    for metric, ascending in tie_breakers:
+        series = _leader_metric_series(subset, metric)
+        mask = series.notna()
+        if not mask.any():
+            continue
+        target = float(series[mask].min()) if ascending else float(series[mask].max())
+        remaining = pd.Index(series.index[mask & (series == target)])
+        subset = subset.loc[remaining]
+        if len(remaining) <= 1:
+            break
+    if len(remaining) > 1:
+        subset = subset.loc[remaining]
+        subset = subset.sort_values(by="asin", ascending=True, kind="mergesort")
+        return pd.Index([subset.index[0]])
+    return remaining
+
+
+def _select_leader_opponent(
+    my_row: Mapping[str, Any],
+    competitors: pd.DataFrame,
+    *,
+    config: LeaderSelectionConfig,
+    channel: str,
+    log: bool = True,
+) -> LeaderSelectionResult:
+    if competitors.empty:
+        raise ValueError("competitors dataframe must not be empty")
+
+    strategy = (config.strategy or "rank_leaf_min").strip().lower()
+    allow_missing = config.allow_missing_rank
+
+    stage_sequence: list[str] = []
+    if strategy == "rank_leaf_min":
+        stage_sequence.append("rank_leaf")
+        if allow_missing:
+            stage_sequence.append("rank_pos_pct")
+        stage_sequence.append("score_max")
+    elif strategy == "rank_pos_pct_max":
+        stage_sequence.append("rank_pos_pct")
+        if allow_missing:
+            stage_sequence.append("rank_leaf")
+        stage_sequence.append("score_max")
+    else:
+        stage_sequence.append("score_max")
+
+    fallback_reasons: list[str] = []
+    selected = pd.Index([], dtype=object)
+    stage_used = stage_sequence[-1]
+
+    for stage in stage_sequence:
+        if stage == "rank_leaf":
+            selected = _select_by_rank_leaf(competitors)
+        elif stage == "rank_pos_pct":
+            selected = _select_by_rank_pos_pct(competitors)
+        else:
+            selected = _select_by_score_max(competitors)
+
+        if len(selected) == 0:
+            if stage in {"rank_leaf", "rank_pos_pct"}:
+                fallback_reasons.append("no_valid_rank")
+            continue
+        stage_used = stage
+        break
+
+    if len(selected) == 0:
+        selected = pd.Index([competitors.index[0]])
+
+    selected = _apply_leader_tie_breakers(competitors, selected, config.tie_breakers)
+    leader_row = competitors.loc[selected[0]]
+
+    if log:
+        for reason in fallback_reasons:
+            LOGGER.info(
+                "compare.leader_fallback reason=%s channel=%s my_asin=%s week=%s scene_tag=%s marketplace=%s",
+                reason,
+                channel,
+                my_row.get("asin"),
+                my_row.get("week"),
+                my_row.get("scene_tag"),
+                my_row.get("marketplace_id"),
+            )
+        LOGGER.info(
+            "compare.leader_selected my_asin=%s leader=%s strategy=%s rank_leaf=%s rank_pos_pct=%s scene_tag=%s marketplace=%s week=%s",
+            my_row.get("asin"),
+            leader_row.get("asin"),
+            stage_used,
+            _clean_int(leader_row.get("rank_leaf")),
+            _leader_metric_value(leader_row, "rank_pos_pct"),
+            my_row.get("scene_tag"),
+            my_row.get("marketplace_id"),
+            my_row.get("week"),
+        )
+
+    return LeaderSelectionResult(
+        row=leader_row,
+        stage=stage_used,
+        fallback_reasons=tuple(fallback_reasons),
+    )
+
+
+def _has_traffic_metrics(row: Mapping[str, Any]) -> bool:
+    for column in (
+        "ad_ratio",
+        "nf_ratio",
+        "recommend_ratio",
+        "sp_share_in_ad",
+        "sbv_share_in_ad",
+        "sb_share_in_ad",
+        "ad_to_natural",
+        "kw_brand_share_7d_avg",
+        "kw_competitor_share_7d_avg",
+        "kw_generic_share_7d_avg",
+        "kw_attribute_share_7d_avg",
+        "kw_days_covered",
+        "kw_coverage_ratio",
+    ):
+        value = row.get(column)
+        if _clean_float(value) is not None or _clean_int(value) is not None:
+            return True
+    return False
 
 
 def _standardise_flow_weekly(flow: pd.DataFrame | None) -> pd.DataFrame:
@@ -1076,15 +1385,14 @@ def build_competition_pairs(
         if mine.empty or competitors.empty:
             continue
 
-        competitors = competitors.sort_values(
+        sorted_competitors = competitors.sort_values(
             by=["rank_score", "rank_root"], ascending=[False, True]
         )
-        leader = competitors.iloc[0]
-        median = competitors.iloc[len(competitors) // 2]
+        median = sorted_competitors.iloc[len(sorted_competitors) // 2]
 
-        traffic_median = _traffic_median_metrics(competitors)
+        traffic_median = _traffic_median_metrics(sorted_competitors)
 
-        comp_prices = pd.to_numeric(competitors["price_current"], errors="coerce")
+        comp_prices = pd.to_numeric(sorted_competitors["price_current"], errors="coerce")
         comp_price_mean = float(comp_prices.mean()) if comp_prices.notna().any() else None
         comp_price_std = (
             float(comp_prices.std(ddof=0))
@@ -1093,7 +1401,23 @@ def build_competition_pairs(
         )
         median_price = _clean_float(median.get("price_current"))
 
+        leader_cache: dict[str, LeaderSelectionResult] = {}
+        traffic_missing_logged: set[tuple[str | None, str | None, str | None]] = set()
+
         for _, my_row in mine.iterrows():
+            my_asin = my_row.get("asin")
+            leader_result = leader_cache.get(my_asin)
+            if leader_result is None:
+                leader_result = _select_leader_opponent(
+                    my_row,
+                    competitors,
+                    config=LEADER_CONFIG,
+                    channel="page",
+                    log=True,
+                )
+                leader_cache[my_asin] = leader_result
+            leader = leader_result.row
+
             for opp_type, opp_row in (("leader", leader), ("median", median)):
                 page_record, traffic_metrics = _compute_pair_row(
                     my_row,
@@ -1115,6 +1439,19 @@ def build_competition_pairs(
                 )
                 page_records.append(page_record)
                 traffic_records.append(traffic_record)
+
+                if opp_type == "leader":
+                    key = (my_asin, opp_row.get("asin"), my_row.get("week"))
+                    if key not in traffic_missing_logged and not _has_traffic_metrics(opp_row):
+                        LOGGER.info(
+                            "compare.leader_mismatch traffic_missing leader=%s my_asin=%s week=%s scene_tag=%s marketplace=%s",
+                            opp_row.get("asin"),
+                            my_asin,
+                            my_row.get("week"),
+                            my_row.get("scene_tag"),
+                            my_row.get("marketplace_id"),
+                        )
+                        traffic_missing_logged.add(key)
 
     if not page_records:
         return (
@@ -1157,9 +1494,24 @@ def build_competition_pairs_each(
             continue
 
         traffic_median = _traffic_median_metrics(competitors)
+        leader_cache: dict[str, LeaderSelectionResult] = {}
 
         for _, my_row in mine.iterrows():
+            my_asin = my_row.get("asin")
+            leader_result = leader_cache.get(my_asin)
+            if leader_result is None:
+                leader_result = _select_leader_opponent(
+                    my_row,
+                    competitors,
+                    config=LEADER_CONFIG,
+                    channel="page",
+                    log=False,
+                )
+                leader_cache[my_asin] = leader_result
+            leader_asin = leader_result.row.get("asin")
+
             for _, opp_row in competitors.iterrows():
+                opp_type_each = "leader" if opp_row.get("asin") == leader_asin else "asin"
                 page_record, traffic_metrics = _compute_pair_each_row(
                     my_row,
                     opp_row,
@@ -1168,10 +1520,12 @@ def build_competition_pairs_each(
                     traffic_context=traffic_context,
                     traffic_median=traffic_median,
                 )
+                page_record["opp_type"] = opp_type_each
                 traffic_record = _build_traffic_pair_each_record(
                     my_row,
                     opp_row,
                     traffic_metrics,
+                    opp_type=opp_type_each,
                 )
                 page_records.append(page_record)
                 traffic_records.append(traffic_record)
@@ -2458,6 +2812,7 @@ def _pair_each_columns() -> list[str]:
         "sunday",
         "my_asin",
         "opp_asin",
+        "opp_type",
         "opp_parent_asin",
         "my_parent_asin",
         "my_price_net",
@@ -2562,6 +2917,7 @@ def _traffic_pair_each_columns() -> list[str]:
         "sunday",
         "my_asin",
         "opp_asin",
+        "opp_type",
         "my_parent_asin",
         "opp_parent_asin",
         "my_ad_ratio",
@@ -2667,6 +3023,8 @@ def _build_traffic_pair_each_record(
     my_row: Mapping[str, Any],
     opp_row: Mapping[str, Any],
     metrics: Mapping[str, Any],
+    *,
+    opp_type: str,
 ) -> dict[str, Any]:
     record = {
         "scene_tag": my_row.get("scene_tag"),
@@ -2677,6 +3035,7 @@ def _build_traffic_pair_each_record(
         "sunday": my_row.get("sunday"),
         "my_asin": my_row.get("asin"),
         "opp_asin": opp_row.get("asin"),
+        "opp_type": opp_type,
         "my_parent_asin": my_row.get("parent_asin"),
         "opp_parent_asin": opp_row.get("parent_asin"),
         "my_ad_ratio": _clean_float(my_row.get("ad_ratio")),

@@ -110,3 +110,12 @@ rule_sets:
       mix: 0.5
       keyword: 0.5
 
+leader:
+  strategy: rank_leaf_min
+  tie_breakers:
+    - rank_pos_pct: desc
+    - rating: desc
+    - reviews: desc
+    - price_net: asc
+  allow_missing_rank: true
+

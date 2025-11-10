@@ -958,6 +958,7 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                     sunday TEXT,
                     my_asin TEXT,
                     opp_asin TEXT,
+                    opp_type TEXT,
                     opp_parent_asin TEXT,
                     price_gap_each REAL,
                     price_ratio_each REAL,
@@ -1079,12 +1080,12 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
             text(
                 """
                 INSERT INTO bi_amz_comp_pairs_each
-                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_asin, opp_asin, opp_parent_asin,
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday, my_asin, opp_asin, opp_type, opp_parent_asin,
                  price_gap_each, price_ratio_each, rank_pos_delta, content_gap_each, social_gap_each, badge_delta_sum,
                  my_price_net, opp_price_net, my_price_current, opp_price_current,
                  my_rank_pos_pct, opp_rank_pos_pct, my_content_score, opp_content_score,
                  my_social_proof, opp_social_proof, score_price, score_rank, score_cont, score_soc, score_badge)
-                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_asin, :opp_asin, :opp_parent_asin,
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :my_asin, :opp_asin, :opp_type, :opp_parent_asin,
                         :price_gap_each, :price_ratio_each, :rank_pos_delta, :content_gap_each, :social_gap_each, :badge_delta_sum,
                         :my_price_net, :opp_price_net, :my_price_current, :opp_price_current,
                         :my_rank_pos_pct, :opp_rank_pos_pct, :my_content_score, :opp_content_score,
@@ -1101,6 +1102,7 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                 "my_asin": ctx["my_asin"],
                 "opp_asin": "B0OPPASIN",
                 "opp_parent_asin": "PARENT-OPP",
+                "opp_type": "leader",
                 "price_gap_each": 7.0,
                 "price_ratio_each": 1.54,
                 "rank_pos_delta": 0.1,
