@@ -2456,8 +2456,9 @@ class CompetitionLLMOrchestrator:
         opp_value = row.get(opp_key)
         if my_value in (None, "") or opp_value in (None, ""):
             return None
-        if lag_type and not self._is_unfavorable_metric(
-            lag_type, suffix, my_value, opp_value
+        always_include = self._metric_always_included(lag_type, suffix)
+        if lag_type and not always_include and not self._is_unfavorable_metric(
+            lag_type, suffix, my_value, opp_value, row=row
         ):
             return None
         entry: dict[str, Any] = {
@@ -2485,12 +2486,23 @@ class CompetitionLLMOrchestrator:
                 entry["note"] = note
         return entry
 
+    def _metric_always_included(self, lag_type: str | None, metric: str) -> bool:
+        if not lag_type or not metric:
+            return False
+        mapping = getattr(self._config.stage_2, "always_include_metrics", {}) or {}
+        metrics = mapping.get(lag_type.lower())
+        if not metrics:
+            return False
+        return metric.lower() in metrics
+
     def _is_unfavorable_metric(
         self,
         lag_type: str,
         metric: str,
         my_value: Any,
         opp_value: Any,
+        *,
+        row: Mapping[str, Any] | None = None,
     ) -> bool:
         if not self._config.stage_2.require_unfavorable_evidence:
             return True
@@ -2499,11 +2511,21 @@ class CompetitionLLMOrchestrator:
         opp_num = _coerce_float(opp_value)
         if my_num is None or opp_num is None:
             return False
-        if lag_type == "rank" and metric_key in {"rank_leaf", "rank_pos_pct"}:
-            return my_num > opp_num
+        if lag_type == "rank":
+            if metric_key == "rank_leaf":
+                return my_num > opp_num
+            if metric_key == "rank_pos_pct":
+                return my_num < opp_num
         if lag_type == "content" and metric_key in {"image_cnt", "video_cnt", "content_score"}:
             return my_num < opp_num
         if lag_type == "social" and metric_key in {"rating", "reviews", "social_proof"}:
+            priority = 0
+            if row is not None:
+                priority = self._evaluate_social_priority(row)
+                if priority < 0:
+                    return False
+                if priority > 0:
+                    return True
             return my_num < opp_num
         return True
 
@@ -2543,9 +2565,9 @@ class CompetitionLLMOrchestrator:
             return my_num is not None and opp_num is not None and my_num < opp_num
 
         if lag_type == "rank":
-            return _greater(row.get("my_rank_leaf"), row.get("opp_rank_leaf")) or _greater(
-                row.get("my_rank_pos_pct"), row.get("opp_rank_pos_pct")
-            )
+            if _greater(row.get("my_rank_leaf"), row.get("opp_rank_leaf")):
+                return True
+            return _less(row.get("my_rank_pos_pct"), row.get("opp_rank_pos_pct"))
         if lag_type == "content":
             return (
                 _less(row.get("my_image_cnt"), row.get("opp_image_cnt"))
@@ -2553,6 +2575,11 @@ class CompetitionLLMOrchestrator:
                 or _less(row.get("my_content_score"), row.get("opp_content_score"))
             )
         if lag_type == "social":
+            priority = self._evaluate_social_priority(row)
+            if priority < 0:
+                return False
+            if priority > 0:
+                return True
             return (
                 _less(row.get("my_rating"), row.get("opp_rating"))
                 or _less(row.get("my_reviews"), row.get("opp_reviews"))
@@ -2579,6 +2606,46 @@ class CompetitionLLMOrchestrator:
                 return True
             return my_share < opp_share
         return True
+
+    def _evaluate_social_priority(self, row: Mapping[str, Any]) -> int:
+        min_reviews = getattr(self._config.stage_2, "min_reviews_for_rating_priority", 0)
+        try:
+            min_reviews_value = int(min_reviews)
+        except (TypeError, ValueError):
+            min_reviews_value = 0
+        if min_reviews_value < 0:
+            min_reviews_value = 0
+
+        rating_margin = getattr(self._config.stage_2, "rating_margin", 0.0)
+        try:
+            rating_margin_value = float(rating_margin)
+        except (TypeError, ValueError):
+            rating_margin_value = 0.0
+        if rating_margin_value < 0:
+            rating_margin_value = 0.0
+
+        my_rating = _coerce_float(row.get("my_rating"))
+        opp_rating = _coerce_float(row.get("opp_rating"))
+        if my_rating is None or opp_rating is None:
+            return 0
+        rating_diff = my_rating - opp_rating
+
+        my_reviews = _coerce_float(row.get("my_reviews"))
+        opp_reviews = _coerce_float(row.get("opp_reviews"))
+
+        if (
+            my_reviews is not None
+            and my_reviews >= min_reviews_value
+            and rating_diff >= rating_margin_value
+        ):
+            return -1
+        if (
+            opp_reviews is not None
+            and opp_reviews >= min_reviews_value
+            and (-rating_diff) >= rating_margin_value
+        ):
+            return 1
+        return 0
 
     def _is_unfavorable_keyword_pair(
         self, my_rank: Any, opp_rank: Any, my_share: Any, opp_share: Any
@@ -3703,7 +3770,7 @@ def _format_rank_pct_note(my_value: Any, opp_value: Any, row: Mapping[str, Any])
     if my_num is not None and opp_num is not None:
         gap = my_num - opp_num
         if abs(gap) >= 0.005:
-            direction = "落后" if gap > 0 else "领先"
+            direction = "落后" if gap < 0 else "领先"
             gap_text = f"（{direction} {abs(gap) * 100:.2f}%）"
     return f"排名百分位：我方 {my_text} / 对手({label}) {opp_text}{gap_text}"
 
