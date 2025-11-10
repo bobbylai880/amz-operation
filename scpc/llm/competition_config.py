@@ -14,12 +14,14 @@ class StageOneConfig:
     conf_min: float
     band_weight: float
     opp_weight: float
+    severity_thresholds: Mapping[str, float]
     max_retries: int = 2
 
 
 @dataclass(slots=True)
 class StageTwoConfig:
     enabled: bool
+    aggregate_per_asin: bool
     max_retries: int
     allowed_action_codes: Sequence[str]
     allowed_root_cause_codes: Sequence[str]
@@ -63,11 +65,20 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
     stage2_raw = raw.get("stage_2", {})
     llm_raw = raw.get("llm", {})
 
+    stage1_severity_raw = stage1_raw.get("severity_thresholds") or {}
+    if not isinstance(stage1_severity_raw, Mapping):
+        raise ValueError("stage_1.severity_thresholds must be a mapping when provided")
+    severity_thresholds = {
+        "high": float(stage1_severity_raw.get("high", 2.0)),
+        "mid": float(stage1_severity_raw.get("mid", 1.0)),
+    }
+
     stage1 = StageOneConfig(
         thresholds=stage1_raw.get("thresholds", {}),
         conf_min=float(stage1_raw.get("conf_min", 0.6)),
         band_weight=float(stage1_raw.get("band_weight", 0.5)),
         opp_weight=float(stage1_raw.get("opp_weight", 0.5)),
+        severity_thresholds=severity_thresholds,
         max_retries=int(stage1_raw.get("max_retries", 2)),
     )
 
@@ -83,6 +94,7 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
 
     stage2 = StageTwoConfig(
         enabled=bool(stage2_raw.get("enabled", True)),
+        aggregate_per_asin=bool(stage2_raw.get("aggregate_per_asin", True)),
         max_retries=int(stage2_raw.get("max_retries", 2)),
         allowed_action_codes=tuple(stage2_raw.get("allowed_action_codes", [])),
         allowed_root_cause_codes=tuple(stage2_raw.get("allowed_root_cause_codes", [])),
