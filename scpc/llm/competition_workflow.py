@@ -1978,7 +1978,11 @@ class CompetitionLLMOrchestrator:
                 self._normalise_evidence_sequence(raw_evidence)
             )
 
-            if not normalised:
+            filtered_evidence = self._filter_normalised_evidence(
+                lag_type, normalised, lag_data
+            )
+
+            if not filtered_evidence:
                 if self._config.stage_2.require_unfavorable_evidence:
                     LOGGER.debug(
                         "competition_llm.stage2_drop_root_cause_no_evidence code=%s lag_type=%s",
@@ -1993,7 +1997,7 @@ class CompetitionLLMOrchestrator:
                 )
 
             limit = 4 if lag_type == "rank" else 3
-            evidence_slice = normalised[:limit]
+            evidence_slice = filtered_evidence[:limit]
             if not evidence_slice and self._config.stage_2.require_unfavorable_evidence:
                 LOGGER.debug(
                     "competition_llm.stage2_drop_root_cause_empty_slice code=%s lag_type=%s",
@@ -2506,17 +2510,21 @@ class CompetitionLLMOrchestrator:
     ) -> bool:
         if not self._config.stage_2.require_unfavorable_evidence:
             return True
-        metric_key = metric.lower()
+        metric_key = str(metric or "").lower()
         my_num = _coerce_float(my_value)
         opp_num = _coerce_float(opp_value)
-        if my_num is None or opp_num is None:
-            return False
         if lag_type == "rank":
             if metric_key == "rank_leaf":
+                if my_num is None or opp_num is None:
+                    return False
                 return my_num > opp_num
             if metric_key == "rank_pos_pct":
+                if my_num is None or opp_num is None:
+                    return False
                 return my_num < opp_num
         if lag_type == "content" and metric_key in {"image_cnt", "video_cnt", "content_score"}:
+            if my_num is None or opp_num is None:
+                return False
             return my_num < opp_num
         if lag_type == "social" and metric_key in {"rating", "reviews", "social_proof"}:
             priority = 0
@@ -2526,7 +2534,11 @@ class CompetitionLLMOrchestrator:
                     return False
                 if priority > 0:
                     return True
+            if my_num is None or opp_num is None:
+                return False
             return my_num < opp_num
+        if my_num is None or opp_num is None:
+            return True
         return True
 
     def _filter_unfavorable_rows(
@@ -2735,6 +2747,67 @@ class CompetitionLLMOrchestrator:
             seen.add(key)
             result.append(entry)
         return result
+
+    def _filter_normalised_evidence(
+        self,
+        lag_type: str | None,
+        entries: Sequence[Mapping[str, Any]],
+        lag_data: Mapping[str, Any] | None,
+    ) -> list[Mapping[str, Any]]:
+        if not entries:
+            return []
+        if not lag_type:
+            return list(entries)
+
+        lag_type_lower = str(lag_type).lower()
+        row_lookup: Mapping[str, Mapping[str, Any]] = {}
+        if isinstance(lag_data, Mapping):
+            row_lookup = self._build_lag_row_lookup(lag_data.get("top_opps"))
+
+        filtered: list[Mapping[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            metric = entry.get("metric")
+            if not metric:
+                continue
+            source = str(entry.get("source") or "").lower()
+            against = str(entry.get("against") or "").lower()
+            if lag_type_lower in {"rank", "social"}:
+                if source == "page.overview":
+                    continue
+                if against != "asin":
+                    continue
+            row_context: Mapping[str, Any] | None = None
+            if against == "asin":
+                opp_asin = entry.get("opp_asin")
+                if opp_asin is not None:
+                    row_context = row_lookup.get(str(opp_asin))
+            if not self._is_unfavorable_metric(
+                lag_type_lower,
+                metric,
+                entry.get("my_value"),
+                entry.get("opp_value"),
+                row=row_context,
+            ):
+                continue
+            filtered.append(entry)
+        return filtered
+
+    def _build_lag_row_lookup(
+        self, rows: Any
+    ) -> Mapping[str, Mapping[str, Any]]:
+        if not isinstance(rows, Sequence):
+            return {}
+        lookup: dict[str, Mapping[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            opp_asin = row.get("opp_asin")
+            if opp_asin in (None, ""):
+                continue
+            lookup[str(opp_asin)] = row
+        return lookup
 
     def _format_evidence_value(self, value: Any) -> Any:
         numeric = _coerce_float(value)
