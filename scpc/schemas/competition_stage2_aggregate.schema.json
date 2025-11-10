@@ -5,10 +5,10 @@
   "required": ["context", "lag_type", "root_causes", "actions"],
   "properties": {
     "context": { "type": "object" },
-    "lag_type": { "type": "string", "enum": ["mixed"] },
+    "lag_type": { "type": "string", "enum": ["mixed", "none"] },
     "root_causes": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {
         "type": "object",
         "required": ["root_cause_code", "summary", "evidence", "priority"],
@@ -46,6 +46,7 @@
                 "unit": { "type": ["string", "null"] },
                 "source": { "type": ["string", "null"] },
                 "opp_asin": { "type": ["string", "null"] },
+                "opp_brand": { "type": ["string", "null"] },
                 "note": { "type": ["string", "null"] }
               },
               "additionalProperties": false

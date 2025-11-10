@@ -28,6 +28,8 @@ class StageTwoConfig:
     allowed_action_codes: Sequence[str]
     allowed_root_cause_codes: Sequence[str]
     trigger_status: Sequence[str]
+    require_unfavorable_evidence: bool
+    keyword_max_pairs_per_opp: int
 
 
 @dataclass(slots=True)
@@ -100,6 +102,17 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
     if not trigger_status:
         trigger_status = ("lag",)
 
+    keyword_section = stage2_raw.get("keyword")
+    if not isinstance(keyword_section, Mapping):
+        keyword_section = {}
+    keyword_limit_raw = keyword_section.get("max_pairs_per_opp", 2)
+    try:
+        keyword_limit = int(keyword_limit_raw)
+    except (TypeError, ValueError):
+        keyword_limit = 2
+    if keyword_limit < 1:
+        keyword_limit = 2
+
     stage2 = StageTwoConfig(
         enabled=bool(stage2_raw.get("enabled", True)),
         aggregate_per_asin=bool(stage2_raw.get("aggregate_per_asin", True)),
@@ -107,6 +120,8 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         allowed_action_codes=tuple(stage2_raw.get("allowed_action_codes", [])),
         allowed_root_cause_codes=tuple(stage2_raw.get("allowed_root_cause_codes", [])),
         trigger_status=trigger_status,
+        require_unfavorable_evidence=bool(stage2_raw.get("require_unfavorable_evidence", True)),
+        keyword_max_pairs_per_opp=keyword_limit,
     )
 
     if not llm_raw.get("model"):
