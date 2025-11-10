@@ -103,11 +103,6 @@ _STAGE2_GROUP_FIELDS = (
 _PAGE_LAG_TYPES = {"price", "rank", "content", "social", "badge", "confidence"}
 _TRAFFIC_LAG_TYPES = {"traffic_mix", "keyword"}
 
-_LAG_TYPE_FILENAME_ALIASES = {
-    "price": "pricing",
-    "traffic_mix": "traffic",
-}
-
 _RULES_CONFIG_DEFAULT_PATH = Path("configs/competition_lag_rules.yaml")
 _RULES_CONFIG_SCHEMA_NAME = "competition_lag_rules.schema.json"
 _DEFAULT_RULES_CONFIG = {
@@ -441,22 +436,9 @@ class CompetitionLLMOrchestrator:
         stage1_outputs: Sequence[StageOneResult] = ()
         if run_stage1:
             stage1_inputs = self._collect_stage1_inputs(target_week, marketplace_id)
-            stage1_rule_results = list(self._execute_stage1_code(stage1_inputs))
-            stage1_inputs_list = list(stage1_inputs)
-            stage1_materialised: list[StageOneResult] = []
-            for idx, rule_result in enumerate(stage1_rule_results):
-                overview_rows: Sequence[Mapping[str, Any]] = ()
-                traffic_rows: Sequence[Mapping[str, Any]] = ()
-                if idx < len(stage1_inputs_list):
-                    _, overview_rows, traffic_rows = stage1_inputs_list[idx]
-                stage1_materialised.append(
-                    self._apply_stage1_llm(rule_result, overview_rows, traffic_rows)
-                )
-            stage1_outputs = tuple(stage1_materialised)
+            stage1_outputs = self._execute_stage1_code(stage1_inputs)
             for item in stage1_outputs:
                 storage_paths.append(self._write_stage1_output(item))
-                if isinstance(item, StageOneLLMResult) and item.prompt_path:
-                    storage_paths.append(item.prompt_path)
         else:
             LOGGER.info("competition_llm.stage1_skipped")
 
@@ -976,7 +958,7 @@ class CompetitionLLMOrchestrator:
             )
             context = facts.get("context") or {}
             week_label = str(context.get("week") or "unknown")
-            base_name = self._build_stage2_storage_name(context, group.items)
+            base_name = self._build_stage2_storage_name(context)
             prompt_path = self._write_prompt_snapshot(
                 stage="stage2",
                 week=week_label,
@@ -994,7 +976,9 @@ class CompetitionLLMOrchestrator:
             human_markdown = llm_response.get("human_markdown")
             if not isinstance(machine_json, Mapping):
                 raise ValueError("Stage-2 machine_json missing or invalid")
-            machine_json = _ensure_stage2_context(machine_json, facts.get("context"))
+            if not isinstance(machine_json.get("context"), Mapping):
+                machine_json = dict(machine_json)
+                machine_json["context"] = facts.get("context", {})
             self._validate_stage2_machine_json(machine_json)
             if not isinstance(human_markdown, str):
                 raise ValueError("Stage-2 human_markdown must be a string")
@@ -1010,29 +994,8 @@ class CompetitionLLMOrchestrator:
             )
         return tuple(outputs)
 
-    def _build_stage1_storage_name(self, context: Mapping[str, Any]) -> str:
+    def _build_stage2_storage_name(self, context: Mapping[str, Any]) -> str:
         asin = str(context.get("my_asin") or "unknown")
-        opp_type = str(context.get("opp_type") or "na")
-        return f"{asin}_{opp_type}"
-
-    def _build_stage2_storage_name(
-        self,
-        context: Mapping[str, Any],
-        items: Sequence[StageTwoCandidate] | None = None,
-    ) -> str:
-        asin = str(context.get("my_asin") or "unknown")
-        if items:
-            first = items[0]
-            raw_lag_type = str(first.dimension.get("lag_type") or "").strip().lower()
-            lag_type = raw_lag_type or _normalize_lag_type(first.dimension.get("lag_type")) or "all"
-            lag_type = _LAG_TYPE_FILENAME_ALIASES.get(lag_type, lag_type)
-            opp_type = str(
-                first.context.get("opp_type")
-                or first.dimension.get("source_opp_type")
-                or "na"
-            ).lower()
-            if len(items) == 1:
-                return f"{asin}_{lag_type}_{opp_type}"
         return f"{asin}_ALL"
 
     def _build_stage2_aggregate_facts(self, group: StageTwoAggregateInput) -> Mapping[str, Any]:
