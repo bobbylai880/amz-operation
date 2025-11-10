@@ -4,6 +4,7 @@ from datetime import date
 import pytest
 
 from scpc.etl.scene_pipeline import main, parse_args
+from scpc.reports.builder import build_scene_markdown
 
 pd = pytest.importorskip("pandas")
 sqlalchemy = pytest.importorskip("sqlalchemy")
@@ -64,6 +65,8 @@ def test_main_writes_summary_to_db(tmp_path, monkeypatch):
         "insufficient_data": False,
         "analysis_summary": "场景短期平稳，关注库存周转。",
     }
+    expected_markdown = build_scene_markdown(summary)
+    expected_json = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
     monkeypatch.setattr("scpc.etl.scene_pipeline.summarize_scene", lambda **kwargs: summary)
     monkeypatch.setattr("scpc.etl.scene_pipeline._resolve_llm_metadata", lambda: ("deepseek-pro", "v1.0"))
 
@@ -91,6 +94,8 @@ def test_main_writes_summary_to_db(tmp_path, monkeypatch):
     assert captured["marketplace_id"] == "US"
     assert captured["week"] == "2024W12"
     assert captured["summary_str"] == "场景短期平稳，关注库存周转。"
+    assert captured["summary_md"] == expected_markdown
+    assert captured["summary_json"] == expected_json
     assert captured["llm_model"] == "deepseek-pro"
     assert captured["llm_version"] == "v1.0"
     assert captured["confidence"] == 0.81
