@@ -12,6 +12,7 @@ stage_1:
   band_weight: 0.4
   opp_weight: 0.6
   max_retries: 3
+  rules_config_path: "configs/competition_lag_rules.yaml"
 stage_2:
   enabled: true
   trigger_status:

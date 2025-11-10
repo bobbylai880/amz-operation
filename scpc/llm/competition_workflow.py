@@ -5,12 +5,14 @@ import json
 import logging
 import re
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Sequence
 
+import yaml
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -41,11 +43,6 @@ FROM vw_amz_comp_llm_overview
 {marketplace_filter}
 ORDER BY sunday DESC
 LIMIT 1
-"""
-
-_STAGE1_RULE_SQL = """
-SELECT rule_name, lag_type, metric, opp_type, cmp, threshold, weight, is_active
-FROM bi_amz_comp_lag_rule
 """
 
 _STAGE1_KEY_FIELDS = (
@@ -84,6 +81,166 @@ _STAGE2_GROUP_FIELDS = (
 
 _PAGE_LAG_TYPES = {"price", "rank", "content", "social", "badge", "confidence"}
 _TRAFFIC_LAG_TYPES = {"traffic_mix", "keyword"}
+
+_RULES_CONFIG_DEFAULT_PATH = Path("configs/competition_lag_rules.yaml")
+_RULES_CONFIG_SCHEMA_NAME = "competition_lag_rules.schema.json"
+_DEFAULT_RULES_CONFIG = {
+    "version": 1,
+    "defaults": {"comparator": ">", "opp_type": "any", "weight": 1.0},
+    "profiles": [
+        {
+            "name": "default",
+            "description": "通用规则，适配大多数类目/场景",
+            "is_active": True,
+            "rules": [
+                {
+                    "lag_type": "price",
+                    "metric": "price_gap_leader",
+                    "opp_type": "leader",
+                    "cmp": ">",
+                    "threshold": 0.0,
+                    "weight": 1.0,
+                    "comment": "与 leader 的净价差（我-对手）> 0 表示更贵",
+                },
+                {
+                    "lag_type": "price",
+                    "metric": "price_index_med",
+                    "opp_type": "median",
+                    "cmp": ">",
+                    "threshold": 1.05,
+                    "weight": 1.0,
+                    "comment": "价格指数 > 1.05 表示价格偏高",
+                },
+                {
+                    "lag_type": "price",
+                    "metric": "price_z",
+                    "opp_type": "any",
+                    "cmp": ">",
+                    "threshold": 0.5,
+                    "weight": 0.5,
+                    "comment": "价格Z分偏高，辅助判定",
+                },
+                {
+                    "lag_type": "rank",
+                    "metric": "rank_pos_pct",
+                    "opp_type": "any",
+                    "cmp": ">",
+                    "threshold": 0.60,
+                    "weight": 1.0,
+                    "comment": "排名百分位 > 0.60 视为排名弱",
+                },
+                {
+                    "lag_type": "content",
+                    "metric": "content_gap",
+                    "opp_type": "leader",
+                    "cmp": "<",
+                    "threshold": -0.15,
+                    "weight": 1.0,
+                    "comment": "内容差 <-0.15 视为内容落后",
+                },
+                {
+                    "lag_type": "social",
+                    "metric": "social_gap",
+                    "opp_type": "leader",
+                    "cmp": "<",
+                    "threshold": -0.10,
+                    "weight": 1.0,
+                    "comment": "社交口碑弱",
+                },
+                {
+                    "lag_type": "badge",
+                    "metric": "badge_delta_sum",
+                    "opp_type": "any",
+                    "cmp": "<",
+                    "threshold": 0,
+                    "weight": 1.0,
+                    "comment": "权益徽章缺失",
+                },
+                {
+                    "lag_type": "confidence",
+                    "metric": "confidence",
+                    "opp_type": "any",
+                    "cmp": "<",
+                    "threshold": 0.60,
+                    "weight": 1.0,
+                    "comment": "数据置信度低需要补齐证据",
+                },
+                {
+                    "lag_type": "traffic_mix",
+                    "metric": "ad_ratio_index_med",
+                    "opp_type": "median",
+                    "cmp": "<",
+                    "threshold": 0.80,
+                    "weight": 1.0,
+                    "comment": "广告占比指数（我/中位）偏低",
+                },
+                {
+                    "lag_type": "traffic_mix",
+                    "metric": "ad_to_natural_gap",
+                    "opp_type": "any",
+                    "cmp": "<",
+                    "threshold": -0.20,
+                    "weight": 1.0,
+                    "comment": "付费:自然差距偏低 → 结构弱于竞对",
+                },
+                {
+                    "lag_type": "traffic_mix",
+                    "metric": "sp_share_in_ad_gap",
+                    "opp_type": "any",
+                    "cmp": "<",
+                    "threshold": -0.10,
+                    "weight": 1.0,
+                    "comment": "SP 在广告内部占比不足",
+                },
+                {
+                    "lag_type": "keyword",
+                    "metric": "kw_top3_share_gap",
+                    "opp_type": "any",
+                    "cmp": "<",
+                    "threshold": -0.10,
+                    "weight": 1.0,
+                    "comment": "Top3 关键词份额差不足",
+                },
+                {
+                    "lag_type": "keyword",
+                    "metric": "kw_brand_share_gap",
+                    "opp_type": "any",
+                    "cmp": "<",
+                    "threshold": -0.05,
+                    "weight": 1.0,
+                    "comment": "品牌词份额偏低",
+                },
+                {
+                    "lag_type": "keyword",
+                    "metric": "kw_competitor_share_gap",
+                    "opp_type": "any",
+                    "cmp": ">",
+                    "threshold": 0.05,
+                    "weight": 1.0,
+                    "comment": "竞品词过高，可能吸错流量",
+                },
+            ],
+        }
+    ],
+    "overrides": [
+        {
+            "name": "US-浴室袋-价格更敏感",
+            "is_active": True,
+            "when": {"marketplace_id": "US", "scene_tag": "浴室袋"},
+            "rules": [
+                {
+                    "lag_type": "price",
+                    "metric": "price_index_med",
+                    "opp_type": "median",
+                    "cmp": ">",
+                    "threshold": 1.03,
+                    "weight": 1.0,
+                    "comment": "US/浴室袋价格敏感，阈值收紧",
+                }
+            ],
+        }
+    ],
+}
 
 _COMPARATOR_ALIASES = {
     "gt": ">",
@@ -194,10 +351,12 @@ class CompetitionLLMOrchestrator:
         self._storage_root = Path(storage_root or "storage/competition_llm")
         self._stage2_schema = load_schema("competition_stage2_aggregate.schema.json")
         self._stage2_prompt = load_prompt("competition_stage2_aggregate.md")
+        self._current_marketplace_id: str | None = None
 
     def run(self, week: str | None, *, marketplace_id: str | None = None) -> CompetitionRunResult:
         """Execute Stage-1 and Stage-2 for the provided week."""
 
+        self._current_marketplace_id = marketplace_id
         target_week = self._resolve_week(week, marketplace_id)
         LOGGER.info(
             "competition_llm.start week=%s marketplace_id=%s",
@@ -238,6 +397,7 @@ class CompetitionLLMOrchestrator:
             len(stage2_candidates),
             len(stage2_outputs),
         )
+        self._current_marketplace_id = None
         return CompetitionRunResult(
             week=target_week,
             stage1_processed=len(stage1_outputs),
@@ -284,11 +444,11 @@ class CompetitionLLMOrchestrator:
         self,
         inputs: Sequence[tuple[Mapping[str, Any], Sequence[Mapping[str, Any]], Sequence[Mapping[str, Any]]]],
     ) -> Sequence[StageOneResult]:
-        rules = self._load_active_rules()
-        if not rules:
-            LOGGER.warning("competition_llm.stage1_no_rules active=0")
+        rules_config = self._load_rules_config()
         results: list[StageOneResult] = []
+        has_applicable_rules = False
         for context, overview_rows, traffic_rows in inputs:
+            rules = self._load_active_rules(context, config_data=rules_config)
             opp_type = str(context.get("opp_type") or "").lower()
             applicable_rules = [rule for rule in rules if rule.opp_type in ("any", opp_type)]
             if not applicable_rules:
@@ -296,6 +456,7 @@ class CompetitionLLMOrchestrator:
                 summary = "未检测到落后维度"
                 results.append(StageOneResult(context=context, summary=summary, dimensions=()))
                 continue
+            has_applicable_rules = True
 
             lag_scores: defaultdict[str, float] = defaultdict(float)
             triggered_rules: defaultdict[str, list[str]] = defaultdict(list)
@@ -373,6 +534,8 @@ class CompetitionLLMOrchestrator:
                     dimensions=tuple(dimensions),
                 )
             )
+        if not has_applicable_rules:
+            LOGGER.warning("competition_llm.stage1_no_rules active=0")
         return tuple(results)
 
     def _write_stage1_output(self, result: StageOneResult) -> Path:
@@ -722,39 +885,155 @@ class CompetitionLLMOrchestrator:
             params["marketplace_id"] = marketplace_id
         return self._fetch_all(sql, params)
 
-    def _load_active_rules(self) -> Sequence[LagRule]:
-        rows = self._fetch_all(_STAGE1_RULE_SQL, {})
-        rules: list[LagRule] = []
-        for row in rows:
-            if not row.get("is_active"):
-                continue
-            lag_type = _normalize_lag_type(row.get("lag_type"))
-            metric = str(row.get("metric") or "").strip()
+    def _load_rules_config(self) -> Mapping[str, Any]:
+        path_value = self._config.stage_1.rules_config_path or str(_RULES_CONFIG_DEFAULT_PATH)
+        path = Path(path_value)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+
+        data: Mapping[str, Any] | None = None
+        try:
+            text_data = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            LOGGER.warning("competition_llm.rules_config_missing path=%s", path)
+        except OSError as exc:  # pragma: no cover - unexpected I/O errors
+            LOGGER.warning("competition_llm.rules_config_read_error path=%s error=%s", path, exc)
+        else:
+            try:
+                loaded = yaml.safe_load(text_data)
+            except Exception as exc:  # pragma: no cover - YAML parser edge cases
+                LOGGER.warning("competition_llm.rules_config_parse_error path=%s error=%s", path, exc)
+            else:
+                if isinstance(loaded, Mapping):
+                    data = loaded
+                elif loaded is not None:
+                    LOGGER.warning(
+                        "competition_llm.rules_config_invalid_type path=%s type=%s",
+                        path,
+                        type(loaded).__name__,
+                    )
+
+        if data is None:
+            LOGGER.warning("competition_llm.rules_config_fallback_default path=%s", path)
+            data = deepcopy(_DEFAULT_RULES_CONFIG)
+        else:
+            data = deepcopy(data)
+
+        try:
+            schema = load_schema(_RULES_CONFIG_SCHEMA_NAME)
+            validate_schema(schema, data)
+        except Exception as exc:  # pragma: no cover - schema warning path
+            LOGGER.warning("competition_llm.rules_config_schema_warn path=%s error=%s", path, exc)
+
+        return data
+
+    def _load_active_rules(
+        self, context: Mapping[str, Any], *, config_data: Mapping[str, Any]
+    ) -> Sequence[LagRule]:
+        defaults_raw = config_data.get("defaults")
+        defaults = defaults_raw if isinstance(defaults_raw, Mapping) else {}
+        rules_by_key: dict[tuple[str, str, str, str], LagRule] = {}
+
+        def _emit(rule: Mapping[str, Any], *, opp_type_default: str = "any") -> None:
+            if not isinstance(rule, Mapping):
+                return
+            if rule.get("is_active") is False:
+                return
+            lag_type = _normalize_lag_type(rule.get("lag_type"))
+            metric = str(rule.get("metric") or "").strip()
             if not lag_type or not metric:
-                continue
-            comparator_raw = str(row.get("cmp") or row.get("comparator") or "").strip()
-            comparator = _COMPARATOR_ALIASES.get(comparator_raw.lower(), comparator_raw)
+                return
+            comparator_raw = rule.get("cmp") or rule.get("comparator") or defaults.get("comparator")
+            comparator_alias = str(comparator_raw or "").strip().lower()
+            comparator = _COMPARATOR_ALIASES.get(comparator_alias, comparator_raw)
+            comparator = str(comparator or "").strip()
             if comparator not in _COMPARATOR_FUNCS:
-                LOGGER.warning("competition_llm.stage1_skip_rule comparator=%s rule=%s", comparator_raw, row)
-                continue
-            threshold = _coerce_float(row.get("threshold"))
+                LOGGER.debug("competition_llm.stage1_skip_rule comparator=%s rule=%s", comparator_raw, rule)
+                return
+            threshold = _coerce_float(rule.get("threshold"))
             if threshold is None:
-                LOGGER.warning("competition_llm.stage1_skip_rule threshold rule=%s", row)
-                continue
-            weight = _coerce_float(row.get("weight")) or 1.0
-            opp_type = str(row.get("opp_type") or "any").lower()
-            rules.append(
-                LagRule(
-                    rule_name=str(row.get("rule_name") or f"{metric}_{comparator}"),
-                    lag_type=lag_type,
-                    metric=metric,
-                    opp_type=opp_type,
-                    comparator=comparator,
-                    threshold=float(threshold),
-                    weight=float(weight),
-                )
+                LOGGER.debug("competition_llm.stage1_skip_rule threshold_missing rule=%s", rule)
+                return
+            weight = _coerce_float(rule.get("weight"))
+            if weight is None:
+                weight = _coerce_float(defaults.get("weight"))
+            if weight is None:
+                weight = 1.0
+            opp_type_raw = rule.get("opp_type") or defaults.get("opp_type") or opp_type_default or "any"
+            opp_type = str(opp_type_raw or "any").strip().lower()
+            rule_name = str(rule.get("rule_name") or f"{metric}_{comparator}")
+            rules_by_key[(lag_type, metric, opp_type, comparator)] = LagRule(
+                rule_name=rule_name,
+                lag_type=lag_type,
+                metric=metric,
+                opp_type=opp_type,
+                comparator=comparator,
+                threshold=float(threshold),
+                weight=float(weight),
             )
-        return tuple(rules)
+
+        profiles = config_data.get("profiles") or ()
+        for profile in profiles:
+            if not isinstance(profile, Mapping):
+                continue
+            if not profile.get("is_active"):
+                continue
+            for rule in profile.get("rules") or ():
+                if isinstance(rule, Mapping):
+                    _emit(rule)
+
+        ctx_source = context or {}
+
+        def _norm(value: Any) -> str:
+            return str(value or "").strip().lower()
+
+        ctx = {
+            "marketplace_id": _norm(ctx_source.get("marketplace_id") or self._current_marketplace_id),
+            "scene_tag": _norm(ctx_source.get("scene_tag")),
+            "base_scene": _norm(ctx_source.get("base_scene")),
+            "morphology": _norm(ctx_source.get("morphology")),
+            "opp_type": _norm(ctx_source.get("opp_type")),
+        }
+
+        def _match(conditions: Mapping[str, Any]) -> bool:
+            for key, expected in conditions.items():
+                if key not in ctx:
+                    continue
+                if _norm(expected) != ctx[key]:
+                    return False
+            return True
+
+        overrides = config_data.get("overrides") or ()
+        for override in overrides:
+            if not isinstance(override, Mapping):
+                continue
+            if not override.get("is_active"):
+                continue
+            when = override.get("when")
+            if not isinstance(when, Mapping):
+                when = {}
+            if when and not _match(when):
+                continue
+            opp_default = _norm(when.get("opp_type")) if when else ""
+            if not opp_default:
+                opp_default = "any"
+            for rule in override.get("rules") or ():
+                if isinstance(rule, Mapping):
+                    if rule.get("is_active") is False:
+                        lag_type = _normalize_lag_type(rule.get("lag_type"))
+                        metric = str(rule.get("metric") or "").strip()
+                        comparator_raw = rule.get("cmp") or rule.get("comparator") or defaults.get("comparator")
+                        comparator_alias = str(comparator_raw or "").strip().lower()
+                        comparator = _COMPARATOR_ALIASES.get(comparator_alias, comparator_raw)
+                        comparator = str(comparator or "").strip()
+                        opp_type_raw = rule.get("opp_type") or defaults.get("opp_type") or opp_default or "any"
+                        opp_type = str(opp_type_raw or "any").strip().lower()
+                        if lag_type and metric and comparator:
+                            rules_by_key.pop((lag_type, metric, opp_type, comparator), None)
+                        continue
+                    _emit(rule, opp_type_default=opp_default)
+
+        return tuple(rules_by_key.values())
 
     def _map_severity(self, score: float) -> str:
         thresholds = self._config.stage_1.severity_thresholds or {}
