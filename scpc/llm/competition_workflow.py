@@ -152,8 +152,6 @@ _ENTITY_DETAIL_FIELDS: tuple[str, ...] = (
 )
 
 _KEYWORD_LOOKBACK_DAYS = 7
-_KEYWORD_PER_PAIR_LIMIT = 2
-
 _RULES_CONFIG_DEFAULT_PATH = Path("configs/competition_lag_rules.yaml")
 _RULES_CONFIG_SCHEMA_NAME = "competition_lag_rules.schema.json"
 _DEFAULT_RULES_CONFIG = {
@@ -1445,10 +1443,41 @@ class CompetitionLLMOrchestrator:
     ) -> str:
         root_causes = machine_json.get("root_causes")
         if not isinstance(root_causes, Sequence) or not root_causes:
-            return "# 差异点与对比对象\n\n- 暂无证据\n"
+            return "# 差异点与对比对象\n\n- 本周未发现对我不利的客观差异\n"
 
         row_index = self._build_evidence_row_index(facts or {})
         lines: list[str] = ["# 差异点与对比对象", ""]
+
+        lines.append("## 落后维度概览")
+        overview_lines: list[str] = []
+        for cause in root_causes:
+            if not isinstance(cause, Mapping):
+                continue
+            title = str(
+                cause.get("summary")
+                or cause.get("root_cause_code")
+                or cause.get("lag_dimension")
+                or "差异"
+            ).strip()
+            if title:
+                overview_lines.append(f"- {title}")
+        if overview_lines:
+            lines.extend(overview_lines)
+        else:
+            lines.append("- 暂无维度")
+        lines.append("")
+
+        lines.append("## Top 对手差距")
+        top_rows = self._collect_top_opponents(facts or {}, limit=3)
+        if top_rows:
+            for row in top_rows:
+                lines.append(f"- {_format_opp_label(row)}")
+        else:
+            lines.append("- 暂无对手差距")
+        lines.append("")
+
+        lines.append("## 客观证据明细")
+        lines.append("")
 
         for cause in root_causes:
             if not isinstance(cause, Mapping):
@@ -1458,8 +1487,8 @@ class CompetitionLLMOrchestrator:
                 or cause.get("root_cause_code")
                 or cause.get("lag_dimension")
                 or "差异"
-            )
-            lines.append(f"## {title}")
+            ).strip() or "差异"
+            lines.append(f"### {title}")
             evidence_items = cause.get("evidence")
             formatted: list[str] = []
             if isinstance(evidence_items, Sequence):
@@ -1501,6 +1530,34 @@ class CompetitionLLMOrchestrator:
                     continue
                 index.setdefault(opp_asin, row)
         return index
+
+    def _collect_top_opponents(
+        self, facts: Mapping[str, Any], *, limit: int = 3
+    ) -> list[Mapping[str, Any]]:
+        if not isinstance(facts, Mapping):
+            return []
+        lag_items = facts.get("lag_items")
+        if not isinstance(lag_items, Sequence):
+            return []
+        results: list[Mapping[str, Any]] = []
+        seen: set[str] = set()
+        for item in lag_items:
+            if not isinstance(item, Mapping):
+                continue
+            top_opps = item.get("top_opps")
+            if not isinstance(top_opps, Sequence):
+                continue
+            for row in top_opps:
+                if not isinstance(row, Mapping):
+                    continue
+                opp_asin = str(row.get("opp_asin") or "").strip()
+                if not opp_asin or opp_asin in seen:
+                    continue
+                seen.add(opp_asin)
+                results.append(row)
+                if len(results) >= limit:
+                    return results
+        return results
 
     def _format_evidence_markdown_line(
         self,
@@ -1922,6 +1979,13 @@ class CompetitionLLMOrchestrator:
             )
 
             if not normalised:
+                if self._config.stage_2.require_unfavorable_evidence:
+                    LOGGER.debug(
+                        "competition_llm.stage2_drop_root_cause_no_evidence code=%s lag_type=%s",
+                        entry.get("root_cause_code"),
+                        lag_type,
+                    )
+                    continue
                 LOGGER.warning(
                     "competition_llm.stage2_evidence_missing code=%s hints=%s",
                     entry.get("root_cause_code"),
@@ -1929,11 +1993,24 @@ class CompetitionLLMOrchestrator:
                 )
 
             limit = 4 if lag_type == "rank" else 3
-            entry["evidence"] = normalised[:limit]
+            evidence_slice = normalised[:limit]
+            if not evidence_slice and self._config.stage_2.require_unfavorable_evidence:
+                LOGGER.debug(
+                    "competition_llm.stage2_drop_root_cause_empty_slice code=%s lag_type=%s",
+                    entry.get("root_cause_code"),
+                    lag_type,
+                )
+                continue
+            entry["evidence"] = evidence_slice
             entry.pop("evidence_refs", None)
             cleaned_causes.append(entry)
 
         data["root_causes"] = cleaned_causes
+        if not cleaned_causes:
+            data["root_causes"] = []
+            data["lag_type"] = "none"
+        else:
+            data["lag_type"] = "mixed"
         return data
 
     def _build_evidence_from_hint(
@@ -2183,7 +2260,7 @@ class CompetitionLLMOrchestrator:
         else:
             entries = []
         if not entries:
-            entries = self._build_default_pairwise_entries(row, source)
+            entries = self._build_default_pairwise_entries(row, source, lag_type)
         return entries
 
     def _build_rank_entries(
@@ -2195,6 +2272,7 @@ class CompetitionLLMOrchestrator:
             "rank_leaf",
             source,
             priority=1,
+            lag_type="rank",
             unit="rank",
             note_builder=_format_rank_leaf_note,
         )
@@ -2205,6 +2283,7 @@ class CompetitionLLMOrchestrator:
             "rank_pos_pct",
             source,
             priority=2,
+            lag_type="rank",
             unit="pct",
             note_builder=_format_rank_pct_note,
         )
@@ -2221,6 +2300,7 @@ class CompetitionLLMOrchestrator:
             "image_cnt",
             source,
             priority=1,
+            lag_type="content",
             note_builder=_format_image_note,
         )
         if entry:
@@ -2230,6 +2310,7 @@ class CompetitionLLMOrchestrator:
             "video_cnt",
             source,
             priority=2,
+            lag_type="content",
             note_builder=_format_video_note,
         )
         if entry:
@@ -2239,6 +2320,7 @@ class CompetitionLLMOrchestrator:
             "content_score",
             source,
             priority=3,
+            lag_type="content",
             note_builder=_format_content_score_note,
         )
         if entry:
@@ -2254,6 +2336,7 @@ class CompetitionLLMOrchestrator:
             "rating",
             source,
             priority=1,
+            lag_type="social",
             note_builder=_format_rating_note,
         )
         if entry:
@@ -2263,6 +2346,7 @@ class CompetitionLLMOrchestrator:
             "reviews",
             source,
             priority=2,
+            lag_type="social",
             note_builder=_format_reviews_note,
         )
         if entry:
@@ -2272,6 +2356,7 @@ class CompetitionLLMOrchestrator:
             "social_proof",
             source,
             priority=3,
+            lag_type="social",
             note_builder=_format_social_proof_note,
         )
         if entry:
@@ -2288,9 +2373,12 @@ class CompetitionLLMOrchestrator:
         if not isinstance(pairs, Sequence):
             return []
         entries: list[Mapping[str, Any]] = []
-        for index, pair in enumerate(pairs):
+        limit = max(1, int(self._config.stage_2.keyword_max_pairs_per_opp or 1))
+        for pair in pairs:
             if not isinstance(pair, Mapping):
                 continue
+            if len(entries) >= limit:
+                break
             keyword = pair.get("keyword")
             opp_rank = pair.get("opp_rank")
             if not keyword or opp_rank is None:
@@ -2298,6 +2386,8 @@ class CompetitionLLMOrchestrator:
             my_rank = pair.get("my_rank")
             my_share = pair.get("my_share")
             opp_share = pair.get("opp_share")
+            if not self._is_unfavorable_keyword_pair(my_rank, opp_rank, my_share, opp_share):
+                continue
             note = _format_keyword_note(
                 row,
                 keyword,
@@ -2316,14 +2406,17 @@ class CompetitionLLMOrchestrator:
                 "unit": "rank",
                 "source": "keywords.7d",
                 "note": note,
-                "_priority": 1 + index,
+                "_priority": len(entries) + 1,
                 "_impact": float(pair.get("impact", 0.0) or 0.0),
             }
+            opp_brand = row.get("opp_brand")
+            if opp_brand:
+                entry["opp_brand"] = opp_brand
             entries.append(entry)
         return entries
 
     def _build_default_pairwise_entries(
-        self, row: Mapping[str, Any], source: str
+        self, row: Mapping[str, Any], source: str, lag_type: str
     ) -> list[Mapping[str, Any]]:
         entries: list[Mapping[str, Any]] = []
         for key in row.keys():
@@ -2335,6 +2428,7 @@ class CompetitionLLMOrchestrator:
                 suffix,
                 source,
                 priority=50,
+                lag_type=lag_type,
             )
             if entry:
                 entries.append(entry)
@@ -2347,6 +2441,7 @@ class CompetitionLLMOrchestrator:
         source: str,
         *,
         priority: int,
+        lag_type: str | None = None,
         unit: str | None = None,
         note_builder: Callable[[Any, Any, Mapping[str, Any]], str | None] | None = None,
     ) -> Mapping[str, Any] | None:
@@ -2361,6 +2456,10 @@ class CompetitionLLMOrchestrator:
         opp_value = row.get(opp_key)
         if my_value in (None, "") or opp_value in (None, ""):
             return None
+        if lag_type and not self._is_unfavorable_metric(
+            lag_type, suffix, my_value, opp_value
+        ):
+            return None
         entry: dict[str, Any] = {
             "metric": suffix,
             "against": "asin",
@@ -2371,6 +2470,9 @@ class CompetitionLLMOrchestrator:
             "_priority": priority,
             "_impact": _compute_pair_gap(my_value, opp_value),
         }
+        opp_brand = row.get("opp_brand")
+        if opp_brand:
+            entry["opp_brand"] = opp_brand
         if unit:
             entry["unit"] = unit
         else:
@@ -2382,6 +2484,122 @@ class CompetitionLLMOrchestrator:
             if note:
                 entry["note"] = note
         return entry
+
+    def _is_unfavorable_metric(
+        self,
+        lag_type: str,
+        metric: str,
+        my_value: Any,
+        opp_value: Any,
+    ) -> bool:
+        if not self._config.stage_2.require_unfavorable_evidence:
+            return True
+        metric_key = metric.lower()
+        my_num = _coerce_float(my_value)
+        opp_num = _coerce_float(opp_value)
+        if my_num is None or opp_num is None:
+            return False
+        if lag_type == "rank" and metric_key in {"rank_leaf", "rank_pos_pct"}:
+            return my_num > opp_num
+        if lag_type == "content" and metric_key in {"image_cnt", "video_cnt", "content_score"}:
+            return my_num < opp_num
+        if lag_type == "social" and metric_key in {"rating", "reviews", "social_proof"}:
+            return my_num < opp_num
+        return True
+
+    def _filter_unfavorable_rows(
+        self, lag_type: str, rows: Sequence[Mapping[str, Any]] | None
+    ) -> list[MutableMapping[str, Any]]:
+        if not rows:
+            return []
+        if not self._config.stage_2.require_unfavorable_evidence:
+            return [row if isinstance(row, MutableMapping) else dict(row) for row in rows if isinstance(row, Mapping)]
+        filtered: list[MutableMapping[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if not self._row_has_unfavorable_gap(lag_type, row):
+                continue
+            if isinstance(row, MutableMapping):
+                filtered.append(row)
+            else:
+                filtered.append(dict(row))
+        return filtered
+
+    def _row_has_unfavorable_gap(
+        self, lag_type: str, row: Mapping[str, Any]
+    ) -> bool:
+        if not self._config.stage_2.require_unfavorable_evidence:
+            return True
+
+        def _greater(my: Any, opp: Any) -> bool:
+            my_num = _coerce_float(my)
+            opp_num = _coerce_float(opp)
+            return my_num is not None and opp_num is not None and my_num > opp_num
+
+        def _less(my: Any, opp: Any) -> bool:
+            my_num = _coerce_float(my)
+            opp_num = _coerce_float(opp)
+            return my_num is not None and opp_num is not None and my_num < opp_num
+
+        if lag_type == "rank":
+            return _greater(row.get("my_rank_leaf"), row.get("opp_rank_leaf")) or _greater(
+                row.get("my_rank_pos_pct"), row.get("opp_rank_pos_pct")
+            )
+        if lag_type == "content":
+            return (
+                _less(row.get("my_image_cnt"), row.get("opp_image_cnt"))
+                or _less(row.get("my_video_cnt"), row.get("opp_video_cnt"))
+                or _less(row.get("my_content_score"), row.get("opp_content_score"))
+            )
+        if lag_type == "social":
+            return (
+                _less(row.get("my_rating"), row.get("opp_rating"))
+                or _less(row.get("my_reviews"), row.get("opp_reviews"))
+                or _less(row.get("my_social_proof"), row.get("opp_social_proof"))
+            )
+        if lag_type == "keyword":
+            pairs = row.get("keyword_pairs")
+            if isinstance(pairs, Sequence):
+                for pair in pairs:
+                    if not isinstance(pair, Mapping):
+                        continue
+                    if self._is_unfavorable_keyword_pair(
+                        pair.get("my_rank"),
+                        pair.get("opp_rank"),
+                        pair.get("my_share"),
+                        pair.get("opp_share"),
+                    ):
+                        return True
+            my_share = _coerce_float(row.get("my_kw_top3_share_7d_avg"))
+            opp_share = _coerce_float(row.get("opp_kw_top3_share_7d_avg"))
+            if opp_share is None:
+                return False
+            if my_share is None:
+                return True
+            return my_share < opp_share
+        return True
+
+    def _is_unfavorable_keyword_pair(
+        self, my_rank: Any, opp_rank: Any, my_share: Any, opp_share: Any
+    ) -> bool:
+        if not self._config.stage_2.require_unfavorable_evidence:
+            return True
+        opp_rank_num = _coerce_float(opp_rank)
+        if opp_rank_num is None:
+            return False
+        my_rank_num = _coerce_float(my_rank)
+        if my_rank_num is None:
+            return True
+        if my_rank_num > opp_rank_num:
+            return True
+        opp_share_num = _coerce_float(opp_share)
+        if opp_share_num is None:
+            return False
+        my_share_num = _coerce_float(my_share)
+        if my_share_num is None:
+            return True
+        return my_share_num < opp_share_num
 
     def _normalise_evidence_sequence(self, items: Any) -> list[Mapping[str, Any]]:
         if not isinstance(items, Sequence):
@@ -2418,6 +2636,9 @@ class CompetitionLLMOrchestrator:
         }
         if against == "asin":
             normalised["opp_asin"] = str(opp_asin)
+            opp_brand = item.get("opp_brand")
+            if opp_brand not in (None, ""):
+                normalised["opp_brand"] = str(opp_brand)
         unit = item.get("unit")
         if unit is not None:
             normalised["unit"] = unit
@@ -2504,7 +2725,10 @@ class CompetitionLLMOrchestrator:
                 )
                 continue
             if allowed_actions_set and code not in allowed_actions_set:
-                raise ValueError(f"Action code {code!r} is not permitted")
+                LOGGER.debug(
+                    "competition_llm.stage2_drop_action_disallowed code=%s", code
+                )
+                continue
             normalized = dict(action)
             normalized["code"] = code
             cleaned_actions.append(normalized)
@@ -2614,7 +2838,7 @@ class CompetitionLLMOrchestrator:
           LIMIT 3
         """
         try:
-            top_each = self._fetch_all(sql_each, ctx)
+            top_each_raw = self._fetch_all(sql_each, ctx)
         except SQLAlchemyError as exc:  # pragma: no cover - optional table
             LOGGER.debug(
                 "competition_llm.stage2_page_pairs_unavailable asin=%s lag_type=%s error=%s",
@@ -2622,9 +2846,10 @@ class CompetitionLLMOrchestrator:
                 lag_type,
                 exc,
             )
-            top_each = []
-        if top_each:
-            self._attach_page_entity_details(ctx, top_each)
+            top_each_raw = []
+        if top_each_raw:
+            self._attach_page_entity_details(ctx, top_each_raw)
+        top_each = self._filter_unfavorable_rows(lag_type, top_each_raw)
         comparison_reasons = _build_comparison_reasons(lag_type, top_each)
 
         return {
@@ -3045,6 +3270,7 @@ class CompetitionLLMOrchestrator:
         opponent_keywords: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
         pairs: list[dict[str, Any]] = []
+        limit = max(1, int(self._config.stage_2.keyword_max_pairs_per_opp or 1))
         used: set[str] = set()
         for item in opponent_keywords:
             keyword = item.get("keyword")
@@ -3055,10 +3281,10 @@ class CompetitionLLMOrchestrator:
                 continue
             pairs.append(self._build_keyword_pair(keyword, my_item, item))
             used.add(keyword)
-            if len(pairs) >= _KEYWORD_PER_PAIR_LIMIT:
+            if len(pairs) >= limit:
                 return pairs
         for item in opponent_keywords:
-            if len(pairs) >= _KEYWORD_PER_PAIR_LIMIT:
+            if len(pairs) >= limit:
                 break
             keyword = item.get("keyword")
             if not keyword or keyword in used:
@@ -3151,7 +3377,7 @@ class CompetitionLLMOrchestrator:
           LIMIT 3
         """
         try:
-            top_each = self._fetch_all(sql_each, ctx)
+            top_each_raw = self._fetch_all(sql_each, ctx)
         except SQLAlchemyError as exc:  # pragma: no cover - optional table
             LOGGER.debug(
                 "competition_llm.stage2_traffic_pairs_unavailable asin=%s lag_type=%s error=%s",
@@ -3159,11 +3385,12 @@ class CompetitionLLMOrchestrator:
                 lag_type,
                 exc,
             )
-            top_each = []
-        if top_each:
-            self._attach_page_entity_details(ctx, top_each)
+            top_each_raw = []
+        if top_each_raw:
+            self._attach_page_entity_details(ctx, top_each_raw)
             if lag_type == "keyword":
-                self._attach_keyword_details(ctx, top_each)
+                self._attach_keyword_details(ctx, top_each_raw)
+        top_each = self._filter_unfavorable_rows(lag_type, top_each_raw)
         comparison_reasons = _build_comparison_reasons(lag_type, top_each)
 
         return {
@@ -3610,34 +3837,32 @@ def _compose_reason_sentence(lag_type: str, row: Mapping[str, Any]) -> str:
     if lag_type == "price":
         gap = _format_metric_value(row.get("price_gap_each"))
         ratio = _format_metric_value(row.get("price_ratio_each"))
-        return f"竞品 {label} 的价格差为 {gap}，我方/竞品价格比 {ratio}，价格优势不足。"
+        return f"竞品 {label} 价格差 {gap}，我方/竞品价格比 {ratio}。"
     if lag_type == "rank":
         delta = _format_metric_value(row.get("rank_pos_delta"))
-        return f"竞品 {label} 的排名领先差值 {delta}，我方自然位次需提升。"
+        return f"竞品 {label} 排名领先差值 {delta}，我方自然位次落后。"
     if lag_type == "content":
         gap = _format_metric_value(row.get("content_gap_each"))
-        return f"竞品 {label} 的内容表现领先 {gap}，需要优化前台素材。"
+        return f"竞品 {label} 内容表现领先 {gap}。"
     if lag_type == "social":
         gap = _format_metric_value(row.get("social_gap_each"))
-        return f"竞品 {label} 的社交口碑差距为 {gap}，需加强评价与评分建设。"
+        return f"竞品 {label} 社交口碑差距 {gap}。"
     if lag_type == "badge":
         diff = _format_metric_value(row.get("badge_delta_sum"))
-        return f"竞品 {label} 拥有更多权益标识差值 {diff}，需补齐权益标签。"
+        return f"竞品 {label} 权益标识差值 {diff}。"
     if lag_type == "confidence":
         confidence = _format_metric_value(row.get("confidence"))
-        return f"竞品 {label} 的信号置信度 {confidence} 更高，需补充可靠证据。"
+        return f"竞品 {label} 信号置信度 {confidence} 更高。"
     if lag_type == "traffic_mix":
         ad_gap = _format_metric_value(row.get("ad_ratio_gap_each"))
         mix_gap = _format_metric_value(row.get("ad_to_natural_gap_each"))
-        return (
-            f"竞品 {label} 的广告占比差距 {ad_gap}，广告/自然流量组合差距 {mix_gap}，流量结构劣势明显。"
-        )
+        return f"竞品 {label} 广告占比差距 {ad_gap}，广告/自然流量差距 {mix_gap}。"
     if lag_type == "keyword":
         my_share = _format_metric_value(row.get("my_kw_top3_share_7d_avg"))
         opp_share = _format_metric_value(row.get("opp_kw_top3_share_7d_avg"))
-        return f"竞品 {label} 的Top3关键词份额为 {opp_share}，我方仅 {my_share}，关键词覆盖不足。"
+        return f"竞品 {label} Top3关键词份额 {opp_share}，我方 {my_share}。"
     score = _format_metric_value(row.get("score"))
-    return f"竞品 {label} 的差距评分为 {score}，需结合明细进一步分析。"
+    return f"竞品 {label} 差距评分 {score}。"
 
 
 def _format_metric_value(value: Any) -> str:
