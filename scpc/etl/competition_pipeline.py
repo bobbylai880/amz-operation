@@ -44,7 +44,7 @@ SELECT asin, marketplace_id, week, sunday, parent_asin,
        image_cnt, video_cnt, bullet_cnt, title_len,
        aplus_flag, badge_json
 FROM bi_amz_asin_product_snapshot
-WHERE marketplace_id = :mk AND week = :week
+WHERE marketplace_id = :mk AND week IN (:week, :week_hyphen)
 """
 
 LATEST_SNAPSHOT_WEEK_SQL = """
@@ -151,6 +151,13 @@ def _canonical_week_label(week: str | None) -> str:
         raise ValueError(f"Invalid ISO week label: {week}")
 
     return f"{year}W{week_num:02d}"
+
+
+def _hyphenated_week_label(week: str) -> str:
+    """Return the ``YYYY-Www`` representation for ``week``."""
+
+    canonical = _canonical_week_label(week)
+    return f"{canonical[:4]}-W{canonical[5:]}"
 
 
 def _iso_week_to_dates(week: str) -> tuple[date, date]:
@@ -847,7 +854,13 @@ def run_competition_pipeline(
     )
 
     snapshot_df = _read_dataframe(
-        engine, SNAPSHOT_SQL, {"mk": marketplace_id, "week": resolved_week}
+        engine,
+        SNAPSHOT_SQL,
+        {
+            "mk": marketplace_id,
+            "week": resolved_week,
+            "week_hyphen": _hyphenated_week_label(resolved_week),
+        },
     )
     if "discount_rate" not in snapshot_df.columns:
         snapshot_df["discount_rate"] = pd.NA
