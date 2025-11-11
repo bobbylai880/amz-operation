@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from collections import defaultdict
 from copy import deepcopy
@@ -128,6 +129,22 @@ _ROOT_CAUSE_TO_LAG: Mapping[str, str] = {
     "badge_gap": "badge",
     "rank_gap": "rank",
     "social_gap": "social",
+}
+
+_DEFAULT_DIRECTION_TOLERANCE = 1e-6
+_DIRECTION_KEYWORDS = {
+    "lower_better": "越低越好",
+    "higher_better": "越高越好",
+}
+_METRIC_DIRECTION_MAP: Mapping[str, str] = {
+    "rank": "lower_better",
+    "rank_leaf": "lower_better",
+    "rank_root": "lower_better",
+    "rank_pos_pct": "lower_better",
+    "rank_pos_delta": "lower_better",
+    "rank_delta": "lower_better",
+    "rank_score": "higher_better",
+    "content_score": "higher_better",
 }
 
 _ENTITY_DETAIL_FIELDS: tuple[str, ...] = (
@@ -348,6 +365,7 @@ class LagRule:
     comparator: str
     threshold: float
     weight: float
+    direction: str | None = None
 
 
 @dataclass(slots=True)
@@ -454,6 +472,26 @@ class CompetitionLLMOrchestrator:
         self._current_marketplace_id: str | None = None
         self._brand_cache: dict[str, str | None] = {}
         self._brand_path_tokens: list[str] | None = None
+        env_flag = os.getenv("COMP_RANK_FIX_ENABLED")
+        if env_flag is None:
+            self._rank_fix_enabled = bool(
+                getattr(self._config.stage_2, "rank_direction_fix_enabled", False)
+            )
+        else:
+            self._rank_fix_enabled = env_flag.strip().lower() in {"1", "true", "yes", "on"}
+        tolerance_config = getattr(
+            self._config.stage_2, "direction_tolerance", _DEFAULT_DIRECTION_TOLERANCE
+        )
+        try:
+            tolerance_value = float(tolerance_config)
+        except (TypeError, ValueError):
+            tolerance_value = _DEFAULT_DIRECTION_TOLERANCE
+        if tolerance_value < 0:
+            tolerance_value = 0.0
+        self._direction_tolerance = tolerance_value if tolerance_value is not None else _DEFAULT_DIRECTION_TOLERANCE
+        if self._direction_tolerance < 0:
+            self._direction_tolerance = 0.0
+        self._rank_fix_counters: dict[str, int] = {"total": 0, "corrected": 0, "dropped": 0}
 
     def run(
         self,
@@ -621,6 +659,7 @@ class CompetitionLLMOrchestrator:
             triggered_rules: defaultdict[str, list[str]] = defaultdict(list)
             lead_hits: defaultdict[str, list[str]] = defaultdict(list)
             confidence_tracker: defaultdict[str, float] = defaultdict(lambda: self._config.stage_1.conf_min)
+            direction_registry: defaultdict[str, dict[str, str]] = defaultdict(dict)
 
             for channel, rows in (("page", overview_rows), ("traffic", traffic_rows)):
                 if not rows:
@@ -642,6 +681,9 @@ class CompetitionLLMOrchestrator:
                                 triggered_rules[rule.lag_type].append(rule.rule_name)
                             else:
                                 triggered_rules[rule.lag_type].append(f"{rule.metric}{rule.comparator}{rule.threshold}")
+                            direction_value = rule.direction or _resolve_direction(rule.metric, rule.lag_type)
+                            if direction_value:
+                                direction_registry[rule.lag_type][rule.metric] = direction_value
                         else:
                             mirror = _MIRROR_MAP.get(rule.comparator)
                             if mirror and _compare(numeric_value, rule.threshold, mirror):
@@ -665,6 +707,12 @@ class CompetitionLLMOrchestrator:
                 }
                 if triggered_rules.get(lag_type):
                     payload["triggered_rules"] = triggered_rules[lag_type]
+                metric_dir = direction_registry.get(lag_type)
+                if metric_dir:
+                    payload["metric_directions"] = {
+                        metric: metric_dir[metric]
+                        for metric in sorted(metric_dir)
+                    }
                 dimensions.append(payload)
                 LOGGER.info(
                     "competition_llm.stage1_lag lag_type=%s opp_type=%s lag_score=%.3f severity=%s rules=%s",
@@ -1068,13 +1116,18 @@ class CompetitionLLMOrchestrator:
             if not isinstance(machine_json.get("context"), Mapping):
                 machine_json["context"] = facts.get("context", {})
             machine_json = self._materialize_evidence(machine_json, facts)
+            if self._rank_fix_enabled:
+                self._fix_directional_metrics(machine_json, facts=facts)
             self._validate_stage2_machine_json(machine_json)
+            llm_markdown = human_markdown_raw if isinstance(human_markdown_raw, str) else None
             if not isinstance(human_markdown_raw, str):
                 LOGGER.debug(
                     "competition_llm.stage2_markdown_non_string type=%s",
                     type(human_markdown_raw).__name__,
                 )
-            human_markdown = self._render_stage2_diff_markdown(machine_json, facts)
+            human_markdown = self._render_stage2_diff_markdown(
+                machine_json, facts, llm_markdown=llm_markdown
+            )
             outputs.append(
                 StageTwoAggregateResult(
                     context=facts.get("context", {}),
@@ -1179,6 +1232,10 @@ class CompetitionLLMOrchestrator:
                 entry["lag_scores"].append(lag_score)
             if dimension.get("triggered_rules"):
                 entry["triggered_rules"].update(dimension.get("triggered_rules"))
+            metric_dirs_raw = dimension.get("metric_directions")
+            metric_dirs = _normalise_direction_map(metric_dirs_raw) if metric_dirs_raw else {}
+            if metric_dirs:
+                entry.setdefault("metric_directions", {}).update(metric_dirs)
 
             for evidence in evidence_items:
                 overview = evidence.get("overview") or {}
@@ -1203,6 +1260,11 @@ class CompetitionLLMOrchestrator:
                 lag_item["lag_score"] = max(entry["lag_scores"])
             if entry.get("triggered_rules"):
                 lag_item["triggered_rules"] = sorted(entry["triggered_rules"])
+            if entry.get("metric_directions"):
+                lag_item["metric_directions"] = {
+                    metric: entry["metric_directions"][metric]
+                    for metric in sorted(entry["metric_directions"])
+                }
             lag_items_payload.append(lag_item)
 
         lag_items_payload.sort(key=lambda item: (-_SEVERITY_ORDER.get(str(item.get("severity")).lower(), 1), item.get("lag_type")))
@@ -1362,6 +1424,8 @@ class CompetitionLLMOrchestrator:
         self,
         machine_json: Mapping[str, Any],
         facts: Mapping[str, Any] | None,
+        *,
+        llm_markdown: str | None = None,
     ) -> str:
         root_causes = machine_json.get("root_causes")
         if not isinstance(root_causes, Sequence) or not root_causes:
@@ -1425,6 +1489,41 @@ class CompetitionLLMOrchestrator:
             else:
                 for text in formatted:
                     lines.append(f"- {text}")
+            lines.append("")
+
+        diagnostics = machine_json.get("diagnostics")
+        actions_section: Sequence[Mapping[str, Any]] | None = None
+        if isinstance(diagnostics, Mapping):
+            validated = diagnostics.get("validated_actions")
+            if isinstance(validated, Sequence):
+                actions_section = [
+                    action
+                    for action in validated
+                    if isinstance(action, Mapping)
+                ]
+
+        action_lines: list[str] = []
+        if actions_section:
+            for action in actions_section:
+                text = (
+                    str(action.get("how") or action.get("why") or action.get("expected_impact") or action.get("code") or "")
+                ).strip()
+                if not text:
+                    continue
+                if not text.startswith("-"):
+                    text = f"- {text}"
+                action_lines.append(text)
+        if llm_markdown and llm_markdown.strip():
+            for raw_line in llm_markdown.strip().splitlines():
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                if not stripped.startswith("-"):
+                    stripped = f"- {stripped}"
+                action_lines.append(stripped)
+        if action_lines:
+            lines.append("## 建议动作")
+            lines.extend(action_lines)
             lines.append("")
 
         return "\n".join(lines).strip() + "\n"
@@ -1493,6 +1592,10 @@ class CompetitionLLMOrchestrator:
         if not metric or my_value is None or opp_value is None:
             return None
 
+        direction = _normalize_direction(evidence.get("direction"))
+        delta_value = evidence.get("delta")
+        worse_flag = evidence.get("worse")
+
         if against != "asin":
             if against == "leader":
                 label = "领先者"
@@ -1500,6 +1603,14 @@ class CompetitionLLMOrchestrator:
                 label = "中位数"
             else:
                 label = "对手"
+            if direction:
+                direction_text = _DIRECTION_KEYWORDS.get(direction)
+                metric_label = f"{metric}（{direction_text}）" if direction_text else metric
+                delta_formatted = _format_signed_value(delta_value if delta_value is not None else _compute_delta(my_value, opp_value))
+                conclusion = "更差" if worse_flag is True else ("更好" if worse_flag is False else "待确认")
+                my_text = _format_metric_value(my_value)
+                opp_text = _format_metric_value(opp_value)
+                return f"{metric_label}：我方 {my_text} / {label} {opp_text}，差值 {delta_formatted} → {conclusion}"
             my_text = _format_metric_value(my_value)
             opp_text = _format_metric_value(opp_value)
             return f"{metric}：我方 {my_text} / {label} {opp_text}"
@@ -1516,8 +1627,19 @@ class CompetitionLLMOrchestrator:
         base_row = temp_row
 
         note = evidence.get("note")
-        if isinstance(note, str) and note.strip():
+        if isinstance(note, str) and note.strip() and not direction:
             return note.strip()
+
+        if direction:
+            direction_text = _DIRECTION_KEYWORDS.get(direction)
+            metric_label = f"{metric}（{direction_text}）" if direction_text else metric
+            my_text = _format_metric_value(my_value)
+            opp_text = _format_metric_value(opp_value)
+            delta_metric = delta_value if delta_value is not None else _compute_delta(my_value, opp_value)
+            delta_formatted = _format_signed_value(delta_metric)
+            conclusion = "更差" if worse_flag is True else ("更好" if worse_flag is False else "待确认")
+            label = _format_opponent_display_label(base_row)
+            return f"{metric_label}：我方 {my_text} / 对手({label}) {opp_text}，差值 {delta_formatted} → {conclusion}"
 
         formatter_map: Mapping[str, Callable[[Any, Any, Mapping[str, Any]], str]] = {
             "rank_leaf": _format_rank_leaf_note,
@@ -1661,6 +1783,8 @@ class CompetitionLLMOrchestrator:
             opp_type_raw = rule.get("opp_type") or defaults.get("opp_type") or opp_type_default or "any"
             opp_type = str(opp_type_raw or "any").strip().lower()
             rule_name = str(rule.get("rule_name") or f"{metric}_{comparator}")
+            direction_raw = rule.get("direction") or defaults.get("direction")
+            direction = _normalize_direction(direction_raw) or _resolve_direction(metric, lag_type)
             rules_by_key[(lag_type, metric, opp_type, comparator)] = LagRule(
                 rule_name=rule_name,
                 lag_type=lag_type,
@@ -1669,6 +1793,7 @@ class CompetitionLLMOrchestrator:
                 comparator=comparator,
                 threshold=float(threshold),
                 weight=float(weight),
+                direction=direction,
             )
 
         profiles = config_data.get("profiles") or ()
@@ -1850,9 +1975,7 @@ class CompetitionLLMOrchestrator:
             entry = dict(cause)
             raw_evidence: list[Any] = []
             if entry.get("evidence"):
-                raw_evidence.extend(
-                    self._normalise_evidence_sequence(entry.get("evidence"))
-                )
+                raw_evidence.extend(entry.get("evidence"))
 
             inferred_lag = self._infer_root_cause_dimension(entry, lag_index)
             lag_type = inferred_lag
@@ -1896,12 +2019,19 @@ class CompetitionLLMOrchestrator:
                     sorted(lag_index),
                 )
 
+            direction_hints = _normalise_direction_map(
+                lag_data.get("metric_directions") if isinstance(lag_data, Mapping) else {}
+            )
             normalised = self._deduplicate_evidence(
-                self._normalise_evidence_sequence(raw_evidence)
+                self._normalise_evidence_sequence(
+                    raw_evidence,
+                    lag_type=lag_type,
+                    direction_hints=direction_hints,
+                )
             )
 
             filtered_evidence = self._filter_normalised_evidence(
-                lag_type, normalised, lag_data
+                lag_type, normalised, lag_data, direction_hints=direction_hints
             )
 
             if not filtered_evidence:
@@ -1931,13 +2061,156 @@ class CompetitionLLMOrchestrator:
             entry.pop("evidence_refs", None)
             cleaned_causes.append(entry)
 
-        data["root_causes"] = cleaned_causes
         if not cleaned_causes:
             data["root_causes"] = []
             data["lag_type"] = "none"
         else:
-            data["lag_type"] = "mixed"
+            data["root_causes"] = cleaned_causes
+            data["lag_type"] = self._determine_machine_lag_type(
+                cleaned_causes,
+                lag_index,
+                original=data.get("lag_type"),
+            )
         return data
+
+    def _fix_directional_metrics(
+        self,
+        machine_json: MutableMapping[str, Any],
+        *,
+        facts: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(machine_json, MutableMapping):
+            return
+        root_causes = machine_json.get("root_causes")
+        if not isinstance(root_causes, Sequence):
+            return
+
+        lag_index = self._build_lag_index(facts or {}) if facts else {}
+        direction_hints_map = {
+            lag: _normalise_direction_map(data.get("metric_directions"))
+            for lag, data in lag_index.items()
+        }
+
+        total = 0
+        corrected = 0
+        dropped = 0
+        updated_causes: list[Mapping[str, Any]] = []
+
+        for cause in root_causes:
+            if not isinstance(cause, Mapping):
+                updated_causes.append(cause)
+                continue
+
+            code = str(cause.get("root_cause_code") or cause.get("code") or "").lower()
+            if code != "rank_gap":
+                updated_causes.append(cause)
+                continue
+
+            total += 1
+            lag_type = _normalize_lag_type(cause.get("lag_dimension") or "rank") or "rank"
+            direction_hints = direction_hints_map.get(lag_type, {})
+            original_evidence_raw = (
+                cause.get("evidence") if isinstance(cause.get("evidence"), Sequence) else []
+            )
+            need_metadata_fix = self._has_missing_directional_fields(original_evidence_raw)
+            evidence_items = self._normalise_evidence_sequence(
+                original_evidence_raw,
+                lag_type=lag_type,
+                direction_hints=direction_hints,
+            )
+            any_worse = any(item.get("worse") is True for item in evidence_items)
+            if not any_worse:
+                LOGGER.info(
+                    "competition_llm.stage2_rankgap_dropped_no_worse summary=%s opp_asins=%s",
+                    cause.get("summary"),
+                    [item.get("opp_asin") for item in evidence_items if item.get("opp_asin")],
+                )
+                dropped += 1
+                continue
+
+            summary_before = str(cause.get("summary") or "").strip()
+            summary_after = self._rewrite_rank_summary(summary_before, lag_type)
+            did_correct = need_metadata_fix or summary_after != summary_before
+
+            updated_cause = dict(cause)
+            updated_cause["evidence"] = evidence_items
+            if summary_after != summary_before:
+                updated_cause["summary"] = summary_after
+            updated_causes.append(updated_cause)
+
+            if did_correct:
+                corrected += 1
+                LOGGER.info(
+                    "competition_llm.stage2_direction_fixed summary_before=%s summary_after=%s metadata_fix=%s",
+                    summary_before,
+                    summary_after,
+                    need_metadata_fix,
+                )
+
+        if total:
+            diagnostics = machine_json.setdefault("diagnostics", {})
+            stage2_metrics = diagnostics.setdefault("stage2_rank_fix", {})
+            stage2_metrics.update(
+                {
+                    "total_causes": total,
+                    "corrected_count": corrected,
+                    "dropped_count": dropped,
+                }
+            )
+            self._rank_fix_counters["total"] += total
+            self._rank_fix_counters["corrected"] += corrected
+            self._rank_fix_counters["dropped"] += dropped
+            LOGGER.info(
+                "stage2_rank_fix.metrics total_causes=%s corrected_count=%s dropped_count=%s",
+                total,
+                corrected,
+                dropped,
+            )
+
+        if updated_causes:
+            machine_json["root_causes"] = updated_causes
+            machine_json["lag_type"] = self._determine_machine_lag_type(
+                updated_causes, lag_index, original=machine_json.get("lag_type")
+            )
+        else:
+            machine_json["root_causes"] = []
+            machine_json["lag_type"] = "none"
+
+    def _has_missing_directional_fields(self, evidence: Any) -> bool:
+        if not isinstance(evidence, Sequence):
+            return True
+        for item in evidence:
+            if not isinstance(item, Mapping):
+                continue
+            direction = _normalize_direction(item.get("direction"))
+            delta = item.get("delta")
+            worse = item.get("worse")
+            if direction is None or delta is None or worse is None:
+                return True
+        return False
+
+    def _rewrite_rank_summary(self, summary: str, lag_type: str) -> str:
+        if not summary:
+            return summary
+        if _normalize_lag_type(lag_type) != "rank":
+            return summary
+        updated = summary
+        replacements = {
+            "百分位低于": "百分位高于",
+            "百分位更低": "百分位更高",
+            "排名低于": "排名高于",
+            "排名更低": "排名更高",
+        }
+        for old, new in replacements.items():
+            if old in updated:
+                updated = updated.replace(old, new)
+        direction_phrase = _DIRECTION_KEYWORDS.get("lower_better")
+        if direction_phrase and direction_phrase not in updated:
+            stripped = updated.rstrip("。")
+            updated = f"{stripped}（{direction_phrase}）"
+            if summary.endswith("。"):
+                updated += "。"
+        return updated
 
     def _build_evidence_from_hint(
         self,
@@ -1996,6 +2269,7 @@ class CompetitionLLMOrchestrator:
                 "lag_type": normalized,
                 "overview": overview,
                 "top_opps": top_opps,
+                "metric_directions": _normalise_direction_map(item.get("metric_directions")),
             }
         return index
 
@@ -2012,6 +2286,41 @@ class CompetitionLLMOrchestrator:
         if mapped in lag_index:
             return mapped
         return mapped
+
+    def _determine_machine_lag_type(
+        self,
+        causes: Sequence[Any],
+        lag_index: Mapping[str, Mapping[str, Any]],
+        *,
+        original: Any = None,
+    ) -> str:
+        if not causes:
+            return "none"
+        inferred: list[str] = []
+        for cause in causes:
+            if not isinstance(cause, Mapping):
+                continue
+            inferred_lag = self._infer_root_cause_dimension(cause, lag_index)
+            if inferred_lag:
+                inferred.append(inferred_lag)
+        unique_normalized = {
+            _normalize_lag_type(value) for value in inferred if value
+        }
+        unique_normalized.discard("")
+        unique_normalized.discard(None)  # type: ignore[arg-type]
+        if len(unique_normalized) == 1:
+            normalized = next(iter(unique_normalized))
+            return _LAG_TYPE_FILENAME_ALIASES.get(normalized, normalized)
+        if not unique_normalized and isinstance(original, str):
+            cleaned = original.strip()
+            if cleaned:
+                normalized_original = _normalize_lag_type(cleaned)
+                if normalized_original:
+                    return _LAG_TYPE_FILENAME_ALIASES.get(
+                        normalized_original, cleaned
+                    )
+                return cleaned
+        return "mixed"
 
     def _parse_evidence_refs(self, refs: Any) -> list[Mapping[str, Any]]:
         if not isinstance(refs, Sequence):
@@ -2137,6 +2446,7 @@ class CompetitionLLMOrchestrator:
         if not isinstance(rows, Sequence):
             return []
         source = "pairs_each" if lag_type in _PAGE_LAG_TYPES else "traffic.pairs"
+        direction_hints = _normalise_direction_map(lag_data.get("metric_directions"))
         candidates: list[tuple[int, float, Mapping[str, Any]]] = []
         for row in rows:
             if not isinstance(row, Mapping):
@@ -2148,6 +2458,7 @@ class CompetitionLLMOrchestrator:
                 lag_type,
                 row,
                 source,
+                direction_hints=direction_hints,
             ):
                 if metric and entry.get("metric") != metric:
                     continue
@@ -2172,25 +2483,36 @@ class CompetitionLLMOrchestrator:
         lag_type: str,
         row: Mapping[str, Any],
         source: str,
+        *,
+        direction_hints: Mapping[str, str] | None = None,
     ) -> list[Mapping[str, Any]]:
         if not isinstance(row, Mapping):
             return []
         if lag_type == "rank":
-            entries = self._build_rank_entries(row, source)
+            entries = self._build_rank_entries(row, source, direction_hints=direction_hints)
         elif lag_type == "content":
-            entries = self._build_content_entries(row, source)
+            entries = self._build_content_entries(row, source, direction_hints=direction_hints)
         elif lag_type == "social":
-            entries = self._build_social_entries(row, source)
+            entries = self._build_social_entries(row, source, direction_hints=direction_hints)
         elif lag_type == "keyword":
-            entries = self._build_keyword_entries(row, source)
+            entries = self._build_keyword_entries(row, source, direction_hints=direction_hints)
         else:
             entries = []
         if not entries:
-            entries = self._build_default_pairwise_entries(row, source, lag_type)
+            entries = self._build_default_pairwise_entries(
+                row,
+                source,
+                lag_type,
+                direction_hints=direction_hints,
+            )
         return entries
 
     def _build_rank_entries(
-        self, row: Mapping[str, Any], source: str
+        self,
+        row: Mapping[str, Any],
+        source: str,
+        *,
+        direction_hints: Mapping[str, str] | None = None,
     ) -> list[Mapping[str, Any]]:
         entries: list[Mapping[str, Any]] = []
         entry = self._build_metric_entry(
@@ -2201,6 +2523,7 @@ class CompetitionLLMOrchestrator:
             lag_type="rank",
             unit="rank",
             note_builder=_format_rank_leaf_note,
+            direction_hints=direction_hints,
         )
         if entry:
             entries.append(entry)
@@ -2212,13 +2535,18 @@ class CompetitionLLMOrchestrator:
             lag_type="rank",
             unit="pct",
             note_builder=_format_rank_pct_note,
+            direction_hints=direction_hints,
         )
         if entry:
             entries.append(entry)
         return entries
 
     def _build_content_entries(
-        self, row: Mapping[str, Any], source: str
+        self,
+        row: Mapping[str, Any],
+        source: str,
+        *,
+        direction_hints: Mapping[str, str] | None = None,
     ) -> list[Mapping[str, Any]]:
         entries: list[Mapping[str, Any]] = []
         entry = self._build_metric_entry(
@@ -2228,6 +2556,7 @@ class CompetitionLLMOrchestrator:
             priority=1,
             lag_type="content",
             note_builder=_format_image_note,
+            direction_hints=direction_hints,
         )
         if entry:
             entries.append(entry)
@@ -2238,6 +2567,7 @@ class CompetitionLLMOrchestrator:
             priority=2,
             lag_type="content",
             note_builder=_format_video_note,
+            direction_hints=direction_hints,
         )
         if entry:
             entries.append(entry)
@@ -2248,13 +2578,18 @@ class CompetitionLLMOrchestrator:
             priority=3,
             lag_type="content",
             note_builder=_format_content_score_note,
+            direction_hints=direction_hints,
         )
         if entry:
             entries.append(entry)
         return entries
 
     def _build_social_entries(
-        self, row: Mapping[str, Any], source: str
+        self,
+        row: Mapping[str, Any],
+        source: str,
+        *,
+        direction_hints: Mapping[str, str] | None = None,
     ) -> list[Mapping[str, Any]]:
         entries: list[Mapping[str, Any]] = []
         entry = self._build_metric_entry(
@@ -2264,6 +2599,7 @@ class CompetitionLLMOrchestrator:
             priority=1,
             lag_type="social",
             note_builder=_format_rating_note,
+            direction_hints=direction_hints,
         )
         if entry:
             entries.append(entry)
@@ -2274,6 +2610,7 @@ class CompetitionLLMOrchestrator:
             priority=2,
             lag_type="social",
             note_builder=_format_reviews_note,
+            direction_hints=direction_hints,
         )
         if entry:
             entries.append(entry)
@@ -2284,13 +2621,18 @@ class CompetitionLLMOrchestrator:
             priority=3,
             lag_type="social",
             note_builder=_format_social_proof_note,
+            direction_hints=direction_hints,
         )
         if entry:
             entries.append(entry)
         return entries
 
     def _build_keyword_entries(
-        self, row: Mapping[str, Any], source: str
+        self,
+        row: Mapping[str, Any],
+        source: str,
+        *,
+        direction_hints: Mapping[str, str] | None = None,
     ) -> list[Mapping[str, Any]]:
         opp_asin = row.get("opp_asin")
         if not opp_asin:
@@ -2338,11 +2680,26 @@ class CompetitionLLMOrchestrator:
             opp_brand = row.get("opp_brand")
             if opp_brand:
                 entry["opp_brand"] = opp_brand
+            direction = _resolve_direction("keyword_rank", "keyword", direction_hints) or "lower_better"
+            entry["direction"] = direction
+            delta_value = _compute_delta(my_rank, opp_rank)
+            entry["delta"] = round(delta_value, 6) if delta_value is not None else None
+            entry["worse"] = _compute_worse(
+                direction,
+                my_rank,
+                opp_rank,
+                self._direction_tolerance,
+            )
             entries.append(entry)
         return entries
 
     def _build_default_pairwise_entries(
-        self, row: Mapping[str, Any], source: str, lag_type: str
+        self,
+        row: Mapping[str, Any],
+        source: str,
+        lag_type: str,
+        *,
+        direction_hints: Mapping[str, str] | None = None,
     ) -> list[Mapping[str, Any]]:
         entries: list[Mapping[str, Any]] = []
         for key in row.keys():
@@ -2355,6 +2712,7 @@ class CompetitionLLMOrchestrator:
                 source,
                 priority=50,
                 lag_type=lag_type,
+                direction_hints=direction_hints,
             )
             if entry:
                 entries.append(entry)
@@ -2370,6 +2728,7 @@ class CompetitionLLMOrchestrator:
         lag_type: str | None = None,
         unit: str | None = None,
         note_builder: Callable[[Any, Any, Mapping[str, Any]], str | None] | None = None,
+        direction_hints: Mapping[str, str] | None = None,
     ) -> Mapping[str, Any] | None:
         opp_asin = row.get("opp_asin")
         if not opp_asin:
@@ -2410,6 +2769,16 @@ class CompetitionLLMOrchestrator:
             note = note_builder(my_value, opp_value, row)
             if note:
                 entry["note"] = note
+        direction = _resolve_direction(suffix, lag_type, direction_hints)
+        entry["direction"] = direction
+        delta_value = _compute_delta(my_value, opp_value)
+        entry["delta"] = round(delta_value, 6) if delta_value is not None else None
+        if direction:
+            entry["worse"] = _compute_worse(
+                direction, my_value, opp_value, self._direction_tolerance
+            )
+        else:
+            entry["worse"] = None
         return entry
 
     def _metric_always_included(self, lag_type: str | None, metric: str) -> bool:
@@ -2429,21 +2798,18 @@ class CompetitionLLMOrchestrator:
         opp_value: Any,
         *,
         row: Mapping[str, Any] | None = None,
+        direction_hints: Mapping[str, str] | None = None,
     ) -> bool:
         if not self._config.stage_2.require_unfavorable_evidence:
             return True
         metric_key = str(metric or "").lower()
         my_num = _coerce_float(my_value)
         opp_num = _coerce_float(opp_value)
+        direction = _resolve_direction(metric_key, lag_type, direction_hints)
         if lag_type == "rank":
-            if metric_key == "rank_leaf":
-                if my_num is None or opp_num is None:
-                    return False
-                return my_num > opp_num
-            if metric_key == "rank_pos_pct":
-                if my_num is None or opp_num is None:
-                    return False
-                return my_num < opp_num
+            if direction:
+                worse_flag = _compute_worse(direction, my_num, opp_num, self._direction_tolerance)
+                return bool(worse_flag)
         if lag_type == "content" and metric_key in {"image_cnt", "video_cnt", "content_score"}:
             if my_num is None or opp_num is None:
                 return False
@@ -2456,11 +2822,20 @@ class CompetitionLLMOrchestrator:
                     return False
                 if priority > 0:
                     return True
+            if direction:
+                worse_flag = _compute_worse(direction, my_num, opp_num, self._direction_tolerance)
+                if worse_flag is not None:
+                    return worse_flag
             if my_num is None or opp_num is None:
                 return False
             return my_num < opp_num
+        if direction:
+            worse_flag = _compute_worse(direction, my_num, opp_num, self._direction_tolerance)
+            if worse_flag is None:
+                return False
+            return worse_flag
         if my_num is None or opp_num is None:
-            return True
+            return False
         return True
 
     def _filter_unfavorable_rows(
@@ -2499,9 +2874,21 @@ class CompetitionLLMOrchestrator:
             return my_num is not None and opp_num is not None and my_num < opp_num
 
         if lag_type == "rank":
-            if _greater(row.get("my_rank_leaf"), row.get("opp_rank_leaf")):
+            worse_leaf = _compute_worse(
+                "lower_better",
+                row.get("my_rank_leaf"),
+                row.get("opp_rank_leaf"),
+                self._direction_tolerance,
+            )
+            if worse_leaf:
                 return True
-            return _less(row.get("my_rank_pos_pct"), row.get("opp_rank_pos_pct"))
+            worse_pct = _compute_worse(
+                "lower_better",
+                row.get("my_rank_pos_pct"),
+                row.get("opp_rank_pos_pct"),
+                self._direction_tolerance,
+            )
+            return bool(worse_pct)
         if lag_type == "content":
             return (
                 _less(row.get("my_image_cnt"), row.get("opp_image_cnt"))
@@ -2602,17 +2989,33 @@ class CompetitionLLMOrchestrator:
             return True
         return my_share_num < opp_share_num
 
-    def _normalise_evidence_sequence(self, items: Any) -> list[Mapping[str, Any]]:
+    def _normalise_evidence_sequence(
+        self,
+        items: Any,
+        *,
+        lag_type: str | None = None,
+        direction_hints: Mapping[str, str] | None = None,
+    ) -> list[Mapping[str, Any]]:
         if not isinstance(items, Sequence):
             return []
         result: list[Mapping[str, Any]] = []
         for item in items:
-            normalised = self._normalise_evidence_entry(item)
+            normalised = self._normalise_evidence_entry(
+                item,
+                lag_type=lag_type,
+                direction_hints=direction_hints,
+            )
             if normalised:
                 result.append(normalised)
         return result
 
-    def _normalise_evidence_entry(self, item: Any) -> Mapping[str, Any] | None:
+    def _normalise_evidence_entry(
+        self,
+        item: Any,
+        *,
+        lag_type: str | None = None,
+        direction_hints: Mapping[str, str] | None = None,
+    ) -> Mapping[str, Any] | None:
         if not isinstance(item, Mapping):
             return None
         metric = str(item.get("metric") or "").strip()
@@ -2649,6 +3052,17 @@ class CompetitionLLMOrchestrator:
         note = item.get("note")
         if note is not None:
             normalised["note"] = note
+        direction = _normalize_direction(item.get("direction"))
+        resolved_direction = direction or _resolve_direction(metric, lag_type, direction_hints)
+        normalised["direction"] = resolved_direction
+        delta_value = _compute_delta(my_value, opp_value)
+        normalised["delta"] = round(delta_value, 6) if delta_value is not None else None
+        if resolved_direction:
+            normalised["worse"] = _compute_worse(
+                resolved_direction, my_value, opp_value, self._direction_tolerance
+            )
+        else:
+            normalised["worse"] = None
         return normalised
 
     def _deduplicate_evidence(
@@ -2675,6 +3089,8 @@ class CompetitionLLMOrchestrator:
         lag_type: str | None,
         entries: Sequence[Mapping[str, Any]],
         lag_data: Mapping[str, Any] | None,
+        *,
+        direction_hints: Mapping[str, str] | None = None,
     ) -> list[Mapping[str, Any]]:
         if not entries:
             return []
@@ -2685,6 +3101,7 @@ class CompetitionLLMOrchestrator:
         row_lookup: Mapping[str, Mapping[str, Any]] = {}
         if isinstance(lag_data, Mapping):
             row_lookup = self._build_lag_row_lookup(lag_data.get("top_opps"))
+        hints = direction_hints or {}
 
         filtered: list[Mapping[str, Any]] = []
         for entry in entries:
@@ -2711,6 +3128,7 @@ class CompetitionLLMOrchestrator:
                 entry.get("my_value"),
                 entry.get("opp_value"),
                 row=row_context,
+                direction_hints=hints,
             ):
                 continue
             filtered.append(entry)
@@ -2764,7 +3182,9 @@ class CompetitionLLMOrchestrator:
             )
             raw_actions = []
 
-        allowed_actions = tuple(self._config.stage_2.allowed_action_codes or ())
+        allowed_actions_seq = self._config.stage_2.allowed_action_codes
+        enforce_actions = allowed_actions_seq is not None
+        allowed_actions = tuple(allowed_actions_seq or ())
         allowed_actions_set = {code for code in allowed_actions if code}
         cleaned_actions: list[dict[str, Any]] = []
         for index, action in enumerate(raw_actions):
@@ -2786,11 +3206,17 @@ class CompetitionLLMOrchestrator:
                     action,
                 )
                 continue
-            if allowed_actions_set and code not in allowed_actions_set:
-                LOGGER.debug(
-                    "competition_llm.stage2_drop_action_disallowed code=%s", code
-                )
-                continue
+            if enforce_actions:
+                if not allowed_actions_set:
+                    LOGGER.debug(
+                        "competition_llm.stage2_drop_action_disallowed code=%s", code
+                    )
+                    raise ValueError(f"Action code {code!r} is not permitted")
+                if code not in allowed_actions_set:
+                    LOGGER.debug(
+                        "competition_llm.stage2_drop_action_disallowed code=%s", code
+                    )
+                    raise ValueError(f"Action code {code!r} is not permitted")
             normalized = dict(action)
             normalized["code"] = code
             cleaned_actions.append(normalized)
@@ -2843,6 +3269,9 @@ class CompetitionLLMOrchestrator:
                 updated.pop("evidence_refs", None)
                 root_causes[index] = updated
 
+        if cleaned_actions:
+            diagnostics = mutable_payload.setdefault("diagnostics", {})
+            diagnostics["validated_actions"] = cleaned_actions
         mutable_payload["actions"] = []
         if "recommended_actions" in mutable_payload:
             mutable_payload["recommended_actions"] = []
@@ -3700,6 +4129,84 @@ def _extract_json_path(obj: Any, tokens: Sequence[str]) -> Any:
         else:
             return None
     return current
+
+
+def _normalize_direction(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    if cleaned in {"lower", "lower-better", "lower_better"}:
+        return "lower_better"
+    if cleaned in {"higher", "higher-better", "higher_better"}:
+        return "higher_better"
+    return None
+
+
+def _resolve_direction(
+    metric: str | None,
+    lag_type: str | None = None,
+    hints: Mapping[str, str] | None = None,
+) -> str | None:
+    if not metric:
+        return None
+    metric_key = str(metric).strip().lower()
+    if hints:
+        hint_value = hints.get(metric_key)
+        normalized_hint = _normalize_direction(hint_value)
+        if normalized_hint:
+            return normalized_hint
+    if metric_key in _METRIC_DIRECTION_MAP:
+        return _METRIC_DIRECTION_MAP[metric_key]
+    if lag_type and _normalize_lag_type(lag_type) == "rank":
+        if metric_key.startswith("rank_") or metric_key.endswith("_rank"):
+            return "lower_better"
+    return None
+
+
+def _normalise_direction_map(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, Mapping):
+        return {}
+    result: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        normalised = _normalize_direction(value)
+        if normalised:
+            result[key.strip().lower()] = normalised
+    return result
+
+
+def _compute_delta(my_value: Any, opp_value: Any) -> float | None:
+    my_num = _coerce_float(my_value)
+    opp_num = _coerce_float(opp_value)
+    if my_num is None or opp_num is None:
+        return None
+    return my_num - opp_num
+
+
+def _compute_worse(
+    direction: str, my_value: Any, opp_value: Any, tolerance: float
+) -> bool | None:
+    my_num = _coerce_float(my_value)
+    opp_num = _coerce_float(opp_value)
+    if my_num is None or opp_num is None:
+        return None
+    if direction == "lower_better":
+        return my_num > opp_num + tolerance
+    if direction == "higher_better":
+        return my_num < opp_num - tolerance
+    return None
+
+
+def _format_signed_value(value: Any) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "缺失"
+    if abs(number) < 1:
+        return f"{number:+.2%}"
+    if abs(number) >= 100 or number.is_integer():
+        return f"{number:+.0f}"
+    return f"{number:+.2f}"
 
 
 def _compute_pair_gap(my_value: Any, opp_value: Any) -> float:

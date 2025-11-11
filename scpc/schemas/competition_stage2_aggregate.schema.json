@@ -47,7 +47,13 @@
                 "source": { "type": ["string", "null"] },
                 "opp_asin": { "type": ["string", "null"] },
                 "opp_brand": { "type": ["string", "null"] },
-                "note": { "type": ["string", "null"] }
+                "note": { "type": ["string", "null"] },
+                "direction": {
+                  "type": ["string", "null"],
+                  "enum": ["lower_better", "higher_better", null]
+                },
+                "delta": { "type": ["number", "null"] },
+                "worse": { "type": ["boolean", "null"] }
               },
               "additionalProperties": false
             }

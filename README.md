@@ -97,6 +97,9 @@ python -m scpc.etl.scene_pipeline \
    - `compute_competition_features()` 将对比结果、评分、环比与 Top 对手整合为 `CompetitionFeatureResult`，供 LLM 第二层判因使用；
    - `pairs` 中的 `score_components`（页面规则结论）与 `traffic.scores/confidence`（流量规则结论）同时暴露给 LLM，实现页面 + 流量双维度复核；
    - 后续可按需要扩展到 `assemble_llm_packets()`、`create_llm_overview()` 等接口，为 LLM 提供落后洞察与证据包。
+6. **Stage-2 自校验**
+   - 聚合阶段在写库前调用 `_fix_directional_metrics()`，为排名类证据补齐 `direction/delta/worse` 字段，并统计 `stage2_rank_fix.total_causes/corrected_count/dropped_count`；
+   - 若所有 `rank_gap` 证据均显示我方不落后，则自动剔除该 root cause 并写日志 `competition_llm.stage2_rankgap_dropped_no_worse`，避免方向性错误进入最终 JSON/Markdown。
 
 ### 数据契约
 - **输入事实层**：页面与场景标签 (`bi_amz_asin_product_snapshot`、`bi_amz_asin_scene_tag`)；
