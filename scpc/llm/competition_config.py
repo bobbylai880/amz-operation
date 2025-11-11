@@ -33,6 +33,8 @@ class StageTwoConfig:
     min_reviews_for_rating_priority: int
     rating_margin: float
     always_include_metrics: Mapping[str, tuple[str, ...]]
+    rank_direction_fix_enabled: bool = False
+    direction_tolerance: float = 1e-6
 
 
 @dataclass(slots=True)
@@ -156,6 +158,14 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
                 deduped = tuple(dict.fromkeys(metric_values))
                 always_include[lag_type] = deduped
 
+    direction_tolerance_raw = stage2_raw.get("direction_tolerance", 1e-6)
+    try:
+        direction_tolerance = float(direction_tolerance_raw)
+    except (TypeError, ValueError):
+        direction_tolerance = 1e-6
+    if direction_tolerance < 0:
+        direction_tolerance = 0.0
+
     stage2 = StageTwoConfig(
         enabled=bool(stage2_raw.get("enabled", True)),
         aggregate_per_asin=bool(stage2_raw.get("aggregate_per_asin", True)),
@@ -168,6 +178,8 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         min_reviews_for_rating_priority=min_reviews,
         rating_margin=rating_margin,
         always_include_metrics=always_include,
+        rank_direction_fix_enabled=bool(stage2_raw.get("rank_direction_fix_enabled", False)),
+        direction_tolerance=direction_tolerance,
     )
 
     if not llm_raw.get("model"):

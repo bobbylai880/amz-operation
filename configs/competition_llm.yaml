@@ -22,7 +22,8 @@ stage_2:
     - neutral
     - parity
   max_retries: 2
-  allowed_action_codes: []
+  allowed_action_codes:
+    - price_adjust
   allowed_root_cause_codes:
     - pricing_misalignment
     - promo_gap
