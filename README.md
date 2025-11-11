@@ -263,6 +263,8 @@ python -m scpc.etl.competition_pipeline \
 
 CLI 会基于配置文件加载 Stage-1 阈值、Stage-2 动作白名单与 DeepSeek 连接参数，依次请求 `vw_amz_comp_llm_overview` 与 `vw_amz_comp_llm_overview_traffic`，完成所选阶段的诊断后把 Schema 校验通过的 JSON 及 Markdown 输出存入目标目录。每次向 LLM 发送请求前，系统会将实际使用的 Prompt+Facts 落盘到 `stage2/prompts/` 目录，便于复核与审计；运行日志会记录提示、重试和跳过原因（如缺失 `llm_packet`）。
 
+Stage-1 与 Stage-2 的持久化结果位于 `storage/competition_llm/<WEEK>/stage*/` 目录：Stage-1 保留 `B0XXXXXX_<opp>.json`（含上下文、维度列表）；Stage-2 仅输出 `B0XXXXXX_ALL.json` 主 JSON（包含 `machine_json` 与渲染好的差异 Markdown），不会再生成 `_summary.json` / `_summary.md` 附件，避免重复的人工摘要文件占用存储。
+
 ## 目录结构
 ```
 configs/                 # YAML 配置（调度、阈值等）
