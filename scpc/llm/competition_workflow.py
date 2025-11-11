@@ -147,6 +147,8 @@ _METRIC_DIRECTION_MAP: Mapping[str, str] = {
     "content_score": "higher_better",
 }
 
+_ABSOLUTE_RANK_METRICS: frozenset[str] = frozenset({"rank_leaf", "rank_root"})
+
 _ENTITY_DETAIL_FIELDS: tuple[str, ...] = (
     "price_current",
     "price_list",
@@ -2741,6 +2743,9 @@ class CompetitionLLMOrchestrator:
         opp_value = row.get(opp_key)
         if my_value in (None, "") or opp_value in (None, ""):
             return None
+        if _normalize_lag_type(lag_type) == "rank" and _is_absolute_rank_metric(suffix, lag_type):
+            if _is_missing_rank_value(my_value) or _is_missing_rank_value(opp_value):
+                return None
         always_include = self._metric_always_included(lag_type, suffix)
         if lag_type and not always_include and not self._is_unfavorable_metric(
             lag_type, suffix, my_value, opp_value, row=row
@@ -3029,6 +3034,9 @@ class CompetitionLLMOrchestrator:
         opp_value = item.get("opp_value")
         if my_value is None or opp_value is None:
             return None
+        if _is_absolute_rank_metric(metric, lag_type):
+            if _is_missing_rank_value(my_value) or _is_missing_rank_value(opp_value):
+                return None
         opp_asin = item.get("opp_asin")
         if against == "asin" and not opp_asin:
             return None
@@ -4161,6 +4169,31 @@ def _resolve_direction(
         if metric_key.startswith("rank_") or metric_key.endswith("_rank"):
             return "lower_better"
     return None
+
+
+def _is_absolute_rank_metric(metric: str | None, lag_type: str | None = None) -> bool:
+    if not metric:
+        return False
+    metric_key = str(metric).strip().lower()
+    if metric_key in _ABSOLUTE_RANK_METRICS:
+        return True
+    return False
+
+
+def _is_missing_rank_value(value: Any) -> bool:
+    if value in (None, ""):
+        return True
+    if isinstance(value, (int, float, Decimal)):
+        return float(value) <= 0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return True
+        try:
+            return float(stripped) <= 0
+        except ValueError:
+            return False
+    return False
 
 
 def _normalise_direction_map(raw: Any) -> dict[str, str]:

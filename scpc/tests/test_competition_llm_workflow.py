@@ -1781,6 +1781,58 @@ def test_materialize_evidence_drops_rank_overview_entries(sqlite_engine, tmp_pat
     assert {item["metric"] for item in evidence} == {"rank_leaf", "rank_pos_pct"}
 
 
+def test_materialize_evidence_skips_rank_when_opponent_missing(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    facts = {
+        "lag_items": [
+            {
+                "lag_type": "rank",
+                "top_opps": [
+                    {
+                        "opp_asin": "B0RANK0",
+                        "my_rank_leaf": 40,
+                        "opp_rank_leaf": 0,
+                    }
+                ],
+            }
+        ]
+    }
+    machine_json = {
+        "context": {"my_asin": "B05555"},
+        "lag_type": "rank",
+        "root_causes": [
+            {
+                "root_cause_code": "rank_gap",
+                "summary": "排名落后",
+                "priority": 1,
+                "evidence": [
+                    {
+                        "metric": "rank_leaf",
+                        "against": "asin",
+                        "my_value": 40,
+                        "opp_value": 0,
+                        "opp_asin": "B0RANK0",
+                        "source": "pairs_each",
+                    }
+                ],
+            }
+        ],
+        "actions": [],
+    }
+
+    result = orchestrator._materialize_evidence(machine_json, facts)
+
+    assert result["root_causes"] == []
+    assert result["lag_type"] == "none"
+
+
 def test_fix_directional_metrics_drops_when_no_worse(sqlite_engine, tmp_path):
     config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
     orchestrator = CompetitionLLMOrchestrator(
