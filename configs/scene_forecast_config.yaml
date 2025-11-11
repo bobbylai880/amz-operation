@@ -33,11 +33,11 @@ scene_forecast:
   # 五、输出与格式
   # -------------------------------
   output:
-    forecast_horizon_weeks: 4  # 预测未来几周
+    forecast_horizon_weeks: 5  # 预测未来几周
     history_window_weeks: 8    # 历史参考窗口（过去N周 + 去年±N周）
     pct_digits: 2              # 百分比保留小数位
     vol_digits: 2              # 数量保留小数位
-    wow_digits: 6              # WoW中位数精度
+    wow_digits: 8              # WoW中位数精度
     max_top_keywords: 10        # TopN 关键词上限（>=1）
 
   # -------------------------------
