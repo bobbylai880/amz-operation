@@ -34,6 +34,8 @@ from scpc.etl.competition_features import (
 
 LOGGER = logging.getLogger(__name__)
 
+ISO_WEEK_PATTERN = re.compile(r"(\d{4})-?W(\d{1,2})")
+
 
 SNAPSHOT_SQL = """
 SELECT asin, marketplace_id, week, sunday, parent_asin,
@@ -42,7 +44,7 @@ SELECT asin, marketplace_id, week, sunday, parent_asin,
        image_cnt, video_cnt, bullet_cnt, title_len,
        aplus_flag, badge_json
 FROM bi_amz_asin_product_snapshot
-WHERE marketplace_id = :mk AND week = :week
+WHERE marketplace_id = :mk AND week IN (:week, :week_hyphen)
 """
 
 LATEST_SNAPSHOT_WEEK_SQL = """
@@ -132,14 +134,14 @@ WHERE is_active = 1
 """
 
 
-def _iso_week_to_dates(week: str) -> tuple[date, date]:
-    """Return the Monday and Sunday for an ISO formatted ``YYYYWww`` label."""
+def _canonical_week_label(week: str | None) -> str:
+    """Return the canonical ``YYYYWww`` representation for ``week``."""
 
-    if not week:
-        raise ValueError(f"Invalid ISO week label: {week}")
+    if week is None:
+        raise ValueError("Week label cannot be None")
 
-    normalized = week.strip()
-    match = re.fullmatch(r"(\d{4})-?W(\d{1,2})", normalized)
+    normalized = str(week).strip()
+    match = ISO_WEEK_PATTERN.fullmatch(normalized)
     if not match:
         raise ValueError(f"Invalid ISO week label: {week}")
 
@@ -147,6 +149,24 @@ def _iso_week_to_dates(week: str) -> tuple[date, date]:
     week_num = int(match.group(2))
     if week_num < 1 or week_num > 53:
         raise ValueError(f"Invalid ISO week label: {week}")
+
+    return f"{year}W{week_num:02d}"
+
+
+def _hyphenated_week_label(week: str) -> str:
+    """Return the ``YYYY-Www`` representation for ``week``."""
+
+    canonical = _canonical_week_label(week)
+    return f"{canonical[:4]}-W{canonical[5:]}"
+
+
+def _iso_week_to_dates(week: str) -> tuple[date, date]:
+    """Return the Monday and Sunday for an ISO formatted ``YYYYWww`` label."""
+
+    label = _canonical_week_label(week)
+
+    year = int(label[:4])
+    week_num = int(label[5:])
 
     monday = date.fromisocalendar(year, week_num, 1)
     sunday = monday + timedelta(days=6)
@@ -520,7 +540,7 @@ def _latest_week_with_pairs(engine: Engine, marketplace_id: str) -> str | None:
         week_value = row["week"]
     except (TypeError, KeyError):  # pragma: no cover - compatibility fallback
         week_value = row[0] if row else None
-    return str(week_value) if week_value else None
+    return _canonical_week_label(str(week_value)) if week_value else None
 
 
 def _load_feature_slice(
@@ -686,12 +706,18 @@ def _run_compare_checks(
 def _run_post_write_checks(engine: Engine, marketplace_id: str, week: str) -> None:
     """Execute verification queries to confirm rows exist for the target slice."""
 
+    _, sunday = _iso_week_to_dates(week)
+
     commands = [
         (
             ENTITIES_TABLE,
             text(
                 f"SELECT COUNT(*) AS row_count FROM {ENTITIES_TABLE} "
                 "WHERE marketplace_id = :mk AND week = :week"
+            ),
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {ENTITIES_TABLE} "
+                "WHERE marketplace_id = :mk AND sunday = :sunday"
             ),
         ),
         (
@@ -700,11 +726,17 @@ def _run_post_write_checks(engine: Engine, marketplace_id: str, week: str) -> No
                 f"SELECT COUNT(*) AS row_count FROM {TRAFFIC_TABLE} "
                 "WHERE marketplace_id = :mk AND week = :week"
             ),
+            text(
+                f"SELECT COUNT(*) AS row_count FROM {TRAFFIC_TABLE} "
+                "WHERE marketplace_id = :mk AND sunday = :sunday"
+            ),
         ),
     ]
 
+    coverage_counts: dict[str, dict[str, int]] = {}
+
     with engine.connect() as conn:
-        for idx, (table, stmt) in enumerate(commands, start=1):
+        for idx, (table, stmt, sunday_stmt) in enumerate(commands, start=1):
             command_preview = (
                 f"SELECT COUNT(*) AS row_count FROM {table} "
                 "WHERE marketplace_id = :mk AND week = :week"
@@ -716,15 +748,75 @@ def _run_post_write_checks(engine: Engine, marketplace_id: str, week: str) -> No
                 command_preview,
             )
             result = conn.execute(stmt, {"mk": marketplace_id, "week": week})
-            row_count = result.scalar() or 0
-            status = "ok" if row_count > 0 else "empty"
-            log_fn = LOGGER.info if row_count > 0 else LOGGER.warning
+            row_count = int(result.scalar() or 0)
+
+            sunday_count: int | None = None
+            sunday_preview = (
+                f"SELECT COUNT(*) AS row_count FROM {table} "
+                "WHERE marketplace_id = :mk AND sunday = :sunday"
+            )
+            LOGGER.info(
+                "competition_pipeline_check_step_sunday step=%d table=%s command=%s",
+                idx,
+                table,
+                sunday_preview,
+            )
+            try:
+                sunday_result = conn.execute(
+                    sunday_stmt, {"mk": marketplace_id, "sunday": sunday}
+                )
+                sunday_count = int(sunday_result.scalar() or 0)
+            except SQLAlchemyError as exc:  # pragma: no cover - schema variance guard
+                LOGGER.warning(
+                    "competition_pipeline_check_sunday_failed step=%d table=%s week=%s error=%s",
+                    idx,
+                    table,
+                    week,
+                    exc,
+                )
+                sunday_count = None
+
+            coverage_counts[table] = {
+                "week": row_count,
+                "sunday": sunday_count or 0,
+            }
+
+            max_count = max(row_count, sunday_count or 0)
+            status = "ok" if max_count > 0 else "empty"
+            log_fn = LOGGER.info if max_count > 0 else LOGGER.warning
             log_fn(
-                "competition_pipeline_check_result step=%d table=%s row_count=%d status=%s",
+                "competition_pipeline_check_result step=%d table=%s week_rows=%d sunday_rows=%s status=%s",
                 idx,
                 table,
                 row_count,
+                sunday_count if sunday_count is not None else "n/a",
                 status,
+            )
+
+    entity_counts = coverage_counts.get(ENTITIES_TABLE, {"week": 0, "sunday": 0})
+    traffic_counts = coverage_counts.get(TRAFFIC_TABLE, {"week": 0, "sunday": 0})
+    entity_rows = max(entity_counts.get("week", 0), entity_counts.get("sunday", 0))
+    traffic_rows = max(traffic_counts.get("week", 0), traffic_counts.get("sunday", 0))
+
+    if entity_rows > 0:
+        coverage_ratio = traffic_rows / entity_rows if entity_rows else 0.0
+        if traffic_rows < 0.5 * entity_rows:
+            LOGGER.warning(
+                "competition_pipeline_traffic_coverage_low week=%s mk=%s entity_rows=%d traffic_rows=%d coverage_ratio=%.3f",
+                week,
+                marketplace_id,
+                entity_rows,
+                traffic_rows,
+                coverage_ratio,
+            )
+        else:
+            LOGGER.info(
+                "competition_pipeline_traffic_coverage_ok week=%s mk=%s entity_rows=%d traffic_rows=%d coverage_ratio=%.3f",
+                week,
+                marketplace_id,
+                entity_rows,
+                traffic_rows,
+                coverage_ratio,
             )
 
 
@@ -742,6 +834,8 @@ def run_competition_pipeline(
     engine = engine or create_doris_engine()
 
     resolved_week = week
+    if resolved_week:
+        resolved_week = _canonical_week_label(resolved_week)
     if not resolved_week:
         resolved_week = _latest_week_with_data(engine, marketplace_id)
         LOGGER.info(
@@ -760,10 +854,18 @@ def run_competition_pipeline(
     )
 
     snapshot_df = _read_dataframe(
-        engine, SNAPSHOT_SQL, {"mk": marketplace_id, "week": resolved_week}
+        engine,
+        SNAPSHOT_SQL,
+        {
+            "mk": marketplace_id,
+            "week": resolved_week,
+            "week_hyphen": _hyphenated_week_label(resolved_week),
+        },
     )
     if "discount_rate" not in snapshot_df.columns:
         snapshot_df["discount_rate"] = pd.NA
+    if "week" in snapshot_df.columns:
+        snapshot_df["week"] = resolved_week
     LOGGER.info(
         "competition_pipeline_snapshots_fetched week=%s rows=%d",
         resolved_week,
@@ -934,6 +1036,26 @@ def run_competition_pipeline(
         len(entities),
         len(traffic_entities),
     )
+    if len(entities) > 0:
+        coverage_ratio = len(traffic_entities) / len(entities)
+        if len(traffic_entities) < 0.5 * len(entities):
+            LOGGER.warning(
+                "competition_pipeline_traffic_coverage_gap week=%s mk=%s entity_rows=%d traffic_rows=%d coverage_ratio=%.3f",
+                resolved_week,
+                marketplace_id,
+                len(entities),
+                len(traffic_entities),
+                coverage_ratio,
+            )
+        else:
+            LOGGER.info(
+                "competition_pipeline_traffic_coverage_snapshot week=%s mk=%s entity_rows=%d traffic_rows=%d coverage_ratio=%.3f",
+                resolved_week,
+                marketplace_id,
+                len(entities),
+                len(traffic_entities),
+                coverage_ratio,
+            )
 
     if write:
         ent_written = replace_into(engine, ENTITIES_TABLE, entities, chunk_size=chunk_size)
@@ -969,6 +1091,11 @@ def run_competition_compare_pipeline(
     """Build competition compare tables from precomputed features and optionally persist them."""
 
     engine = engine or create_doris_engine()
+
+    week = _canonical_week_label(week)
+    previous_week = (
+        _canonical_week_label(previous_week) if previous_week is not None else None
+    )
 
     target_weeks: set[str] = {week}
     if previous_week:
@@ -1089,7 +1216,7 @@ def _latest_week_with_data(engine: Engine, marketplace_id: str) -> str:
         message = f"Latest snapshot query returned empty week for marketplace={marketplace_id}"
         LOGGER.error("competition_pipeline_week_auto_empty %s", message)
         raise RuntimeError(message)
-    return str(week_value)
+    return _canonical_week_label(str(week_value))
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1181,7 +1308,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     log_dir = Path(os.getenv("SCPC_LOG_DIR", "storage/logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    log_week = args.week or "auto"
+    if args.week:
+        try:
+            log_week = _canonical_week_label(args.week)
+        except ValueError:
+            log_week = args.week.replace("-", "")
+    else:
+        log_week = "auto"
     logfile = log_dir / f"competition_pipeline_{log_week}_{args.mk}_{timestamp}.log"
     file_handler = logging.FileHandler(logfile)
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
@@ -1197,7 +1330,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         if with_llm:
             with_compare = True
 
-        resolved_week = args.week
+        resolved_week = None
+        if args.week:
+            try:
+                resolved_week = _canonical_week_label(args.week)
+            except ValueError as exc:
+                LOGGER.error(
+                    "competition_pipeline_invalid_week week=%s error=%s",
+                    args.week,
+                    exc,
+                )
+                raise SystemExit(2) from exc
 
         if not resolved_week:
             if compare_only:
@@ -1216,7 +1359,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                     resolved_week,
                 )
 
-        previous_week = args.previous_week
+        previous_week = None
+        if args.previous_week:
+            try:
+                previous_week = _canonical_week_label(args.previous_week)
+            except ValueError as exc:
+                LOGGER.error(
+                    "competition_pipeline_invalid_previous_week week=%s error=%s",
+                    args.previous_week,
+                    exc,
+                )
+                raise SystemExit(2) from exc
         if with_compare and not previous_week:
             try:
                 previous_week = _previous_week_label(resolved_week)
@@ -1319,6 +1472,7 @@ __all__ = [
     "run_competition_compare_pipeline",
     "_prepare_traffic_entities",
     "_normalise_flow_dataframe",
+    "_canonical_week_label",
     "_iso_week_to_dates",
     "_previous_week_label",
     "_latest_week_with_data",
