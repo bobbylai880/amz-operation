@@ -1885,7 +1885,12 @@ def test_fix_directional_metrics_drops_when_no_worse(sqlite_engine, tmp_path):
     assert machine_json["root_causes"] == []
     assert machine_json["lag_type"] == "none"
     diag = machine_json.get("diagnostics", {}).get("stage2_rank_fix")
-    assert diag == {"total_causes": 1, "corrected_count": 0, "dropped_count": 1}
+    assert diag == {
+        "total_causes": 1,
+        "corrected_count": 0,
+        "dropped_count": 1,
+        "dropped_evidence_count": 0,
+    }
 
 
 def test_fix_directional_metrics_corrects_summary_and_metadata(sqlite_engine, tmp_path):
@@ -1947,7 +1952,91 @@ def test_fix_directional_metrics_corrects_summary_and_metadata(sqlite_engine, tm
     assert evidence["worse"] is True
     assert evidence["delta"] == pytest.approx(0.2123, rel=1e-6)
     diag = machine_json.get("diagnostics", {}).get("stage2_rank_fix")
-    assert diag == {"total_causes": 1, "corrected_count": 1, "dropped_count": 0}
+    assert diag == {
+        "total_causes": 1,
+        "corrected_count": 1,
+        "dropped_count": 0,
+        "dropped_evidence_count": 0,
+    }
+
+
+def test_fix_directional_metrics_drops_invalid_rank_evidence(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    machine_json = {
+        "context": {"my_asin": "B0TEST3"},
+        "lag_type": "rank",
+        "root_causes": [
+            {
+                "root_cause_code": "rank_gap",
+                "summary": "类目排名百分位低于头部对手",
+                "priority": 1,
+                "evidence": [
+                    {
+                        "metric": "rank_pos_pct",
+                        "against": "asin",
+                        "my_value": 0.75,
+                        "opp_value": 0.0,
+                        "opp_asin": "B0ZERO",
+                    },
+                    {
+                        "metric": "rank_pos_pct",
+                        "against": "asin",
+                        "my_value": 0.88,
+                        "opp_value": 0.7,
+                        "opp_asin": "B0OPPV",
+                        "unit": "pct",
+                    },
+                ],
+            }
+        ],
+        "actions": [],
+    }
+    facts = {
+        "lag_items": [
+            {
+                "lag_type": "rank",
+                "metric_directions": {"rank_pos_pct": "lower_better"},
+                "top_opps": [
+                    {
+                        "opp_asin": "B0ZERO",
+                        "my_rank_pos_pct": 0.75,
+                        "opp_rank_pos_pct": 0.0,
+                    },
+                    {
+                        "opp_asin": "B0OPPV",
+                        "my_rank_pos_pct": 0.88,
+                        "opp_rank_pos_pct": 0.7,
+                    },
+                ],
+            }
+        ]
+    }
+
+    orchestrator._fix_directional_metrics(machine_json, facts=facts)
+
+    assert machine_json["root_causes"]
+    cause = machine_json["root_causes"][0]
+    evidence = cause["evidence"]
+    assert len(evidence) == 1
+    record = evidence[0]
+    assert record["opp_asin"] == "B0OPPV"
+    assert record["direction"] == "lower_better"
+    assert record["worse"] is True
+    assert record["delta"] == pytest.approx(0.18, rel=1e-6)
+    diag = machine_json.get("diagnostics", {}).get("stage2_rank_fix")
+    assert diag == {
+        "total_causes": 1,
+        "corrected_count": 1,
+        "dropped_count": 0,
+        "dropped_evidence_count": 1,
+    }
 
 
 def test_materialize_evidence_social_priority_filters_evidence(sqlite_engine, tmp_path):

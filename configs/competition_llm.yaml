@@ -16,6 +16,7 @@ stage_1:
   rules_config_path: "configs/competition_lag_rules.yaml"
 stage_2:
   enabled: true
+  rank_direction_fix_enabled: true
   trigger_status:
     - lag
     - lead

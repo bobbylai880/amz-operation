@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 from collections import defaultdict
@@ -493,7 +494,12 @@ class CompetitionLLMOrchestrator:
         self._direction_tolerance = tolerance_value if tolerance_value is not None else _DEFAULT_DIRECTION_TOLERANCE
         if self._direction_tolerance < 0:
             self._direction_tolerance = 0.0
-        self._rank_fix_counters: dict[str, int] = {"total": 0, "corrected": 0, "dropped": 0}
+        self._rank_fix_counters: dict[str, int] = {
+            "total": 0,
+            "corrected": 0,
+            "dropped": 0,
+            "evidence_dropped": 0,
+        }
 
     def run(
         self,
@@ -2096,6 +2102,7 @@ class CompetitionLLMOrchestrator:
         total = 0
         corrected = 0
         dropped = 0
+        dropped_evidence_total = 0
         updated_causes: list[Mapping[str, Any]] = []
 
         for cause in root_causes:
@@ -2120,22 +2127,86 @@ class CompetitionLLMOrchestrator:
                 lag_type=lag_type,
                 direction_hints=direction_hints,
             )
-            any_worse = any(item.get("worse") is True for item in evidence_items)
+            local_dropped_evidence = 0
+            evidence_changed = False
+            cleaned_evidence: list[Mapping[str, Any]] = []
+            for item in evidence_items:
+                if not isinstance(item, Mapping):
+                    continue
+                metric_name = str(item.get("metric") or "").strip().lower()
+                against = str(item.get("against") or "").strip().lower()
+                my_value = item.get("my_value")
+                opp_value = item.get("opp_value")
+                if against == "asin" and _is_rank_metric(metric_name):
+                    if _is_invalid_rank_value(my_value) or _is_invalid_rank_value(opp_value):
+                        local_dropped_evidence += 1
+                        evidence_changed = True
+                        LOGGER.debug(
+                            "competition_llm.stage2_drop_rank_evidence_missing metric=%s my_value=%s opp_value=%s",
+                            metric_name,
+                            my_value,
+                            opp_value,
+                        )
+                        continue
+
+                updated_item = dict(item)
+                direction_value = _normalize_direction(updated_item.get("direction"))
+                resolved_direction = direction_value or _resolve_direction(
+                    metric_name, lag_type, direction_hints
+                )
+                if resolved_direction != updated_item.get("direction"):
+                    updated_item["direction"] = resolved_direction
+                    evidence_changed = True
+
+                delta_value = _compute_delta(my_value, opp_value)
+                new_delta = round(delta_value, 6) if delta_value is not None else None
+                if new_delta != updated_item.get("delta"):
+                    updated_item["delta"] = new_delta
+                    evidence_changed = True
+
+                if resolved_direction:
+                    new_worse = _compute_worse(
+                        resolved_direction, my_value, opp_value, self._direction_tolerance
+                    )
+                else:
+                    new_worse = None
+                if new_worse != updated_item.get("worse"):
+                    updated_item["worse"] = new_worse
+                    evidence_changed = True
+
+                cleaned_evidence.append(updated_item)
+
+            dropped_evidence_total += local_dropped_evidence
+
+            if not cleaned_evidence:
+                LOGGER.info(
+                    "competition_llm.stage2_rankgap_dropped_no_evidence summary=%s",
+                    cause.get("summary"),
+                )
+                dropped += 1
+                continue
+
+            any_worse = any(item.get("worse") is True for item in cleaned_evidence)
             if not any_worse:
                 LOGGER.info(
                     "competition_llm.stage2_rankgap_dropped_no_worse summary=%s opp_asins=%s",
                     cause.get("summary"),
-                    [item.get("opp_asin") for item in evidence_items if item.get("opp_asin")],
+                    [item.get("opp_asin") for item in cleaned_evidence if item.get("opp_asin")],
                 )
                 dropped += 1
                 continue
 
             summary_before = str(cause.get("summary") or "").strip()
             summary_after = self._rewrite_rank_summary(summary_before, lag_type)
-            did_correct = need_metadata_fix or summary_after != summary_before
+            did_correct = (
+                need_metadata_fix
+                or summary_after != summary_before
+                or evidence_changed
+                or local_dropped_evidence > 0
+            )
 
             updated_cause = dict(cause)
-            updated_cause["evidence"] = evidence_items
+            updated_cause["evidence"] = cleaned_evidence
             if summary_after != summary_before:
                 updated_cause["summary"] = summary_after
             updated_causes.append(updated_cause)
@@ -2143,10 +2214,11 @@ class CompetitionLLMOrchestrator:
             if did_correct:
                 corrected += 1
                 LOGGER.info(
-                    "competition_llm.stage2_direction_fixed summary_before=%s summary_after=%s metadata_fix=%s",
+                    "competition_llm.stage2_direction_fixed summary_before=%s summary_after=%s metadata_fix=%s evidence_changed=%s",
                     summary_before,
                     summary_after,
                     need_metadata_fix,
+                    evidence_changed or local_dropped_evidence > 0,
                 )
 
         if total:
@@ -2157,16 +2229,19 @@ class CompetitionLLMOrchestrator:
                     "total_causes": total,
                     "corrected_count": corrected,
                     "dropped_count": dropped,
+                    "dropped_evidence_count": dropped_evidence_total,
                 }
             )
             self._rank_fix_counters["total"] += total
             self._rank_fix_counters["corrected"] += corrected
             self._rank_fix_counters["dropped"] += dropped
+            self._rank_fix_counters["evidence_dropped"] += dropped_evidence_total
             LOGGER.info(
-                "stage2_rank_fix.metrics total_causes=%s corrected_count=%s dropped_count=%s",
+                "stage2_rank_fix.metrics total_causes=%s corrected_count=%s dropped_count=%s dropped_evidence_count=%s",
                 total,
                 corrected,
                 dropped,
+                dropped_evidence_total,
             )
 
         if updated_causes:
@@ -2744,7 +2819,7 @@ class CompetitionLLMOrchestrator:
         if my_value in (None, "") or opp_value in (None, ""):
             return None
         if _normalize_lag_type(lag_type) == "rank" and _is_absolute_rank_metric(suffix, lag_type):
-            if _is_missing_rank_value(my_value) or _is_missing_rank_value(opp_value):
+            if _is_invalid_rank_value(my_value) or _is_invalid_rank_value(opp_value):
                 return None
         always_include = self._metric_always_included(lag_type, suffix)
         if lag_type and not always_include and not self._is_unfavorable_metric(
@@ -3035,7 +3110,7 @@ class CompetitionLLMOrchestrator:
         if my_value is None or opp_value is None:
             return None
         if _is_absolute_rank_metric(metric, lag_type):
-            if _is_missing_rank_value(my_value) or _is_missing_rank_value(opp_value):
+            if _is_invalid_rank_value(my_value) or _is_invalid_rank_value(opp_value):
                 return None
         opp_asin = item.get("opp_asin")
         if against == "asin" and not opp_asin:
@@ -4180,20 +4255,48 @@ def _is_absolute_rank_metric(metric: str | None, lag_type: str | None = None) ->
     return False
 
 
-def _is_missing_rank_value(value: Any) -> bool:
+def _is_rank_metric(metric: str | None) -> bool:
+    if not metric:
+        return False
+    metric_key = str(metric).strip().lower()
+    if metric_key == "rank":
+        return True
+    if metric_key.startswith("rank_"):
+        return True
+    if metric_key.endswith("_rank"):
+        return True
+    return False
+
+
+def _is_invalid_rank_value(value: Any) -> bool:
     if value in (None, ""):
         return True
     if isinstance(value, (int, float, Decimal)):
-        return float(value) <= 0
+        if isinstance(value, Decimal):
+            if value.is_nan():
+                return True
+            numeric = float(value)
+        else:
+            numeric = float(value)
+        if math.isnan(numeric):
+            return True
+        return numeric <= 0
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
             return True
         try:
-            return float(stripped) <= 0
+            numeric = float(stripped)
         except ValueError:
             return False
+        if math.isnan(numeric):
+            return True
+        return numeric <= 0
     return False
+
+
+def _is_missing_rank_value(value: Any) -> bool:
+    return _is_invalid_rank_value(value)
 
 
 def _normalise_direction_map(raw: Any) -> dict[str, str]:
