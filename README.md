@@ -97,6 +97,9 @@ python -m scpc.etl.scene_pipeline \
    - `compute_competition_features()` 将对比结果、评分、环比与 Top 对手整合为 `CompetitionFeatureResult`，供 LLM 第二层判因使用；
    - `pairs` 中的 `score_components`（页面规则结论）与 `traffic.scores/confidence`（流量规则结论）同时暴露给 LLM，实现页面 + 流量双维度复核；
    - 后续可按需要扩展到 `assemble_llm_packets()`、`create_llm_overview()` 等接口，为 LLM 提供落后洞察与证据包。
+6. **Stage-2 自校验**
+   - 聚合阶段在写库前调用 `_fix_directional_metrics()`，为排名类证据补齐 `direction/delta/worse` 字段，并统计 `stage2_rank_fix.total_causes/corrected_count/dropped_count`；
+   - 若所有 `rank_gap` 证据均显示我方不落后，则自动剔除该 root cause 并写日志 `competition_llm.stage2_rankgap_dropped_no_worse`，避免方向性错误进入最终 JSON/Markdown。
 
 ### 数据契约
 - **输入事实层**：页面与场景标签 (`bi_amz_asin_product_snapshot`、`bi_amz_asin_scene_tag`)；
@@ -262,6 +265,8 @@ python -m scpc.etl.competition_pipeline \
 ```
 
 CLI 会基于配置文件加载 Stage-1 阈值、Stage-2 动作白名单与 DeepSeek 连接参数，依次请求 `vw_amz_comp_llm_overview` 与 `vw_amz_comp_llm_overview_traffic`，完成所选阶段的诊断后把 Schema 校验通过的 JSON 及 Markdown 输出存入目标目录。每次向 LLM 发送请求前，系统会将实际使用的 Prompt+Facts 落盘到 `stage2/prompts/` 目录，便于复核与审计；运行日志会记录提示、重试和跳过原因（如缺失 `llm_packet`）。
+
+Stage-1 与 Stage-2 的持久化结果位于 `storage/competition_llm/<WEEK>/stage*/` 目录：Stage-1 保留 `B0XXXXXX_<opp>.json`（含上下文、维度列表）；Stage-2 仅输出 `B0XXXXXX_ALL.json` 主 JSON（包含 `machine_json` 与渲染好的差异 Markdown），不会再生成 `_summary.json` / `_summary.md` 附件，避免重复的人工摘要文件占用存储。
 
 ## 目录结构
 ```

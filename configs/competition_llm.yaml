@@ -16,13 +16,15 @@ stage_1:
   rules_config_path: "configs/competition_lag_rules.yaml"
 stage_2:
   enabled: true
+  rank_direction_fix_enabled: true
   trigger_status:
     - lag
     - lead
     - neutral
     - parity
   max_retries: 2
-  allowed_action_codes: []
+  allowed_action_codes:
+    - price_adjust
   allowed_root_cause_codes:
     - pricing_misalignment
     - promo_gap
