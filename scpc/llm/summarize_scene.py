@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 logger = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT_TEMPLATE = """你是一位资深亚马逊跨境电商总监，负责场景级定性诊断。\n严格遵守：\n1. 仅基于输入 JSON，禁止引入额外数据或假设。\n2. 输出必须使用中文，并严格匹配 response_schema。\n3. 在 analysis_summary 中，用不超过400字的中文给出整体判断与关键原因，并引用至少两个具体指标数值作为依据（例如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）。\n4. 若数据覆盖不足，则设置 insufficient_data=true，并在 notes 中用简短中文说明原因。\n5. 所有事实数据（逐周时序、环比/同比、TopN 关键词、预测结果）均由系统拼接，禁止在输出中创建 scene_forecast、top_keywords_forecast 或其他明细字段；预测规则如下（供理解趋势，勿在输出中直接填报预测字段）：\n   • 本年最近{history_window}周 WoW 中位数 = 短期趋势项 r。\n   • 去年“过去{history_window}周 + 未来{history_window}周”体量计算季节先验：s[h] = (LY_future_window[h].vol / LY_pivot.vol) - 1。\n   • 组合增速：w[h] = α * r + (1-α) * s[h]，默认 α=0.6，可由 blend_weights 覆盖。\n   • 逐周滚动：pred[0] = 当前最后一周 vol；pred[h] = pred[h-1] * (1 + w[h])。\n   • 方向阈值：pct_change ≥ +1% → up；≤ −1% → down；其余 flat，pct_change 对“最后观测周”计算并保留1位小数。\n   • 关键词预测与场景同法、独立计算。\n"""
+SYSTEM_PROMPT_TEMPLATE = """你是一位资深亚马逊跨境电商总监，负责场景级定性诊断。\n严格遵守：\n1. 仅基于输入 JSON，禁止引入额外数据或假设。\n2. 输出必须使用中文，并严格匹配 response_schema。\n3. 在 analysis_summary 中，用不超过400字的中文给出整体判断与关键原因，并引用至少两个具体指标数值作为依据（例如最新周 vol、wow、yoy、关键词贡献或预测 pct_change）。\n4. 若数据覆盖不足，则设置 insufficient_data=true，并在 notes 中用简短中文说明原因。\n5. 所有事实数据（逐周时序、环比/同比、TopN 关键词、预测结果）均由系统拼接，禁止在输出中创建 scene_forecast、top_keywords_forecast 或其他明细字段；预测规则如下（供理解趋势，勿在输出中直接填报预测字段）：\n   • 本年最近{history_window}周 WoW 中位数 = 短期趋势项 r。\n   • 去年“过去{history_window}周 + 未来{history_window}周”体量计算季节先验：s[h] = (LY_future_window[h].vol / LY_pivot.vol) - 1。\n   • 组合增速：w[h] = α * r + (1-α) * s[h]，默认 α=0.6，可由 blend_weights 覆盖。\n   • 逐周滚动：pred[0] = 当前最后一周 vol；pred[h] = pred[h-1] * (1 + w[h])。\n   • 方向阈值：pct_change ≥ +1% → up；≤ −1% → down；其余 flat，pct_change 对“最后观测周”计算并保留1位小数。\n   • 关键词预测与场景同法、独立计算。\n若场景预测方向与关键词预测方向不一致（如场景上升但关键词普遍下降），必须在 analysis_summary 中解释差异原因。说明可包括：\n1. 场景预测受整体时间序列或季节性修正主导；\n2. 关键词权重或贡献差异导致聚合偏离；\n3. 高权重关键词或季节项抵消短期下跌。该解释应自然融入 summary，不超过100字。\n"""
 
 
 def _build_system_prompt(history_window: int) -> str:
@@ -862,6 +863,8 @@ def _build_scene_summary_payload(
     forecast_guidance: Mapping[str, Any],
     analysis_evidence: Mapping[str, Any],
     quality_notes: str | None = None,
+    diff_flag: bool | None = None,
+    diff_hint: str | None = None,
 ) -> SceneSummaryPayload:
     facts = {
         "scene": scene,
@@ -884,6 +887,10 @@ def _build_scene_summary_payload(
     }
     if quality_notes:
         facts["quality_notes"] = quality_notes
+    if diff_flag is not None:
+        facts["diff_flag"] = bool(diff_flag)
+    if diff_hint:
+        facts["diff_hint"] = diff_hint
     system_prompt = _build_system_prompt(history_window)
     messages = [
         {"role": "system", "content": system_prompt},
@@ -917,6 +924,72 @@ def _extract_forecast_weeks(entries: Any) -> list[dict[str, Any]]:
         }
         weeks.append(week)
     return weeks
+
+
+def _latest_direction_from_weeks(entries: Sequence[Mapping[str, Any]] | None) -> str | None:
+    if not entries:
+        return None
+    for item in reversed(entries):
+        direction = item.get("direction") if isinstance(item, Mapping) else None
+        if isinstance(direction, str) and direction in {"up", "down", "flat"}:
+            return direction
+    return None
+
+
+def _majority_keyword_direction(
+    keyword_entries: Sequence[Mapping[str, Any]] | None,
+) -> str | None:
+    if not keyword_entries:
+        return None
+    directions: list[str] = []
+    for entry in keyword_entries:
+        if not isinstance(entry, Mapping):
+            continue
+        weeks = entry.get("forecast_weeks")
+        direction = None
+        if isinstance(weeks, Sequence):
+            direction = _latest_direction_from_weeks(weeks)
+        if direction:
+            directions.append(direction)
+    if not directions:
+        return None
+    counts = Counter(directions)
+    majority_direction, majority_count = max(counts.items(), key=lambda item: item[1])
+    share = majority_count / len(directions)
+    if share > 0.5:
+        return majority_direction
+    return None
+
+
+def _direction_to_text(direction: str | None) -> str:
+    mapping = {"up": "上升", "down": "下降", "flat": "持平"}
+    if isinstance(direction, str):
+        return mapping.get(direction, direction)
+    return "不确定"
+
+
+def _build_direction_diff_hint(
+    forecast_guidance: Mapping[str, Any] | None,
+) -> tuple[bool, str | None]:
+    if not isinstance(forecast_guidance, Mapping):
+        return False, None
+    scene_guidance = forecast_guidance.get("scene")
+    if not isinstance(scene_guidance, Mapping):
+        return False, None
+    scene_weeks = scene_guidance.get("forecast_weeks")
+    scene_direction = _latest_direction_from_weeks(scene_weeks if isinstance(scene_weeks, Sequence) else [])
+    keyword_entries = forecast_guidance.get("keywords")
+    keyword_direction = _majority_keyword_direction(
+        keyword_entries if isinstance(keyword_entries, Sequence) else []
+    )
+    if (
+        scene_direction
+        and keyword_direction
+        and scene_direction != keyword_direction
+    ):
+        hint = f"场景预测{_direction_to_text(scene_direction)}但多数关键词预测{_direction_to_text(keyword_direction)}"
+        return True, hint[:100]
+    return False, None
 
 
 def _attach_programmatic_forecasts(
@@ -1203,6 +1276,7 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
         vol_digits=vol_digits,
         wow_digits=wow_digits,
     )
+    diff_flag, diff_hint = _build_direction_diff_hint(forecast_guidance)
     payload = _build_scene_summary_payload(
         scene,
         mk,
@@ -1219,6 +1293,8 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
         forecast_guidance=forecast_guidance,
         analysis_evidence=analysis_evidence,
         quality_notes=quality_notes,
+        diff_flag=diff_flag,
+        diff_hint=diff_hint,
     )
     system_prompt = payload.messages[0]["content"] if payload.messages else _build_system_prompt(history_window)
     schema = _load_schema(max_top_keywords=effective_topn)

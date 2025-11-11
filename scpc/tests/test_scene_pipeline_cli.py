@@ -65,7 +65,11 @@ def test_main_writes_summary_to_db(tmp_path, monkeypatch):
         "insufficient_data": False,
         "analysis_summary": "场景短期平稳，关注库存周转。",
     }
-    expected_markdown = build_scene_markdown(summary)
+    expected_markdown = build_scene_markdown(
+        summary,
+        scene_name="写库场景",
+        analysis_week_start=date(2024, 3, 17),
+    )
     expected_json = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
     monkeypatch.setattr("scpc.etl.scene_pipeline.summarize_scene", lambda **kwargs: summary)
     monkeypatch.setattr("scpc.etl.scene_pipeline._resolve_llm_metadata", lambda: ("deepseek-pro", "v1.0"))
@@ -159,7 +163,10 @@ def test_main_emits_scene_markdown(tmp_path, monkeypatch):
         "analysis_summary": "场景稳定，关键词影响有限。",
     }
     monkeypatch.setattr("scpc.etl.scene_pipeline.summarize_scene", lambda **kwargs: summary)
-    monkeypatch.setattr("scpc.etl.scene_pipeline.build_scene_markdown", lambda payload: "# Demo\n")
+    monkeypatch.setattr(
+        "scpc.etl.scene_pipeline.build_scene_markdown",
+        lambda payload, *, scene_name=None, analysis_week_start=None: "# Demo\n",
+    )
     monkeypatch.setenv("SCPC_LOG_DIR", str(log_dir))
 
     main(

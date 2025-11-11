@@ -154,6 +154,8 @@ def test_summarize_scene_retries_on_schema_error(
     parsed = json.loads(calls[0])
     assert "scene_recent_4w" in parsed
     assert "response_schema" in parsed
+    assert parsed.get("diff_flag") is False
+    assert "diff_hint" not in parsed
     forecast_guidance = parsed.get("forecast_guidance", {})
     scene_guidance = forecast_guidance.get("scene", {}) if isinstance(forecast_guidance, dict) else {}
     weeks = scene_guidance.get("forecast_weeks", []) if isinstance(scene_guidance, dict) else []
@@ -278,6 +280,86 @@ def test_top_keyword_limit_respects_config(
     assert "scene_forecast" not in properties
     assert "top_keywords_forecast" not in properties
     summarize_scene_module._scene_forecast_config.cache_clear()
+
+
+def test_diff_hint_injected_on_direction_divergence(
+    monkeypatch, tmp_path, sample_features, sample_drivers, sample_keyword_volumes
+):
+    calls = []
+
+    def fake_read_sql(query, _conn, params):
+        text_query = str(query)
+        if "bi_amz_scene_features" in text_query:
+            return sample_features
+        if "bi_amz_scene_drivers" in text_query:
+            return sample_drivers
+        if "bi_amz_vw_kw_week" in text_query:
+            return sample_keyword_volumes
+        raise AssertionError(f"Unexpected query: {query}")
+
+    original_build = summarize_scene_module._build_forecast_guidance
+
+    def fake_build(*args, **kwargs):
+        guidance = original_build(*args, **kwargs)
+        scene_guidance = guidance.get("scene")
+        if isinstance(scene_guidance, dict):
+            for week in scene_guidance.get("forecast_weeks", []):
+                if isinstance(week, dict):
+                    value = week.get("pct_change_value")
+                    if isinstance(value, (int, float)):
+                        positive = abs(float(value)) or 0.01
+                    else:
+                        positive = 0.01
+                    week["pct_change_value"] = positive
+                    week["pct_change"] = f"{positive * 100:.2f}%"
+                    week["direction"] = "up"
+        keyword_guidance = guidance.get("keywords", [])
+        for entry in keyword_guidance:
+            if not isinstance(entry, dict):
+                continue
+            for week in entry.get("forecast_weeks", []):
+                if isinstance(week, dict):
+                    value = week.get("pct_change_value")
+                    if isinstance(value, (int, float)):
+                        negative = abs(float(value)) or 0.01
+                    else:
+                        negative = 0.01
+                    week["pct_change_value"] = -negative
+                    week["pct_change"] = f"{-negative * 100:.2f}%"
+                    week["direction"] = "down"
+        return guidance
+
+    class StubClient:
+        def generate(self, **_kwargs):
+            calls.append(_kwargs["facts"])
+            payload = {
+                "confidence": 0.68,
+                "insufficient_data": False,
+                "analysis_summary": "体量稳中有升，高权重词带动抵消小词回落。",
+                "notes": None,
+            }
+            return DeepSeekResponse(content=json.dumps(payload), usage={})
+
+        def close(self):
+            pass
+
+    settings = SimpleNamespace(base_url="https://api.deepseek.com", model="deepseek", api_key="key", timeout=1)
+
+    monkeypatch.setattr("scpc.llm.summarize_scene.pd.read_sql_query", fake_read_sql)
+    monkeypatch.setattr(
+        "scpc.llm.summarize_scene._build_forecast_guidance", fake_build
+    )
+    monkeypatch.setattr("scpc.llm.summarize_scene.create_client_from_env", lambda settings: StubClient())
+    monkeypatch.setattr("scpc.llm.summarize_scene.get_deepseek_settings", lambda: settings)
+    monkeypatch.setenv("SCPC_PROMPT_LOG_DIR", str(tmp_path))
+
+    summarize_scene(engine=DummyEngine(), scene="X", mk="US", topn=5)
+
+    assert calls, "expected DeepSeek to be invoked"
+    payload = json.loads(calls[0])
+    assert payload.get("diff_flag") is True
+    assert payload.get("diff_hint") == "场景预测上升但多数关键词预测下降"
+    assert len(payload["diff_hint"]) <= 100
 
 
 def test_summarize_scene_raises_after_two_schema_errors(

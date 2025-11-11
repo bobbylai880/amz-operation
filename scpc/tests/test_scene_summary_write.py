@@ -38,7 +38,7 @@ def test_write_scene_summary_to_db_builds_dataframe(monkeypatch):
         week="2024W12",
         sunday=date(2024, 3, 17),
         summary_str="需求回暖，建议保持广告投入节奏。",
-        summary_md="# 场景级总结\n\n置信度：0.83\n",
+        summary_md="# Storage Rack 场景级总结\n\n分析周期：2024-03-17 ~ 2024-03-23\n\n置信度：0.83\n",
         summary_json={"analysis_summary": "需求回暖，建议保持广告投入节奏。"},
         confidence=0.83,
         llm_model="deepseek-pro",
@@ -67,7 +67,10 @@ def test_write_scene_summary_to_db_builds_dataframe(monkeypatch):
     assert row["sunday"] == date(2024, 3, 17)
     assert row["confidence"] == pytest.approx(0.83)
     assert row["summary_str"] == "需求回暖，建议保持广告投入节奏。"
-    assert row["summary_md"] == "# 场景级总结\n\n置信度：0.83\n"
+    assert (
+        row["summary_md"]
+        == "# Storage Rack 场景级总结\n\n分析周期：2024-03-17 ~ 2024-03-23\n\n置信度：0.83\n"
+    )
     assert row["summary_json"] == json.dumps(
         {"analysis_summary": "需求回暖，建议保持广告投入节奏。"},
         ensure_ascii=False,
