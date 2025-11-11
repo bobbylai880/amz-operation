@@ -1,6 +1,7 @@
 """Markdown report assembly helpers."""
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 from typing import Mapping, Sequence
 
 
@@ -90,10 +91,24 @@ def _format_number(value: object) -> str:
     return formatted
 
 
-def build_scene_markdown(summary: Mapping[str, object]) -> str:
+def build_scene_markdown(
+    summary: Mapping[str, object],
+    *,
+    scene_name: str | None = None,
+    analysis_week_start: object | None = None,
+) -> str:
     """Render a concise Markdown section for a single scene summary."""
 
-    lines: list[str] = ["# 场景级总结", ""]
+    title = "场景级总结" if not scene_name else f"{scene_name} 场景级总结"
+    lines: list[str] = [f"# {title}", ""]
+
+    start_date = _coerce_date(analysis_week_start)
+    if start_date is not None:
+        end_date = start_date + timedelta(days=6)
+        period_line = f"分析周期：{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}"
+    else:
+        period_line = "分析周期：未知"
+    lines.append(period_line + "\n")
     confidence = summary.get("confidence")
     if confidence is not None:
         try:
@@ -163,6 +178,24 @@ def build_scene_markdown(summary: Mapping[str, object]) -> str:
         lines.append(str(notes))
         lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+
+def _coerce_date(value: object) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return date.fromisoformat(stripped)
+        except ValueError:
+            return None
+    return None
 
 
 __all__ = ["build_report", "build_scene_markdown"]

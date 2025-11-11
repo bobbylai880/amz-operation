@@ -319,10 +319,18 @@ def write_scene_summary_to_db(
 
 
 def _build_summary_markdown(
-    summary_payload: Mapping[str, Any], *, scene: str, marketplace_id: str
+    summary_payload: Mapping[str, Any],
+    *,
+    scene: str,
+    marketplace_id: str,
+    analysis_week_start: date | None = None,
 ) -> str | None:
     try:
-        return build_scene_markdown(summary_payload)
+        return build_scene_markdown(
+            summary_payload,
+            scene_name=scene,
+            analysis_week_start=analysis_week_start,
+        )
     except Exception:  # pragma: no cover - defensive guard
         LOGGER.warning(
             "scene_pipeline_markdown_failed scene=%s mk=%s call=%s",
@@ -910,6 +918,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         summary_markdown: str | None = None
         summary_json_text: str | None = None
         summary_error: SceneSummarizationError | None = None
+        resolved_summary_week: tuple[str, date] | None = None
         if args.with_llm:
             features_df = outputs.get("features", pd.DataFrame())
             if not args.llm_only and features_df.empty:
@@ -940,10 +949,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                         marketplace_id=args.mk,
                     )
                     if args.write_summary or args.emit_md:
+                        resolved_summary_week = _resolve_summary_week(
+                            outputs, engine, args.scene, args.mk
+                        )
+                        sunday_for_markdown = (
+                            resolved_summary_week[1]
+                            if resolved_summary_week is not None
+                            else None
+                        )
                         summary_markdown = _build_summary_markdown(
                             summary_payload,
                             scene=args.scene,
                             marketplace_id=args.mk,
+                            analysis_week_start=sunday_for_markdown,
                         )
                     LOGGER.info(
                         "scene_pipeline_llm_complete scene=%s mk=%s call=%s",
@@ -1004,8 +1022,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                         },
                     )
                 else:
-                    resolved = _resolve_summary_week(outputs, engine, args.scene, args.mk)
-                    if resolved is None:
+                    if resolved_summary_week is None:
+                        resolved_summary_week = _resolve_summary_week(
+                            outputs, engine, args.scene, args.mk
+                        )
+                    if resolved_summary_week is None:
                         LOGGER.warning(
                             "scene_pipeline_summary_write_skipped scene=%s mk=%s reason=no_week",
                             args.scene,
@@ -1013,7 +1034,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                             extra={"scene": args.scene, "mk": args.mk, "reason": "no_week"},
                         )
                     else:
-                        week_label, sunday = resolved
+                        week_label, sunday = resolved_summary_week
+                        summary_markdown = _build_summary_markdown(
+                            summary_payload,
+                            scene=args.scene,
+                            marketplace_id=args.mk,
+                            analysis_week_start=sunday,
+                        )
                         confidence_value = summary_payload.get("confidence")
                         model_name, version = _resolve_llm_metadata()
                         inserted = write_scene_summary_to_db(
@@ -1090,10 +1117,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                         _write_json_output(outdir / "scene_summary.errors.json", error_payload)
                 if args.emit_md and summary_payload is not None:
                     if summary_markdown is None:
+                        sunday_for_markdown = (
+                            resolved_summary_week[1]
+                            if resolved_summary_week is not None
+                            else None
+                        )
                         summary_markdown = _build_summary_markdown(
                             summary_payload,
                             scene=args.scene,
                             marketplace_id=args.mk,
+                            analysis_week_start=sunday_for_markdown,
                         )
                     if summary_markdown is not None:
                         _write_text_output(outdir / "scene_report.md", summary_markdown)
