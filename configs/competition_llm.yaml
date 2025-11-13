@@ -50,6 +50,11 @@ stage_2:
       - reviews
   keyword:
     max_pairs_per_opp: 2
+stage_3:
+  enabled: true
+  direction_tolerance: 1.0e-06
+  gap_tolerance: 1.0e-06
+  top_n_per_dimension: 5
 llm:
   model: deepseek-chat
   temperature: 0.1

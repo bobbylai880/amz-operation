@@ -38,6 +38,14 @@ class StageTwoConfig:
 
 
 @dataclass(slots=True)
+class StageThreeConfig:
+    enabled: bool = True
+    direction_tolerance: float = 1e-6
+    gap_tolerance: float = 1e-6
+    top_n_per_dimension: int = 5
+
+
+@dataclass(slots=True)
 class LLMRuntimeConfig:
     model: str
     temperature: float
@@ -51,6 +59,7 @@ class LLMRuntimeConfig:
 class CompetitionLLMConfig:
     stage_1: StageOneConfig
     stage_2: StageTwoConfig
+    stage_3: StageThreeConfig
     llm: LLMRuntimeConfig
 
 
@@ -72,6 +81,7 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
 
     stage1_raw = raw.get("stage_1", {})
     stage2_raw = raw.get("stage_2", {})
+    stage3_raw = raw.get("stage_3", {})
     llm_raw = raw.get("llm", {})
 
     stage1_severity_raw = stage1_raw.get("severity_thresholds") or {}
@@ -182,6 +192,38 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         direction_tolerance=direction_tolerance,
     )
 
+    direction_tol_raw = stage3_raw.get("direction_tolerance", 1e-6)
+    try:
+        direction_tolerance_stage3 = float(direction_tol_raw)
+    except (TypeError, ValueError):
+        direction_tolerance_stage3 = 1e-6
+
+    gap_tol_raw = stage3_raw.get("gap_tolerance", 1e-6)
+    try:
+        gap_tolerance_stage3 = float(gap_tol_raw)
+    except (TypeError, ValueError):
+        gap_tolerance_stage3 = 1e-6
+
+    top_n_raw = stage3_raw.get("top_n_per_dimension", 5)
+    try:
+        top_n_stage3 = int(top_n_raw)
+    except (TypeError, ValueError):
+        top_n_stage3 = 5
+
+    stage3 = StageThreeConfig(
+        enabled=bool(stage3_raw.get("enabled", True)),
+        direction_tolerance=direction_tolerance_stage3,
+        gap_tolerance=gap_tolerance_stage3,
+        top_n_per_dimension=top_n_stage3,
+    )
+
+    if stage3.direction_tolerance < 0:
+        stage3.direction_tolerance = 0.0
+    if stage3.gap_tolerance < 0:
+        stage3.gap_tolerance = 0.0
+    if stage3.top_n_per_dimension < 1:
+        stage3.top_n_per_dimension = 5
+
     if not llm_raw.get("model"):
         raise ValueError("llm.model must be configured")
 
@@ -194,7 +236,7 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         timeout=float(llm_raw.get("timeout", 30)),
     )
 
-    return CompetitionLLMConfig(stage_1=stage1, stage_2=stage2, llm=llm)
+    return CompetitionLLMConfig(stage_1=stage1, stage_2=stage2, stage_3=stage3, llm=llm)
 
 
 __all__ = [
@@ -202,5 +244,6 @@ __all__ = [
     "LLMRuntimeConfig",
     "StageOneConfig",
     "StageTwoConfig",
+    "StageThreeConfig",
     "load_competition_llm_config",
 ]

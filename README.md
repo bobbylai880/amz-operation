@@ -162,6 +162,12 @@ result = compute_competition_features(
 ```
 `tables` 可直接写入 Doris，`result.as_dict()` 则用于 LLM 消费与 JSON Schema 校验。
 
+### Stage-3 场景级 WoW 对比 Facts
+- `CompetitionLLMOrchestrator.run_stage3()` 直接读取 `vw_amz_comp_llm_overview`、`vw_amz_comp_llm_overview_traffic` 与 `bi_amz_comp_llm_packet`，对齐场景与我方 ASIN，输出 `StageThreeResult`。
+- 使用 `stage_three_result_to_facts(result)` 可获得 LLM 友好的 JSON 结构（`context/self_entities/leader_entities/gap_deltas/dimensions`）。
+- 每个场景会在 `storage/competition_llm/{week}/stage3/` 下生成主结果 JSON，并同步生成 `prompts/{scene_tag}_{base_scene}_{morphology}.prompt.json`，其中包含 `competition_stage3_aggregate.md` 提示词和对应 facts。
+- 后续如需串接 Stage3-LLM，可直接复用该 prompt 快照与 facts 作为输入，无需重新拼装特征。
+
 ### 运行命令（数据清洗 + 特征 / Compare 入库）
 ```bash
 python -m scpc.etl.competition_pipeline \
