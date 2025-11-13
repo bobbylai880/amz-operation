@@ -146,6 +146,7 @@ _METRIC_DIRECTION_MAP: Mapping[str, str] = {
     "rank_delta": "lower_better",
     "rank_score": "higher_better",
     "content_score": "higher_better",
+    "price_net": "lower_better",
 }
 
 _ABSOLUTE_RANK_METRICS: frozenset[str] = frozenset({"rank_leaf", "rank_root"})
@@ -3195,25 +3196,26 @@ class CompetitionLLMOrchestrator:
                 continue
             source = str(entry.get("source") or "").lower()
             against = str(entry.get("against") or "").lower()
-            if lag_type_lower in {"rank", "social"}:
-                if source == "page.overview":
-                    continue
-                if against != "asin":
-                    continue
-            row_context: Mapping[str, Any] | None = None
+            # 1. 对排名/社交滞后，只关心成对比较，跳过页面概览来源
+            if lag_type_lower in {"rank", "social"} and source == "page.overview":
+                continue
+
+            # 2. 仅对成对比较执行“不利”检查
             if against == "asin":
+                row_context: Mapping[str, Any] | None = None
                 opp_asin = entry.get("opp_asin")
                 if opp_asin is not None:
                     row_context = row_lookup.get(str(opp_asin))
-            if not self._is_unfavorable_metric(
-                lag_type_lower,
-                metric,
-                entry.get("my_value"),
-                entry.get("opp_value"),
-                row=row_context,
-                direction_hints=hints,
-            ):
-                continue
+
+                if not self._is_unfavorable_metric(
+                    lag_type_lower,
+                    metric,
+                    entry.get("my_value"),
+                    entry.get("opp_value"),
+                    row=row_context,
+                    direction_hints=hints,
+                ):
+                    continue
             filtered.append(entry)
         return filtered
 
