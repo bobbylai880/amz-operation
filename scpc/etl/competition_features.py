@@ -2694,7 +2694,7 @@ def _badge_gap(my_badges: BadgeValue, opp_badges: BadgeValue) -> tuple[str, int 
         "my_only": sorted(my_set - opp_set),
         "opp_only": sorted(opp_set - my_set),
     }
-    badge_delta = len(diff["opp_only"]) - len(diff["my_only"])
+    badge_delta = len(diff["my_only"]) - len(diff["opp_only"])
     return json.dumps(diff, ensure_ascii=False), badge_delta
 
 
