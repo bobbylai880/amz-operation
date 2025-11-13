@@ -2420,7 +2420,10 @@ def _compute_pair_each_row(
     score_rank = _score_feature(rank_pos_delta, feature_rules.get("rank"))
     score_cont = _score_feature(-content_gap_each if content_gap_each is not None else None, feature_rules.get("content"))
     score_soc = _score_feature(-social_gap_each if social_gap_each is not None else None, feature_rules.get("social"))
-    score_badge = _score_feature(badge_delta_sum, feature_rules.get("badge"))
+    score_badge = _score_feature(
+        -badge_delta_sum if badge_delta_sum is not None else None,
+        feature_rules.get("badge"),
+    )
 
     pressure = _weighted_sum(
         [score_price, score_rank, score_cont, score_soc, score_badge],
@@ -2558,7 +2561,10 @@ def _compute_pair_row(
     score_rank = _score_feature(rank_pos_pct, feature_rules.get("rank"))
     score_cont = _score_feature(-content_gap if content_gap is not None else None, feature_rules.get("content"))
     score_soc = _score_feature(-social_gap if social_gap is not None else None, feature_rules.get("social"))
-    score_badge = _score_feature(badge_delta_sum, feature_rules.get("badge"))
+    score_badge = _score_feature(
+        -badge_delta_sum if badge_delta_sum is not None else None,
+        feature_rules.get("badge"),
+    )
 
     pressure = _weighted_sum(
         [score_price, score_rank, score_cont, score_soc, score_badge],

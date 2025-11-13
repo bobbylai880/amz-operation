@@ -33,7 +33,7 @@ scene_forecast:
   # 五、输出与格式
   # -------------------------------
   output:
-    forecast_horizon_weeks: 5  # 预测未来几周
+    forecast_horizon_weeks: 6  # 预测未来几周
     history_window_weeks: 8    # 历史参考窗口（过去N周 + 去年±N周）
     pct_digits: 2              # 百分比保留小数位
     vol_digits: 2              # 数量保留小数位

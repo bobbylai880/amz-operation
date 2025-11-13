@@ -8,14 +8,15 @@ import os
 import re
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Mapping, MutableMapping, Sequence
+from typing import Literal
 
 import yaml
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -68,6 +69,24 @@ ORDER BY sunday DESC
 LIMIT 1
 """
 
+_STAGE3_WEEK_SUNDAY_SQL_BASE = """
+SELECT sunday
+FROM vw_amz_comp_llm_overview
+WHERE week = :week
+{marketplace_filter}
+ORDER BY sunday DESC
+LIMIT 1
+"""
+
+_STAGE3_PREV_WEEK_SQL_BASE = """
+SELECT week, sunday
+FROM vw_amz_comp_llm_overview
+WHERE sunday < :sunday
+{marketplace_filter}
+ORDER BY sunday DESC
+LIMIT 1
+"""
+
 _STAGE1_KEY_FIELDS = (
     "scene_tag",
     "base_scene",
@@ -105,6 +124,30 @@ _STAGE2_GROUP_FIELDS = (
 _PAGE_LAG_TYPES = {"price", "rank", "content", "social", "badge", "confidence"}
 _TRAFFIC_LAG_TYPES = {"traffic_mix", "keyword"}
 _PAIRWISE_ONLY_LAG_TYPES = {"rank", "content", "social", "keyword"}
+
+_STAGE3_CONTEXT_COLUMNS = {
+    "scene_tag",
+    "base_scene",
+    "morphology",
+    "marketplace_id",
+    "week",
+    "sunday",
+    "my_parent_asin",
+    "my_asin",
+    "opp_type",
+    "asin_priority",
+}
+
+_STAGE3_LEADER_EXCLUDE_KEYS = {
+    "asin",
+    "opp_asin",
+    "opp_parent_asin",
+    "brand",
+    "opp_brand",
+    "intensity_band",
+    "lag_type",
+    "opp_type",
+}
 
 _LAG_TYPE_FILENAME_ALIASES: Mapping[str, str] = {
     "price": "pricing",
@@ -162,6 +205,7 @@ _ENTITY_DETAIL_FIELDS: tuple[str, ...] = (
     "image_cnt",
     "video_cnt",
     "bullet_cnt",
+    "title",
     "title_len",
     "aplus_flag",
     "content_score",
@@ -171,6 +215,24 @@ _ENTITY_DETAIL_FIELDS: tuple[str, ...] = (
     "badge_json",
     "brand",
 )
+
+_STAGE3_CONTENT_DIFF_FIELDS: tuple[str, ...] = (
+    "title",
+    "bullet_cnt",
+    "image_cnt",
+    "video_cnt",
+    "aplus_flag",
+    "content_score",
+    "rating",
+    "reviews",
+    "badge_json",
+)
+
+_STAGE3_OPTIONAL_CONTENT_FIELDS: Mapping[str, tuple[str, ...]] = {
+    "bullet_points": ("bullet_points", "bullet_points_array", "bullet_points_json"),
+    "image_urls": ("image_urls", "image_urls_array", "image_urls_json"),
+    "video_urls": ("video_urls", "video_urls_array", "video_urls_json"),
+}
 
 _KEYWORD_LOOKBACK_DAYS = 7
 _RULES_CONFIG_DEFAULT_PATH = Path("configs/competition_lag_rules.yaml")
@@ -418,6 +480,70 @@ class StageTwoAggregateResult:
     prompt_path: Path | None = None
 
 
+EntityRole = Literal["self", "leader", "competitor"]
+Channel = Literal["page", "traffic"]
+
+
+StageThreeFacts = Mapping[str, Any]
+
+
+@dataclass(slots=True)
+class StageThreeEntityDelta:
+    scene_context: Mapping[str, Any]
+    week: str
+    prev_week: str
+    my_asin: str
+    entity_asin: str | None
+    entity_role: EntityRole
+    opp_type: str | None
+    channel: Channel
+    metric_deltas: Mapping[str, Mapping[str, Any]]
+    leader_changed: bool | None = None
+    content_diffs: Sequence[Mapping[str, Any]] | None = None
+
+
+@dataclass(slots=True)
+class StageThreeGapDelta:
+    scene_context: Mapping[str, Any]
+    week: str
+    prev_week: str
+    my_asin: str
+    channel: Channel
+    gap_deltas: Mapping[str, Mapping[str, Any]]
+
+
+@dataclass(slots=True)
+class StageThreeDimensionChange:
+    scene_context: Mapping[str, Any]
+    week: str
+    prev_week: str
+    lag_type: str
+    channel: Channel
+    aggregates: Mapping[str, Any]
+    top_changes: Sequence[Mapping[str, Any]]
+
+
+@dataclass(slots=True)
+class StageThreeResult:
+    context: Mapping[str, Any]
+    self_entities: Sequence[StageThreeEntityDelta]
+    leader_entities: Sequence[StageThreeEntityDelta]
+    gap_deltas: Sequence[StageThreeGapDelta]
+    dimensions: Sequence[StageThreeDimensionChange]
+
+
+def stage_three_result_to_facts(result: StageThreeResult) -> dict[str, Any]:
+    """Convert a :class:`StageThreeResult` into a JSON-friendly mapping."""
+
+    return {
+        "context": dict(result.context),
+        "self_entities": [asdict(entry) for entry in result.self_entities],
+        "leader_entities": [asdict(entry) for entry in result.leader_entities],
+        "gap_deltas": [asdict(entry) for entry in result.gap_deltas],
+        "dimensions": [asdict(entry) for entry in result.dimensions],
+    }
+
+
 @dataclass(slots=True)
 class CompetitionRunResult:
     week: str
@@ -473,6 +599,7 @@ class CompetitionLLMOrchestrator:
         }
         self._stage2_schema = load_schema("competition_stage2_aggregate.schema.json")
         self._stage2_prompt = load_prompt("competition_stage2_aggregate.md")
+        self._stage3_prompt = load_prompt("competition_stage3_aggregate.md")
         self._current_marketplace_id: str | None = None
         self._brand_cache: dict[str, str | None] = {}
         self._brand_path_tokens: list[str] | None = None
@@ -610,6 +737,921 @@ class CompetitionLLMOrchestrator:
             stage2_processed=len(stage2_outputs),
             storage_paths=tuple(storage_paths),
         )
+
+    def run_stage3(
+        self,
+        week: str | None,
+        *,
+        marketplace_id: str | None = None,
+    ) -> Sequence[StageThreeResult]:
+        """Execute the Stage-3 week-over-week comparison pipeline."""
+
+        stage3_config = getattr(self._config, "stage_3", None)
+        if not stage3_config or not stage3_config.enabled:
+            LOGGER.info(
+                "competition_llm.stage3_disabled week=%s marketplace_id=%s",
+                week,
+                marketplace_id,
+            )
+            return ()
+
+        self._current_marketplace_id = marketplace_id
+        target_week = self._resolve_week(week, marketplace_id)
+        prev_week = self._resolve_prev_week(target_week, marketplace_id)
+        if not prev_week:
+            LOGGER.warning(
+                "competition_llm.stage3_missing_prev_week week=%s marketplace_id=%s",
+                target_week,
+                marketplace_id,
+            )
+            return ()
+
+        current_overview = self._query_stage1_table(
+            _STAGE1_OVERVIEW_SQL_BASE,
+            target_week,
+            marketplace_id,
+        )
+        previous_overview = self._query_stage1_table(
+            _STAGE1_OVERVIEW_SQL_BASE,
+            prev_week,
+            marketplace_id,
+        )
+        current_traffic = self._query_stage1_table(
+            _STAGE1_TRAFFIC_SQL_BASE,
+            target_week,
+            marketplace_id,
+        )
+        previous_traffic = self._query_stage1_table(
+            _STAGE1_TRAFFIC_SQL_BASE,
+            prev_week,
+            marketplace_id,
+        )
+
+        if not current_overview and not current_traffic:
+            LOGGER.info(
+                "competition_llm.stage3_no_current_data week=%s marketplace_id=%s",
+                target_week,
+                marketplace_id,
+            )
+            self._current_marketplace_id = None
+            return ()
+
+        leader_current = self._load_stage3_leaders(target_week, marketplace_id)
+        leader_previous = self._load_stage3_leaders(prev_week, marketplace_id)
+
+        results = list(
+            self._build_stage3_results(
+                current_overview,
+                previous_overview,
+                current_traffic,
+                previous_traffic,
+                leader_current,
+                leader_previous,
+                target_week,
+                prev_week,
+                marketplace_id=marketplace_id,
+            )
+        )
+
+        self._current_marketplace_id = None
+
+        if not results:
+            LOGGER.info(
+                "competition_llm.stage3_no_results week=%s prev_week=%s marketplace_id=%s",
+                target_week,
+                prev_week,
+                marketplace_id,
+            )
+            return ()
+
+        for result in results:
+            facts = stage_three_result_to_facts(result)
+            context = facts.get("context", {}) if isinstance(facts, Mapping) else {}
+            week_label = str(context.get("week") or target_week)
+            base_name = self._build_stage3_storage_name(context)
+            self._write_prompt_snapshot(
+                stage="stage3",
+                week=week_label,
+                base_name=base_name,
+                prompt=self._stage3_prompt,
+                facts=facts,
+            )
+            self._write_stage3_output(result, facts=facts, base_name=base_name)
+
+        LOGGER.info(
+            "competition_llm.stage3_completed week=%s prev_week=%s marketplace_id=%s scenes=%s",
+            target_week,
+            prev_week,
+            marketplace_id,
+            len(results),
+        )
+        return tuple(results)
+
+    def _build_stage3_results(
+        self,
+        current_overview: Sequence[Mapping[str, Any]],
+        previous_overview: Sequence[Mapping[str, Any]],
+        current_traffic: Sequence[Mapping[str, Any]],
+        previous_traffic: Sequence[Mapping[str, Any]],
+        leader_current: Mapping[tuple[Any, ...], Mapping[str, Any]],
+        leader_previous: Mapping[tuple[Any, ...], Mapping[str, Any]],
+        week: str,
+        prev_week: str,
+        *,
+        marketplace_id: str | None = None,
+    ) -> Sequence[StageThreeResult]:
+        """Assemble Stage-3 payloads grouped by scene."""
+        stage3_config = getattr(self._config, "stage_3", None)
+        if not stage3_config:
+            return ()
+
+        scene_contexts: dict[tuple[Any, ...], dict[str, Any]] = {}
+        scene_asins: dict[tuple[Any, ...], set[str]] = {}
+        sunday_current: dict[tuple[Any, ...], Any] = {}
+        sunday_previous: dict[tuple[Any, ...], Any] = {}
+
+        current_page_lookup = self._build_stage3_row_lookup(
+            current_overview,
+            scene_contexts=scene_contexts,
+            scene_asins=scene_asins,
+            sunday_map=sunday_current,
+        )
+        previous_page_lookup = self._build_stage3_row_lookup(
+            previous_overview,
+            scene_contexts=scene_contexts,
+            scene_asins=scene_asins,
+            sunday_map=sunday_previous,
+        )
+        current_traffic_lookup = self._build_stage3_row_lookup(
+            current_traffic,
+            scene_contexts=scene_contexts,
+            scene_asins=scene_asins,
+            sunday_map=sunday_current,
+        )
+        previous_traffic_lookup = self._build_stage3_row_lookup(
+            previous_traffic,
+            scene_contexts=scene_contexts,
+            scene_asins=scene_asins,
+            sunday_map=sunday_previous,
+        )
+
+        entity_asins_by_week: dict[str, set[str]] = {week: set(), prev_week: set()}
+        for asin_values in scene_asins.values():
+            for asin in asin_values:
+                asin_key = str(asin)
+                if not asin_key:
+                    continue
+                entity_asins_by_week[week].add(asin_key)
+                entity_asins_by_week[prev_week].add(asin_key)
+
+        for leader_entry in leader_current.values():
+            leader_asin = leader_entry.get("leader_asin")
+            if leader_asin:
+                entity_asins_by_week[week].add(str(leader_asin))
+        for leader_entry in leader_previous.values():
+            leader_asin = leader_entry.get("leader_asin")
+            if leader_asin:
+                entity_asins_by_week[prev_week].add(str(leader_asin))
+
+        entity_details = self._load_stage3_entity_details(
+            entity_asins_by_week,
+            marketplace_id=marketplace_id,
+        )
+
+        results: list[StageThreeResult] = []
+        for scene_key in sorted(scene_contexts):
+            asin_set = scene_asins.get(scene_key)
+            if not asin_set:
+                continue
+            sorted_asins = sorted(asin_set)
+            base_context = dict(scene_contexts[scene_key])
+            base_context.update(
+                {
+                    "week": week,
+                    "prev_week": prev_week,
+                    "sunday": sunday_current.get(scene_key),
+                    "prev_sunday": sunday_previous.get(scene_key),
+                    "my_asins": sorted_asins,
+                }
+            )
+
+            dimension_tracker = _StageThreeDimensionAggregator(
+                stage3_config.top_n_per_dimension
+            )
+            scene_self: list[StageThreeEntityDelta] = []
+            scene_leader: list[StageThreeEntityDelta] = []
+            scene_gaps: list[StageThreeGapDelta] = []
+
+            for asin in sorted_asins:
+                row_key = (*scene_key, asin)
+                page_current = current_page_lookup.get(row_key)
+                page_previous = previous_page_lookup.get(row_key)
+                traffic_current = current_traffic_lookup.get(row_key)
+                traffic_previous = previous_traffic_lookup.get(row_key)
+                leader_curr_entry = leader_current.get(row_key)
+                leader_prev_entry = leader_previous.get(row_key)
+                leader_asin = None
+                if leader_curr_entry:
+                    leader_asin = leader_curr_entry.get("leader_asin")
+                elif leader_prev_entry:
+                    leader_asin = leader_prev_entry.get("leader_asin")
+
+                entity_context = dict(base_context)
+                entity_context["my_asin"] = asin
+                if leader_asin and "leader_asin" not in entity_context:
+                    entity_context["leader_asin"] = leader_asin
+
+                asin_key = str(asin)
+                entity_current = entity_details.get((week, asin_key))
+                entity_previous = entity_details.get((prev_week, asin_key))
+                content_diffs_self = self._compute_stage3_content_diff(
+                    entity_current,
+                    entity_previous,
+                )
+                if not content_diffs_self:
+                    content_diffs_self = None
+
+                if page_current or page_previous:
+                    page_metrics = self._compute_stage3_metric_deltas(
+                        current=page_current,
+                        previous=page_previous,
+                        channel="page",
+                    )
+                    for metric, details in page_metrics.items():
+                        if _is_gap_metric(metric):
+                            delta_value = details.get("delta")
+                            if isinstance(delta_value, (int, float)):
+                                details["status"] = _evaluate_stage3_trend(
+                                    float(delta_value),
+                                    details.get("direction"),
+                                    stage3_config.gap_tolerance,
+                                )
+                            role = "gap"
+                            entity_asin_for_metric = leader_asin
+                        else:
+                            role = "self"
+                            entity_asin_for_metric = asin
+                        dimension_tracker.add_metric(
+                            lag_type=details.get("lag_type"),
+                            channel="page",
+                            metric=metric,
+                            details=details,
+                            my_asin=asin,
+                            entity_role=role,
+                            entity_asin=entity_asin_for_metric,
+                        )
+                    if page_metrics:
+                        scene_self.append(
+                            StageThreeEntityDelta(
+                                scene_context=entity_context,
+                                week=week,
+                                prev_week=prev_week,
+                                my_asin=asin,
+                                entity_asin=asin,
+                                entity_role="self",
+                                opp_type=str((page_current or {}).get("opp_type")),
+                                channel="page",
+                                metric_deltas=page_metrics,
+                                content_diffs=content_diffs_self,
+                            )
+                        )
+                    gap_page = {
+                        metric: dict(details)
+                        for metric, details in page_metrics.items()
+                        if _is_gap_metric(metric)
+                    }
+                    if gap_page:
+                        gap_context = dict(entity_context)
+                        scene_gaps.append(
+                            StageThreeGapDelta(
+                                scene_context=gap_context,
+                                week=week,
+                                prev_week=prev_week,
+                                my_asin=asin,
+                                channel="page",
+                                gap_deltas=gap_page,
+                            )
+                        )
+
+                if traffic_current or traffic_previous:
+                    traffic_metrics = self._compute_stage3_metric_deltas(
+                        current=traffic_current,
+                        previous=traffic_previous,
+                        channel="traffic",
+                    )
+                    for metric, details in traffic_metrics.items():
+                        if _is_gap_metric(metric):
+                            delta_value = details.get("delta")
+                            if isinstance(delta_value, (int, float)):
+                                details["status"] = _evaluate_stage3_trend(
+                                    float(delta_value),
+                                    details.get("direction"),
+                                    stage3_config.gap_tolerance,
+                                )
+                            role = "gap"
+                            entity_asin_for_metric = leader_asin
+                        else:
+                            role = "self"
+                            entity_asin_for_metric = asin
+                        dimension_tracker.add_metric(
+                            lag_type=details.get("lag_type"),
+                            channel="traffic",
+                            metric=metric,
+                            details=details,
+                            my_asin=asin,
+                            entity_role=role,
+                            entity_asin=entity_asin_for_metric,
+                        )
+                    if traffic_metrics:
+                        scene_self.append(
+                            StageThreeEntityDelta(
+                                scene_context=entity_context,
+                                week=week,
+                                prev_week=prev_week,
+                                my_asin=asin,
+                                entity_asin=asin,
+                                entity_role="self",
+                                opp_type=str((traffic_current or {}).get("opp_type")),
+                                channel="traffic",
+                                metric_deltas=traffic_metrics,
+                            )
+                        )
+                    gap_traffic = {
+                        metric: dict(details)
+                        for metric, details in traffic_metrics.items()
+                        if _is_gap_metric(metric)
+                    }
+                    if gap_traffic:
+                        gap_context = dict(entity_context)
+                        scene_gaps.append(
+                            StageThreeGapDelta(
+                                scene_context=gap_context,
+                                week=week,
+                                prev_week=prev_week,
+                                my_asin=asin,
+                                channel="traffic",
+                                gap_deltas=gap_traffic,
+                            )
+                        )
+
+                if leader_curr_entry or leader_prev_entry:
+                    leader_direction_hints: Mapping[str, str] = {}
+                    if leader_curr_entry and leader_curr_entry.get("direction_hints"):
+                        leader_direction_hints = leader_curr_entry["direction_hints"]
+                    elif leader_prev_entry and leader_prev_entry.get("direction_hints"):
+                        leader_direction_hints = leader_prev_entry["direction_hints"]
+
+                    leader_changed: bool | None = None
+                    if leader_curr_entry and leader_prev_entry:
+                        leader_changed = (
+                            str(leader_curr_entry.get("leader_asin") or "")
+                            != str(leader_prev_entry.get("leader_asin") or "")
+                        )
+                    elif leader_curr_entry or leader_prev_entry:
+                        leader_changed = True
+
+                    leader_context = dict(entity_context)
+                    if leader_asin:
+                        leader_context["leader_asin"] = leader_asin
+
+                    leader_asin_key = str(leader_asin) if leader_asin else ""
+                    leader_entity_current = (
+                        entity_details.get((week, leader_asin_key)) if leader_asin_key else None
+                    )
+                    leader_entity_previous = (
+                        entity_details.get((prev_week, leader_asin_key)) if leader_asin_key else None
+                    )
+                    content_diffs_leader = self._compute_stage3_content_diff(
+                        leader_entity_current,
+                        leader_entity_previous,
+                    )
+                    if not content_diffs_leader:
+                        content_diffs_leader = None
+
+                    page_leader_metrics = self._compute_stage3_metric_deltas(
+                        current=(leader_curr_entry or {}).get("page_metrics"),
+                        previous=(leader_prev_entry or {}).get("page_metrics"),
+                        channel="page",
+                        direction_hints=leader_direction_hints,
+                    )
+                    for metric, details in page_leader_metrics.items():
+                        if _is_gap_metric(metric):
+                            delta_value = details.get("delta")
+                            if isinstance(delta_value, (int, float)):
+                                details["status"] = _evaluate_stage3_trend(
+                                    float(delta_value),
+                                    details.get("direction"),
+                                    stage3_config.gap_tolerance,
+                                )
+                        dimension_tracker.add_metric(
+                            lag_type=details.get("lag_type"),
+                            channel="page",
+                            metric=metric,
+                            details=details,
+                            my_asin=asin,
+                            entity_role="leader",
+                            entity_asin=leader_asin,
+                        )
+                    if page_leader_metrics:
+                        scene_leader.append(
+                            StageThreeEntityDelta(
+                                scene_context=leader_context,
+                                week=week,
+                                prev_week=prev_week,
+                                my_asin=asin,
+                                entity_asin=leader_asin,
+                                entity_role="leader",
+                                opp_type=str((leader_curr_entry or leader_prev_entry or {}).get("opp_type")),
+                                channel="page",
+                                metric_deltas=page_leader_metrics,
+                                leader_changed=leader_changed,
+                                content_diffs=content_diffs_leader,
+                            )
+                        )
+
+                    traffic_leader_metrics = self._compute_stage3_metric_deltas(
+                        current=(leader_curr_entry or {}).get("traffic_metrics"),
+                        previous=(leader_prev_entry or {}).get("traffic_metrics"),
+                        channel="traffic",
+                        direction_hints=leader_direction_hints,
+                    )
+                    for metric, details in traffic_leader_metrics.items():
+                        if _is_gap_metric(metric):
+                            delta_value = details.get("delta")
+                            if isinstance(delta_value, (int, float)):
+                                details["status"] = _evaluate_stage3_trend(
+                                    float(delta_value),
+                                    details.get("direction"),
+                                    stage3_config.gap_tolerance,
+                                )
+                        dimension_tracker.add_metric(
+                            lag_type=details.get("lag_type"),
+                            channel="traffic",
+                            metric=metric,
+                            details=details,
+                            my_asin=asin,
+                            entity_role="leader",
+                            entity_asin=leader_asin,
+                        )
+                    if traffic_leader_metrics:
+                        scene_leader.append(
+                            StageThreeEntityDelta(
+                                scene_context=leader_context,
+                                week=week,
+                                prev_week=prev_week,
+                                my_asin=asin,
+                                entity_asin=leader_asin,
+                                entity_role="leader",
+                                opp_type=str((leader_curr_entry or leader_prev_entry or {}).get("opp_type")),
+                                channel="traffic",
+                                metric_deltas=traffic_leader_metrics,
+                                leader_changed=leader_changed,
+                                content_diffs=None,
+                            )
+                        )
+
+            dimensions = tuple(
+                dimension_tracker.build(
+                    scene_context=base_context,
+                    week=week,
+                    prev_week=prev_week,
+                )
+            )
+
+            results.append(
+                StageThreeResult(
+                    context=base_context,
+                    self_entities=tuple(scene_self),
+                    leader_entities=tuple(scene_leader),
+                    gap_deltas=tuple(scene_gaps),
+                    dimensions=dimensions,
+                )
+            )
+
+        return tuple(results)
+
+    def _build_stage3_row_lookup(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        scene_contexts: MutableMapping[tuple[Any, ...], dict[str, Any]],
+        scene_asins: MutableMapping[tuple[Any, ...], set[str]],
+        sunday_map: MutableMapping[tuple[Any, ...], Any],
+    ) -> Mapping[tuple[Any, ...], Mapping[str, Any]]:
+        if not rows:
+            return {}
+
+        grouped: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+        for row in rows:
+            key = self._build_stage3_row_key(row)
+            if key is None:
+                continue
+            grouped.setdefault(key, []).append(row)
+            scene_key = key[:4]
+            asin_value = str(key[4]) if key[4] is not None else ""
+            asin_bucket = scene_asins.setdefault(scene_key, set())
+            if asin_value:
+                asin_bucket.add(asin_value)
+            if scene_key not in scene_contexts:
+                scene_contexts[scene_key] = {
+                    "scene_tag": row.get("scene_tag"),
+                    "base_scene": row.get("base_scene"),
+                    "morphology": self._normalise_morphology_value(row.get("morphology")),
+                    "marketplace_id": row.get("marketplace_id"),
+                }
+            sunday_value = row.get("sunday")
+            if sunday_value is not None and scene_key not in sunday_map:
+                sunday_map[scene_key] = sunday_value
+
+        result: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        for key, bucket in grouped.items():
+            selected = self._select_stage3_primary_row(bucket)
+            if selected is not None:
+                result[key] = selected
+        return result
+
+    def _select_stage3_primary_row(
+        self, rows: Sequence[Mapping[str, Any]]
+    ) -> Mapping[str, Any] | None:
+        if not rows:
+            return None
+        preferred: Mapping[str, Any] | None = None
+        for row in rows:
+            opp_type = str(row.get("opp_type") or "").strip().lower()
+            if opp_type == "leader":
+                preferred = row
+                break
+        if preferred is None:
+            preferred = rows[0]
+        return dict(preferred)
+
+    def _build_stage3_row_key(self, row: Mapping[str, Any]) -> tuple[Any, ...] | None:
+        if not isinstance(row, Mapping):
+            return None
+        scene_tag = row.get("scene_tag")
+        base_scene = row.get("base_scene")
+        marketplace_id = row.get("marketplace_id")
+        my_asin = row.get("my_asin")
+        if scene_tag is None or base_scene is None or marketplace_id is None or my_asin is None:
+            return None
+        morphology = self._normalise_morphology_value(row.get("morphology"))
+        return (
+            scene_tag,
+            base_scene,
+            morphology,
+            marketplace_id,
+            str(my_asin),
+        )
+
+    @staticmethod
+    def _normalise_morphology_value(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned:
+                return None
+            return cleaned
+        return value
+
+    def _load_stage3_leaders(
+        self, week: str, marketplace_id: str | None
+    ) -> Mapping[tuple[Any, ...], Mapping[str, Any]]:
+        sql = """
+          SELECT scene_tag, base_scene, morphology, marketplace_id,
+                 week, sunday, my_asin, lag_type, opp_type, evidence_json
+          FROM bi_amz_comp_llm_packet
+          WHERE week = :week
+        """
+        params: dict[str, Any] = {"week": week}
+        if marketplace_id:
+            sql += " AND marketplace_id = :marketplace_id"
+            params["marketplace_id"] = marketplace_id
+
+        try:
+            rows = self._fetch_all(sql, params)
+        except SQLAlchemyError as exc:
+            LOGGER.warning(
+                "competition_llm.stage3_packet_unavailable week=%s marketplace_id=%s error=%s",
+                week,
+                marketplace_id,
+                exc,
+            )
+            return {}
+
+        result: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        for row in rows:
+            key = self._build_stage3_row_key(row)
+            if key is None:
+                continue
+            parsed = self._parse_stage3_leader_row(row)
+            if not parsed:
+                continue
+            existing = result.get(key)
+            if not existing or parsed.get("rank_value", math.inf) < existing.get(
+                "rank_value", math.inf
+            ):
+                payload = dict(parsed)
+                if "opp_type" not in payload:
+                    payload["opp_type"] = row.get("opp_type")
+                result[key] = payload
+        return result
+
+    def _parse_stage3_leader_row(
+        self, row: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        payload = row.get("evidence_json")
+        if not isinstance(payload, str) or not payload.strip():
+            return None
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            LOGGER.debug(
+                "competition_llm.stage3_packet_parse_error asin=%s",
+                row.get("my_asin"),
+            )
+            return None
+        if not isinstance(parsed, Mapping):
+            return None
+
+        competitors = parsed.get("top_competitors")
+        if not isinstance(competitors, Sequence):
+            return None
+
+        leader_entry: Mapping[str, Any] | None = None
+        leader_rank = math.inf
+        for item in competitors:
+            if not isinstance(item, Mapping):
+                continue
+            asin = item.get("asin") or item.get("opp_asin")
+            if not asin:
+                continue
+            rank_value = _extract_stage3_rank_value(item)
+            if rank_value < leader_rank:
+                leader_entry = item
+                leader_rank = rank_value
+
+        if leader_entry is None:
+            return None
+
+        page_metrics: dict[str, Any] = {}
+        for key, value in leader_entry.items():
+            if key in _STAGE3_LEADER_EXCLUDE_KEYS:
+                continue
+            if isinstance(value, Mapping):
+                continue
+            page_metrics[key] = value
+
+        traffic_payload = leader_entry.get("traffic")
+        traffic_metrics: dict[str, Any] = {}
+        if isinstance(traffic_payload, Mapping):
+            for key, value in traffic_payload.items():
+                if isinstance(value, Mapping):
+                    continue
+                traffic_metrics[key] = value
+
+        result: dict[str, Any] = {
+            "leader_asin": leader_entry.get("asin") or leader_entry.get("opp_asin"),
+            "page_metrics": page_metrics,
+            "traffic_metrics": traffic_metrics,
+            "direction_hints": _normalise_direction_map(parsed.get("metric_directions")),
+            "rank_value": leader_rank,
+        }
+        lag_type = _normalize_lag_type(row.get("lag_type"))
+        if lag_type:
+            result["lag_type"] = lag_type
+        opp_type = row.get("opp_type")
+        if opp_type is not None:
+            result["opp_type"] = opp_type
+        return result
+
+    def _compute_stage3_metric_deltas(
+        self,
+        *,
+        current: Mapping[str, Any] | None,
+        previous: Mapping[str, Any] | None,
+        channel: Channel,
+        direction_hints: Mapping[str, str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        keys: set[str] = set()
+        if current:
+            keys.update(str(key) for key in current.keys())
+        if previous:
+            keys.update(str(key) for key in previous.keys())
+        if not keys:
+            return {}
+
+        results: dict[str, dict[str, Any]] = {}
+        for metric in sorted(keys):
+            if metric in _STAGE3_CONTEXT_COLUMNS:
+                continue
+            curr_value = current.get(metric) if current else None
+            prev_value = previous.get(metric) if previous else None
+            numeric_current = _coerce_float(curr_value)
+            numeric_previous = _coerce_float(prev_value)
+            if numeric_current is None and numeric_previous is None:
+                continue
+            delta_value: float | None = None
+            if numeric_current is not None and numeric_previous is not None:
+                delta_value = numeric_current - numeric_previous
+            direction = _resolve_direction(metric, None, direction_hints) or _infer_stage3_direction(
+                metric, channel
+            )
+            lag_type = _infer_stage3_lag_type(metric, channel)
+            trend_status = _evaluate_stage3_trend(
+                delta_value,
+                direction,
+                getattr(self._config.stage_3, "direction_tolerance", _DEFAULT_DIRECTION_TOLERANCE),
+            )
+            entry: dict[str, Any] = {
+                "current": numeric_current if numeric_current is not None else curr_value,
+                "previous": numeric_previous if numeric_previous is not None else prev_value,
+                "delta": delta_value,
+                "direction": direction,
+                "status": trend_status,
+            }
+            if lag_type:
+                entry["lag_type"] = lag_type
+            results[metric] = entry
+        return results
+
+    def _load_stage3_entity_details(
+        self,
+        entity_asins_by_week: Mapping[str, Collection[str]],
+        *,
+        marketplace_id: str | None = None,
+    ) -> Mapping[tuple[str, str], Mapping[str, Any]]:
+        if not entity_asins_by_week:
+            return {}
+
+        result: dict[tuple[str, str], Mapping[str, Any]] = {}
+        for week_value, asin_values in entity_asins_by_week.items():
+            asin_list = sorted({str(asin) for asin in asin_values if str(asin)})
+            if not asin_list:
+                continue
+            sql = """
+              SELECT *
+              FROM bi_amz_comp_entities_clean
+              WHERE week = :week
+            """
+            if marketplace_id:
+                sql += " AND marketplace_id = :marketplace_id"
+            sql += " AND asin IN :asins"
+            params: dict[str, Any] = {"week": week_value, "asins": tuple(asin_list)}
+            if marketplace_id:
+                params["marketplace_id"] = marketplace_id
+            try:
+                stmt = text(sql).bindparams(bindparam("asins", expanding=True))
+                with self._engine.connect() as conn:
+                    cursor_result = conn.execute(stmt, params)
+                    fetched = cursor_result.fetchall()
+                rows = [self._serialise_row(dict(row._mapping)) for row in fetched]
+            except SQLAlchemyError as exc:  # pragma: no cover - optional table linkage
+                LOGGER.warning(
+                    "competition_llm.stage3_entity_details_unavailable week=%s marketplace_id=%s error=%s",
+                    week_value,
+                    marketplace_id,
+                    exc,
+                )
+                continue
+            for row in rows:
+                asin_value = row.get("asin")
+                if not asin_value:
+                    continue
+                key = (str(row.get("week")), str(asin_value))
+                result[key] = row
+        return result
+
+    def _compute_stage3_content_diff(
+        self,
+        current_entity: Mapping[str, Any] | None,
+        previous_entity: Mapping[str, Any] | None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not current_entity and not previous_entity:
+            return ()
+
+        diffs: list[Mapping[str, Any]] = []
+        for field in _STAGE3_CONTENT_DIFF_FIELDS:
+            current_value = self._extract_stage3_content_field(current_entity, field)
+            previous_value = self._extract_stage3_content_field(previous_entity, field)
+            if self._stage3_content_values_equal(field, current_value, previous_value):
+                continue
+            diffs.append(
+                {
+                    "field": field,
+                    "previous": self._content_value_for_output(field, previous_value),
+                    "current": self._content_value_for_output(field, current_value),
+                }
+            )
+
+        for canonical, aliases in _STAGE3_OPTIONAL_CONTENT_FIELDS.items():
+            current_value = self._first_stage3_content_value(current_entity, aliases)
+            previous_value = self._first_stage3_content_value(previous_entity, aliases)
+            if self._stage3_content_values_equal(canonical, current_value, previous_value):
+                continue
+            diffs.append(
+                {
+                    "field": canonical,
+                    "previous": self._content_value_for_output(canonical, previous_value),
+                    "current": self._content_value_for_output(canonical, current_value),
+                }
+            )
+
+        return tuple(diffs)
+
+    @staticmethod
+    def _extract_stage3_content_field(
+        entity: Mapping[str, Any] | None, field: str
+    ) -> Any:
+        if not entity:
+            return None
+        return entity.get(field)
+
+    @staticmethod
+    def _first_stage3_content_value(
+        entity: Mapping[str, Any] | None, aliases: Sequence[str]
+    ) -> Any:
+        if not entity:
+            return None
+        for alias in aliases:
+            if alias in entity and entity.get(alias) not in (None, ""):
+                return entity.get(alias)
+        return None
+
+    def _stage3_content_values_equal(self, field: str, current: Any, previous: Any) -> bool:
+        return self._content_value_for_compare(field, current) == self._content_value_for_compare(
+            field, previous
+        )
+
+    def _content_value_for_output(self, field: str, value: Any) -> Any:
+        return self._normalise_stage3_content_value(field, value, for_compare=False)
+
+    def _content_value_for_compare(self, field: str, value: Any) -> Any:
+        return self._normalise_stage3_content_value(field, value, for_compare=True)
+
+    def _normalise_stage3_content_value(
+        self, field: str, value: Any, *, for_compare: bool
+    ) -> Any:
+        if value in (None, ""):
+            return None
+        if isinstance(value, Decimal):
+            value = float(value)
+        if isinstance(value, bytes):  # pragma: no cover - defensive
+            try:
+                value = value.decode("utf-8")
+            except Exception:  # pragma: no cover - decoding fallback
+                value = value.decode(errors="ignore")
+
+        if field == "aplus_flag":
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if not lowered:
+                    return None
+                value = lowered not in {"0", "false", "no", "n"}
+            else:
+                value = bool(value)
+            return value
+
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    value = json.loads(stripped)
+                except json.JSONDecodeError:
+                    value = stripped
+            else:
+                value = stripped
+
+        if isinstance(value, Mapping):
+            if for_compare:
+                return tuple(
+                    (
+                        str(key),
+                        self._normalise_stage3_content_value(field, sub_value, for_compare=True),
+                    )
+                    for key, sub_value in sorted(value.items(), key=lambda item: str(item[0]))
+                )
+            return {
+                str(key): self._normalise_stage3_content_value(field, sub_value, for_compare=False)
+                for key, sub_value in value.items()
+            }
+
+        if isinstance(value, (list, tuple, set)):
+            normalised_items = [
+                self._normalise_stage3_content_value(field, item, for_compare=False)
+                for item in value
+            ]
+            cleaned = [item for item in normalised_items if item is not None]
+            if for_compare:
+                return tuple(cleaned)
+            return cleaned
+
+        if isinstance(value, (int, float, bool)):
+            return value
+
+        return value
 
     def _collect_stage1_inputs(
         self, week: str, marketplace_id: str | None
@@ -1020,6 +2062,35 @@ class CompetitionLLMOrchestrator:
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
         return path
+
+    def _write_stage3_output(
+        self,
+        result: StageThreeResult,
+        *,
+        facts: Mapping[str, Any] | None = None,
+        base_name: str | None = None,
+    ) -> Path:
+        context = dict(result.context)
+        week = str(context.get("week") or "unknown")
+        storage_name = base_name or self._build_stage3_storage_name(context)
+        path = self._storage_root / week / "stage3" / f"{storage_name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = (
+            dict(facts)
+            if isinstance(facts, Mapping)
+            else stage_three_result_to_facts(result)
+        )
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
+            encoding="utf-8",
+        )
+        return path
+
+    def _build_stage3_storage_name(self, context: Mapping[str, Any]) -> str:
+        scene_tag = str(context.get("scene_tag") or "unknown")
+        base_scene = str(context.get("base_scene") or "na")
+        morphology = str(context.get("morphology") or "na") or "na"
+        return f"{scene_tag}_{base_scene}_{morphology}"
 
     def _write_prompt_snapshot(
         self,
@@ -1689,6 +2760,29 @@ class CompetitionLLMOrchestrator:
             marketplace_id,
         )
         return resolved_week
+
+    def _resolve_prev_week(self, week: str, marketplace_id: str | None) -> str | None:
+        if not week:
+            return None
+        filter_clause = "AND marketplace_id = :marketplace_id" if marketplace_id else ""
+        current_sql = _STAGE3_WEEK_SUNDAY_SQL_BASE.format(
+            marketplace_filter=filter_clause
+        )
+        params: dict[str, Any] = {"week": week}
+        if marketplace_id:
+            params["marketplace_id"] = marketplace_id
+        current_row = self._fetch_one(current_sql, params)
+        if not current_row or not current_row.get("sunday"):
+            return None
+        prev_params: dict[str, Any] = {"sunday": current_row.get("sunday")}
+        if marketplace_id:
+            prev_params["marketplace_id"] = marketplace_id
+        prev_sql = _STAGE3_PREV_WEEK_SQL_BASE.format(marketplace_filter=filter_clause)
+        prev_row = self._fetch_one(prev_sql, prev_params)
+        if not prev_row:
+            return None
+        prev_week = prev_row.get("week")
+        return str(prev_week) if prev_week is not None else None
 
     @staticmethod
     def _parse_confidence(value: Any) -> float | None:
@@ -3488,7 +4582,7 @@ class CompetitionLLMOrchestrator:
         sql = """
           SELECT price_current, price_list, coupon_pct, price_net,
                  rank_leaf, rank_root, rank_score,
-                 image_cnt, video_cnt, bullet_cnt, title_len, aplus_flag, content_score,
+                 image_cnt, video_cnt, bullet_cnt, title, title_len, aplus_flag, content_score,
                  rating, reviews, social_proof, badge_json
           FROM bi_amz_comp_entities_clean
           WHERE scene_tag=:scene_tag AND base_scene=:base_scene
@@ -4314,6 +5408,204 @@ def _normalise_direction_map(raw: Any) -> dict[str, str]:
     return result
 
 
+class _StageThreeDimensionBucket:
+    __slots__ = ("_top_n", "_counts", "_entries", "_abs_sum", "_total")
+
+    def __init__(self, top_n: int) -> None:
+        self._top_n = max(1, top_n)
+        self._counts: dict[str, int] = {
+            "improve": 0,
+            "worsen": 0,
+            "stable": 0,
+            "unknown": 0,
+        }
+        self._entries: list[dict[str, Any]] = []
+        self._abs_sum = 0.0
+        self._total = 0
+
+    def add_entry(self, entry: Mapping[str, Any], delta_value: float | None) -> None:
+        status_raw = str(entry.get("status") or "unknown").lower()
+        status = status_raw if status_raw in {"improve", "worsen", "stable"} else "unknown"
+        self._counts[status] = self._counts.get(status, 0) + 1
+
+        entry_payload = dict(entry)
+        abs_delta = abs(delta_value) if isinstance(delta_value, (int, float)) else 0.0
+        entry_payload["abs_delta"] = abs_delta
+        self._entries.append(entry_payload)
+        if isinstance(delta_value, (int, float)):
+            self._abs_sum += abs_delta
+            self._total += 1
+        self._entries.sort(key=lambda item: item.get("abs_delta", 0.0), reverse=True)
+        if len(self._entries) > self._top_n:
+            self._entries = self._entries[: self._top_n]
+
+    def export(self) -> tuple[dict[str, Any], list[Mapping[str, Any]]]:
+        aggregates = dict(self._counts)
+        if self._total:
+            aggregates["avg_abs_delta"] = self._abs_sum / self._total
+        top_changes = [
+            {key: value for key, value in entry.items() if key != "abs_delta"}
+            for entry in self._entries
+        ]
+        return aggregates, top_changes
+
+
+class _StageThreeDimensionAggregator:
+    def __init__(self, top_n: int) -> None:
+        self._top_n = max(1, top_n)
+        self._buckets: dict[tuple[str, Channel], _StageThreeDimensionBucket] = {}
+
+    def add_metric(
+        self,
+        *,
+        lag_type: Any,
+        channel: Channel,
+        metric: str,
+        details: Mapping[str, Any],
+        my_asin: str,
+        entity_role: str,
+        entity_asin: str | None,
+    ) -> None:
+        normalized_lag = _normalize_lag_type(lag_type or details.get("lag_type") or metric)
+        if not normalized_lag:
+            return
+        channel_key: Channel = "traffic" if channel == "traffic" else "page"
+        bucket = self._buckets.setdefault(
+            (normalized_lag, channel_key), _StageThreeDimensionBucket(self._top_n)
+        )
+        delta_raw = details.get("delta")
+        if isinstance(delta_raw, Decimal):
+            delta_value: float | None = float(delta_raw)
+        elif isinstance(delta_raw, (int, float)):
+            delta_value = float(delta_raw)
+        else:
+            delta_value = None
+        entry = {
+            "metric": metric,
+            "delta": delta_raw,
+            "status": details.get("status"),
+            "direction": details.get("direction"),
+            "my_asin": my_asin,
+            "entity_role": entity_role,
+            "entity_asin": entity_asin,
+        }
+        if "current" in details:
+            entry["current"] = details.get("current")
+        if "previous" in details:
+            entry["previous"] = details.get("previous")
+        bucket.add_entry(entry, delta_value)
+
+    def build(
+        self,
+        *,
+        scene_context: Mapping[str, Any],
+        week: str,
+        prev_week: str,
+    ) -> Iterable[StageThreeDimensionChange]:
+        for (lag_type, channel), bucket in sorted(
+            self._buckets.items(), key=lambda item: (item[0][0], item[0][1])
+        ):
+            aggregates, top_changes = bucket.export()
+            yield StageThreeDimensionChange(
+                scene_context=scene_context,
+                week=week,
+                prev_week=prev_week,
+                lag_type=lag_type,
+                channel=channel,
+                aggregates=aggregates,
+                top_changes=top_changes,
+            )
+
+
+def _infer_stage3_direction(metric: str | None, channel: Channel | str | None) -> str | None:
+    if not metric:
+        return None
+    metric_lower = str(metric).strip().lower()
+    if not metric_lower:
+        return None
+    if "rank" in metric_lower:
+        return "lower_better"
+    if "price" in metric_lower and "gap" in metric_lower:
+        return "lower_better"
+    if "price_index" in metric_lower or metric_lower.endswith("_index"):
+        return "lower_better"
+    if "gap" in metric_lower or metric_lower.endswith("_delta"):
+        if "price" in metric_lower:
+            return "lower_better"
+        return "higher_better"
+    if "share" in metric_lower or "score" in metric_lower or "traffic" in metric_lower:
+        return "higher_better"
+    if "confidence" in metric_lower:
+        return "higher_better"
+    if channel == "traffic":
+        return "higher_better"
+    return None
+
+
+def _infer_stage3_lag_type(metric: str | None, channel: Channel | str | None) -> str | None:
+    if metric:
+        metric_lower = str(metric).strip().lower()
+        if "price" in metric_lower:
+            return "price"
+        if "rank" in metric_lower:
+            return "rank"
+        if any(token in metric_lower for token in ("content", "image", "video", "bullet", "title", "aplus")):
+            return "content"
+        if any(token in metric_lower for token in ("social", "rating", "review")):
+            return "social"
+        if "badge" in metric_lower:
+            return "badge"
+        if metric_lower.startswith("kw_") or "keyword" in metric_lower:
+            return "keyword"
+        if "traffic" in metric_lower or metric_lower.startswith("ad_") or metric_lower.startswith("sp_") or "share" in metric_lower:
+            return "traffic_mix"
+        if "confidence" in metric_lower:
+            return "confidence"
+    if channel == "traffic":
+        return "traffic_mix"
+    return None
+
+
+def _evaluate_stage3_trend(delta: float | None, direction: str | None, tolerance: float) -> str:
+    if delta is None:
+        return "stable"
+    if tolerance < 0:
+        tolerance = 0.0
+    if abs(delta) <= tolerance:
+        return "stable"
+    if direction == "higher_better":
+        return "improve" if delta > 0 else "worsen"
+    if direction == "lower_better":
+        return "improve" if delta < 0 else "worsen"
+    return "increase" if delta > 0 else "decrease"
+
+
+def _extract_stage3_rank_value(entry: Mapping[str, Any]) -> float:
+    for field in ("rank_leaf", "rank_root", "rank", "rank_pos_pct", "rank_pos"):
+        value = _coerce_float(entry.get(field))
+        if value is not None:
+            return value
+    pressure = _coerce_float(entry.get("pressure"))
+    if pressure is not None:
+        return pressure
+    return math.inf
+
+
+def _is_gap_metric(metric: str | None) -> bool:
+    if not metric:
+        return False
+    metric_lower = str(metric).strip().lower()
+    if "gap" in metric_lower:
+        return True
+    if metric_lower.endswith("_delta") or metric_lower.endswith("_diff"):
+        return True
+    if metric_lower.endswith("_index") or "index" in metric_lower:
+        return True
+    if metric_lower.endswith("_ratio") or "ratio" in metric_lower:
+        return True
+    return False
+
+
 def _compute_delta(my_value: Any, opp_value: Any) -> float | None:
     my_num = _coerce_float(my_value)
     opp_num = _coerce_float(opp_value)
@@ -4622,4 +5914,10 @@ __all__ = [
     "StageOneLLMResult",
     "StageOneResult",
     "StageTwoAggregateResult",
+    "StageThreeFacts",
+    "StageThreeEntityDelta",
+    "StageThreeGapDelta",
+    "StageThreeDimensionChange",
+    "StageThreeResult",
+    "stage_three_result_to_facts",
 ]

@@ -38,7 +38,7 @@ def _build_system_prompt(history_window: int) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(history_window=window)
 
 
-DEFAULT_HISTORY_WINDOW_WEEKS = 4
+DEFAULT_HISTORY_WINDOW_WEEKS = 8
 SYSTEM_PROMPT = _build_system_prompt(DEFAULT_HISTORY_WINDOW_WEEKS)
 
 

@@ -11,6 +11,8 @@ from scpc.llm.competition_config import load_competition_llm_config
 from scpc.llm.competition_workflow import (
     CompetitionLLMOrchestrator,
     StageOneLLMResult,
+    StageThreeResult,
+    stage_three_result_to_facts,
 )
 
 
@@ -996,6 +998,7 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                     week TEXT,
                     sunday TEXT,
                     asin TEXT,
+                    title TEXT,
                     price_current REAL,
                     price_list REAL,
                     coupon_pct REAL,
@@ -1148,11 +1151,11 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                 text(
                     """
                     INSERT INTO bi_amz_comp_entities_clean
-                    (scene_tag, base_scene, morphology, marketplace_id, week, sunday, asin,
+                    (scene_tag, base_scene, morphology, marketplace_id, week, sunday, asin, title,
                      price_current, price_list, coupon_pct, price_net, rank_leaf, rank_root, rank_score,
                      image_cnt, video_cnt, bullet_cnt, title_len, aplus_flag, content_score,
                      rating, reviews, social_proof, badge_json)
-                    VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :asin,
+                    VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :asin, :title,
                             :price_current, :price_list, :coupon_pct, :price_net, :rank_leaf, :rank_root, :rank_score,
                             :image_cnt, :video_cnt, :bullet_cnt, :title_len, :aplus_flag, :content_score,
                             :rating, :reviews, :social_proof, :badge_json)
@@ -1166,6 +1169,7 @@ def test_build_page_evidence_includes_objective_values(sqlite_engine, tmp_path):
                     "week": ctx["week"],
                     "sunday": ctx["sunday"],
                     "asin": asin,
+                    "title": "My Product" if asin == "B0MYASIN" else "Opp Product",
                     "price_current": price_current,
                     "price_list": price_current + 1,
                     "coupon_pct": 0.1,
@@ -1654,6 +1658,437 @@ def test_stage2_validation_accepts_social_gap_root_cause(sqlite_engine, tmp_path
     orchestrator._validate_stage2_machine_json(payload)
 
     assert payload["root_causes"][0]["root_cause_code"] == "social_gap"
+
+
+def test_stage3_run_generates_scene_results(sqlite_engine, tmp_path):
+    stub_llm = StubLLM()
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=stub_llm,
+        config=config,
+        storage_root=tmp_path / "storage",
+    )
+
+    base_scene = {
+        "scene_tag": "SCN-TEST",
+        "base_scene": "base",
+        "morphology": "standard",
+        "marketplace_id": "US",
+        "my_parent_asin": "PARENT-1",
+        "my_asin": "B0MINE1",
+        "opp_type": "leader",
+        "asin_priority": 1,
+    }
+
+    current_packet = json.dumps(
+        {
+            "top_competitors": [
+                {
+                    "asin": "B0LEADER1",
+                    "rank_leaf": 1,
+                    "pressure": 0.6,
+                    "price_gap_each": 1.5,
+                    "rank_pos_delta": 0.2,
+                    "content_gap_each": -0.1,
+                    "traffic": {"gap": 0.05, "delta": 0.02, "confidence": 0.82},
+                }
+            ],
+            "metric_directions": {
+                "price_gap_each": "lower_better",
+                "rank_pos_delta": "lower_better",
+                "content_gap_each": "higher_better",
+                "traffic.gap": "higher_better",
+            },
+        }
+    )
+    previous_packet = json.dumps(
+        {
+            "top_competitors": [
+                {
+                    "asin": "B0LEADER1",
+                    "rank_leaf": 1,
+                    "pressure": 0.55,
+                    "price_gap_each": 2.0,
+                    "rank_pos_delta": 0.35,
+                    "content_gap_each": -0.15,
+                    "traffic": {"gap": 0.03, "delta": 0.01, "confidence": 0.75},
+                }
+            ]
+        }
+    )
+
+    with sqlite_engine.begin() as conn:
+        conn.execute(text("DELETE FROM vw_amz_comp_llm_overview"))
+        conn.execute(text("DELETE FROM vw_amz_comp_llm_overview_traffic"))
+        conn.execute(text("DELETE FROM bi_amz_comp_llm_packet"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS bi_amz_comp_entities_clean (
+                    scene_tag TEXT,
+                    base_scene TEXT,
+                    morphology TEXT,
+                    marketplace_id TEXT,
+                    week TEXT,
+                    sunday TEXT,
+                    asin TEXT,
+                    title TEXT,
+                    price_current REAL,
+                    price_list REAL,
+                    coupon_pct REAL,
+                    price_net REAL,
+                    rank_leaf INTEGER,
+                    rank_root INTEGER,
+                    rank_score REAL,
+                    image_cnt INTEGER,
+                    video_cnt INTEGER,
+                    bullet_cnt INTEGER,
+                    title_len INTEGER,
+                    aplus_flag INTEGER,
+                    content_score REAL,
+                    rating REAL,
+                    reviews INTEGER,
+                    social_proof REAL,
+                    badge_json TEXT
+                )
+                """
+            )
+        )
+        conn.execute(text("DELETE FROM bi_amz_comp_entities_clean"))
+
+        conn.execute(
+            text(
+                """
+                INSERT INTO vw_amz_comp_llm_overview
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday,
+                 my_parent_asin, my_asin, opp_type, asin_priority, price_gap,
+                 price_gap_leader, price_index_med, price_z, rank_pos_pct,
+                 content_gap, social_gap, badge_delta_sum, confidence)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday,
+                        :my_parent_asin, :my_asin, :opp_type, :asin_priority, :price_gap,
+                        :price_gap_leader, :price_index_med, :price_z, :rank_pos_pct,
+                        :content_gap, :social_gap, :badge_delta_sum, :confidence)
+                """
+            ),
+            {
+                **base_scene,
+                "week": "2025-W01",
+                "sunday": "2025-01-05",
+                "price_gap": 0.14,
+                "price_gap_leader": 2.6,
+                "price_index_med": 1.2,
+                "price_z": 0.62,
+                "rank_pos_pct": 0.52,
+                "content_gap": 0.08,
+                "social_gap": 0.04,
+                "badge_delta_sum": 0.4,
+                "confidence": 0.82,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO vw_amz_comp_llm_overview
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday,
+                 my_parent_asin, my_asin, opp_type, asin_priority, price_gap,
+                 price_gap_leader, price_index_med, price_z, rank_pos_pct,
+                 content_gap, social_gap, badge_delta_sum, confidence)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday,
+                        :my_parent_asin, :my_asin, :opp_type, :asin_priority, :price_gap,
+                        :price_gap_leader, :price_index_med, :price_z, :rank_pos_pct,
+                        :content_gap, :social_gap, :badge_delta_sum, :confidence)
+                """
+            ),
+            {
+                **base_scene,
+                "week": "2025-W02",
+                "sunday": "2025-01-12",
+                "price_gap": 0.1,
+                "price_gap_leader": 2.0,
+                "price_index_med": 1.1,
+                "price_z": 0.5,
+                "rank_pos_pct": 0.4,
+                "content_gap": 0.12,
+                "social_gap": 0.06,
+                "badge_delta_sum": 1.0,
+                "confidence": 0.88,
+            },
+        )
+
+        conn.execute(
+            text(
+                """
+                INSERT INTO vw_amz_comp_llm_overview_traffic
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday,
+                 my_parent_asin, my_asin, opp_type, asin_priority, traffic_gap,
+                 ad_ratio_index_med, ad_to_natural_gap, sp_share_in_ad_gap,
+                 kw_top3_share_gap, kw_brand_share_gap, kw_competitor_share_gap, t_confidence)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday,
+                        :my_parent_asin, :my_asin, :opp_type, :asin_priority, :traffic_gap,
+                        :ad_ratio_index_med, :ad_to_natural_gap, :sp_share_in_ad_gap,
+                        :kw_top3_share_gap, :kw_brand_share_gap, :kw_competitor_share_gap, :t_confidence)
+                """
+            ),
+            {
+                **base_scene,
+                "week": "2025-W01",
+                "sunday": "2025-01-05",
+                "traffic_gap": 0.03,
+                "ad_ratio_index_med": 1.05,
+                "ad_to_natural_gap": 0.05,
+                "sp_share_in_ad_gap": 0.03,
+                "kw_top3_share_gap": 0.02,
+                "kw_brand_share_gap": 0.015,
+                "kw_competitor_share_gap": 0.008,
+                "t_confidence": 0.7,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO vw_amz_comp_llm_overview_traffic
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday,
+                 my_parent_asin, my_asin, opp_type, asin_priority, traffic_gap,
+                 ad_ratio_index_med, ad_to_natural_gap, sp_share_in_ad_gap,
+                 kw_top3_share_gap, kw_brand_share_gap, kw_competitor_share_gap, t_confidence)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday,
+                        :my_parent_asin, :my_asin, :opp_type, :asin_priority, :traffic_gap,
+                        :ad_ratio_index_med, :ad_to_natural_gap, :sp_share_in_ad_gap,
+                        :kw_top3_share_gap, :kw_brand_share_gap, :kw_competitor_share_gap, :t_confidence)
+                """
+            ),
+            {
+                **base_scene,
+                "week": "2025-W02",
+                "sunday": "2025-01-12",
+                "traffic_gap": 0.05,
+                "ad_ratio_index_med": 1.15,
+                "ad_to_natural_gap": 0.07,
+                "sp_share_in_ad_gap": 0.04,
+                "kw_top3_share_gap": 0.03,
+                "kw_brand_share_gap": 0.02,
+                "kw_competitor_share_gap": 0.01,
+                "t_confidence": 0.75,
+            },
+        )
+
+        for row in (
+            {
+                "scene_tag": base_scene["scene_tag"],
+                "base_scene": base_scene["base_scene"],
+                "morphology": base_scene["morphology"],
+                "marketplace_id": base_scene["marketplace_id"],
+                "week": "2025-W01",
+                "sunday": "2025-01-05",
+                "asin": "B0MINE1",
+                "title": "Legacy Gadget Title",
+                "price_current": 21.99,
+                "price_list": 22.99,
+                "coupon_pct": 0.05,
+                "price_net": 19.99,
+                "rank_leaf": 5,
+                "rank_root": 12,
+                "rank_score": 0.5,
+                "image_cnt": 6,
+                "video_cnt": 1,
+                "bullet_cnt": 5,
+                "title_len": 18,
+                "aplus_flag": 1,
+                "content_score": 0.9,
+                "rating": 4.5,
+                "reviews": 150,
+                "social_proof": 0.3,
+                "badge_json": json.dumps(["Prime"]),
+            },
+            {
+                "scene_tag": base_scene["scene_tag"],
+                "base_scene": base_scene["base_scene"],
+                "morphology": base_scene["morphology"],
+                "marketplace_id": base_scene["marketplace_id"],
+                "week": "2025-W02",
+                "sunday": "2025-01-12",
+                "asin": "B0MINE1",
+                "title": "Modern Gadget Title",
+                "price_current": 20.49,
+                "price_list": 21.49,
+                "coupon_pct": 0.0,
+                "price_net": 18.99,
+                "rank_leaf": 4,
+                "rank_root": 9,
+                "rank_score": 0.55,
+                "image_cnt": 7,
+                "video_cnt": 1,
+                "bullet_cnt": 4,
+                "title_len": 19,
+                "aplus_flag": 0,
+                "content_score": 0.8,
+                "rating": 4.4,
+                "reviews": 160,
+                "social_proof": 0.35,
+                "badge_json": json.dumps(["Prime", "Climate"]),
+            },
+            {
+                "scene_tag": base_scene["scene_tag"],
+                "base_scene": base_scene["base_scene"],
+                "morphology": base_scene["morphology"],
+                "marketplace_id": base_scene["marketplace_id"],
+                "week": "2025-W01",
+                "sunday": "2025-01-05",
+                "asin": "B0LEADER1",
+                "title": "Leader Classic",
+                "price_current": 18.99,
+                "price_list": 19.99,
+                "coupon_pct": 0.1,
+                "price_net": 17.49,
+                "rank_leaf": 2,
+                "rank_root": 5,
+                "rank_score": 0.62,
+                "image_cnt": 7,
+                "video_cnt": 0,
+                "bullet_cnt": 6,
+                "title_len": 16,
+                "aplus_flag": 1,
+                "content_score": 0.85,
+                "rating": 4.6,
+                "reviews": 240,
+                "social_proof": 0.4,
+                "badge_json": json.dumps(["BestSeller"]),
+            },
+            {
+                "scene_tag": base_scene["scene_tag"],
+                "base_scene": base_scene["base_scene"],
+                "morphology": base_scene["morphology"],
+                "marketplace_id": base_scene["marketplace_id"],
+                "week": "2025-W02",
+                "sunday": "2025-01-12",
+                "asin": "B0LEADER1",
+                "title": "Leader Classic",
+                "price_current": 18.49,
+                "price_list": 19.49,
+                "coupon_pct": 0.05,
+                "price_net": 17.19,
+                "rank_leaf": 1,
+                "rank_root": 4,
+                "rank_score": 0.65,
+                "image_cnt": 5,
+                "video_cnt": 0,
+                "bullet_cnt": 6,
+                "title_len": 16,
+                "aplus_flag": 1,
+                "content_score": 0.83,
+                "rating": 4.7,
+                "reviews": 255,
+                "social_proof": 0.42,
+                "badge_json": json.dumps(["BestSeller", "Editorial"]),
+            },
+        ):
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO bi_amz_comp_entities_clean
+                    (scene_tag, base_scene, morphology, marketplace_id, week, sunday, asin, title,
+                     price_current, price_list, coupon_pct, price_net, rank_leaf, rank_root, rank_score,
+                     image_cnt, video_cnt, bullet_cnt, title_len, aplus_flag, content_score,
+                     rating, reviews, social_proof, badge_json)
+                    VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday, :asin, :title,
+                            :price_current, :price_list, :coupon_pct, :price_net, :rank_leaf, :rank_root, :rank_score,
+                            :image_cnt, :video_cnt, :bullet_cnt, :title_len, :aplus_flag, :content_score,
+                            :rating, :reviews, :social_proof, :badge_json)
+                    """
+                ),
+                row,
+            )
+
+        conn.execute(
+            text(
+                """
+                INSERT INTO bi_amz_comp_llm_packet
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday,
+                 my_asin, lag_type, opp_type, evidence_json)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday,
+                        :my_asin, :lag_type, :opp_type, :evidence_json)
+                """
+            ),
+            {
+                **base_scene,
+                "week": "2025-W01",
+                "sunday": "2025-01-05",
+                "lag_type": "price",
+                "evidence_json": previous_packet,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO bi_amz_comp_llm_packet
+                (scene_tag, base_scene, morphology, marketplace_id, week, sunday,
+                 my_asin, lag_type, opp_type, evidence_json)
+                VALUES (:scene_tag, :base_scene, :morphology, :marketplace_id, :week, :sunday,
+                        :my_asin, :lag_type, :opp_type, :evidence_json)
+                """
+            ),
+            {
+                **base_scene,
+                "week": "2025-W02",
+                "sunday": "2025-01-12",
+                "lag_type": "price",
+                "evidence_json": current_packet,
+            },
+        )
+
+    results = orchestrator.run_stage3("2025-W02", marketplace_id="US")
+
+    assert len(results) == 1
+    result = results[0]
+    assert isinstance(result, StageThreeResult)
+    assert result.context["week"] == "2025-W02"
+    assert result.context["prev_week"] == "2025-W01"
+    assert result.context["my_asins"] == ["B0MINE1"]
+
+    self_by_channel = {entity.channel: entity for entity in result.self_entities}
+    assert self_by_channel["page"].metric_deltas["price_gap_leader"]["delta"] == pytest.approx(-0.6)
+    assert self_by_channel["page"].metric_deltas["price_gap_leader"]["status"] == "improve"
+    assert self_by_channel["traffic"].metric_deltas["traffic_gap"]["delta"] == pytest.approx(0.02)
+    self_page_diffs = self_by_channel["page"].content_diffs or ()
+    assert any(change["field"] == "title" and change["previous"] == "Legacy Gadget Title" for change in self_page_diffs)
+    assert any(change["field"] == "aplus_flag" and change["current"] is False for change in self_page_diffs)
+    assert any(change["field"] == "badge_json" and change["current"] == ["Prime", "Climate"] for change in self_page_diffs)
+
+    leader_by_channel = {entity.channel: entity for entity in result.leader_entities}
+    assert leader_by_channel["page"].entity_asin == "B0LEADER1"
+    assert leader_by_channel["page"].leader_changed is False
+    assert leader_by_channel["page"].metric_deltas["price_gap_each"]["delta"] == pytest.approx(-0.5)
+    leader_page_diffs = leader_by_channel["page"].content_diffs or ()
+    assert any(change["field"] == "image_cnt" and change["current"] == 5 for change in leader_page_diffs)
+
+    gap_by_channel = {delta.channel: delta for delta in result.gap_deltas}
+    assert gap_by_channel["page"].gap_deltas["price_gap_leader"]["delta"] == pytest.approx(-0.6)
+
+    dimension_lookup = {(dim.lag_type, dim.channel): dim for dim in result.dimensions}
+    price_page_dim = dimension_lookup[("price", "page")]
+    assert price_page_dim.aggregates["improve"] >= 1
+    top_change_metrics = {change["metric"] for change in price_page_dim.top_changes}
+    assert "price_gap_leader" in top_change_metrics
+
+    stage3_dir = tmp_path / "storage" / "2025-W02" / "stage3"
+    stage3_path = stage3_dir / "SCN-TEST_base_standard.json"
+    assert stage3_path.exists()
+    payload = json.loads(stage3_path.read_text())
+    assert payload["context"]["scene_tag"] == "SCN-TEST"
+    assert payload["self_entities"]
+    assert any(change["field"] == "title" for change in payload["self_entities"][0]["content_diffs"])
+
+    facts_payload = stage_three_result_to_facts(result)
+    assert facts_payload["context"]["week"] == "2025-W02"
+    assert facts_payload["self_entities"][0]["entity_role"] == "self"
+    assert any(change["field"] == "badge_json" for change in facts_payload["self_entities"][0]["content_diffs"])
+
+    prompt_path = stage3_dir / "prompts" / "SCN-TEST_base_standard.prompt.json"
+    assert prompt_path.exists()
+    prompt_payload = json.loads(prompt_path.read_text())
+    assert "Stage 3 Competition" in prompt_payload["prompt"]
+    assert prompt_payload["facts"]["context"]["scene_tag"] == "SCN-TEST"
 
 
 def test_materialize_evidence_converts_legacy_refs(sqlite_engine, tmp_path):

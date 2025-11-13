@@ -1274,9 +1274,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--llm-stage",
-        choices=("both", "stage1", "stage2"),
+        choices=("both", "stage1", "stage2", "stage3", "all"),
         default="both",
-        help="Select which LLM stages to execute when running the competition workflow (default: both)",
+        help=(
+            "Select which LLM stages to execute when running the competition workflow (default: both). "
+            "Use 'stage3' to only materialise Stage-3 facts, or 'all' to run every stage."
+        ),
     )
     parser.add_argument(
         "--llm-config",
@@ -1300,6 +1303,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="When set, only recompute and persist compare rows where opp_type='leader'",
     )
     return parser.parse_args(argv)
+
+
+def _resolve_llm_stage_selection(selection: str | None) -> tuple[str, ...]:
+    """Normalise CLI stage selection into the orchestrator friendly tuple."""
+
+    if not selection or selection == "both":
+        return ("stage1", "stage2")
+    if selection == "all":
+        return ("stage1", "stage2", "stage3")
+    return (selection,)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1429,23 +1442,45 @@ def main(argv: Sequence[str] | None = None) -> None:
                     storage_root=args.llm_storage_root,
                 )
                 target_week = resolved_week or args.week
-                if args.llm_stage == "both":
-                    stage_selection: Sequence[str] | None = ("stage1", "stage2")
+                stage_selection = _resolve_llm_stage_selection(args.llm_stage)
+                stage3_requested = "stage3" in stage_selection
+                stage12_selection = tuple(
+                    stage for stage in stage_selection if stage in {"stage1", "stage2"}
+                )
+
+                result = None
+                if stage12_selection:
+                    result = competition_orchestrator.run(
+                        target_week,
+                        marketplace_id=args.mk,
+                        stages=stage12_selection,
+                    )
+                    LOGGER.info(
+                        "competition_pipeline_llm_completed week=%s stage1=%s stage2_candidates=%s stage2=%s storage=%s",
+                        result.week,
+                        result.stage1_processed,
+                        result.stage2_candidates,
+                        result.stage2_processed,
+                        [str(path) for path in result.storage_paths],
+                    )
                 else:
-                    stage_selection = (args.llm_stage,)
-                result = competition_orchestrator.run(
-                    target_week,
-                    marketplace_id=args.mk,
-                    stages=stage_selection,
-                )
-                LOGGER.info(
-                    "competition_pipeline_llm_completed week=%s stage1=%s stage2_candidates=%s stage2=%s storage=%s",
-                    result.week,
-                    result.stage1_processed,
-                    result.stage2_candidates,
-                    result.stage2_processed,
-                    [str(path) for path in result.storage_paths],
-                )
+                    LOGGER.info(
+                        "competition_pipeline_llm_stage12_skipped week=%s stages=%s",
+                        target_week,
+                        stage_selection,
+                    )
+
+                if stage3_requested:
+                    stage3_results = competition_orchestrator.run_stage3(
+                        target_week,
+                        marketplace_id=args.mk,
+                    )
+                    LOGGER.info(
+                        "competition_pipeline_stage3_completed week=%s marketplace_id=%s scenes=%s",
+                        target_week,
+                        args.mk,
+                        len(stage3_results),
+                    )
             finally:
                 client.close()
     except Exception as exc:  # pragma: no cover - CLI level safeguard
@@ -1477,6 +1512,7 @@ __all__ = [
     "_previous_week_label",
     "_latest_week_with_data",
     "_latest_week_with_pairs",
+    "_resolve_llm_stage_selection",
     "_prune_traffic_columns",
     "_prune_to_table",
     "_merge_entities_with_traffic",

@@ -162,6 +162,12 @@ result = compute_competition_features(
 ```
 `tables` 可直接写入 Doris，`result.as_dict()` 则用于 LLM 消费与 JSON Schema 校验。
 
+### Stage-3 场景级 WoW 对比 Facts
+- `CompetitionLLMOrchestrator.run_stage3()` 直接读取 `vw_amz_comp_llm_overview`、`vw_amz_comp_llm_overview_traffic` 与 `bi_amz_comp_llm_packet`，对齐场景与我方 ASIN，输出 `StageThreeResult`。
+- 使用 `stage_three_result_to_facts(result)` 可获得 LLM 友好的 JSON 结构（`context/self_entities/leader_entities/gap_deltas/dimensions`）。
+- 每个场景会在 `storage/competition_llm/{week}/stage3/` 下生成主结果 JSON，并同步生成 `prompts/{scene_tag}_{base_scene}_{morphology}.prompt.json`，其中包含 `competition_stage3_aggregate.md` 提示词和对应 facts。
+- 后续如需串接 Stage3-LLM，可直接复用该 prompt 快照与 facts 作为输入，无需重新拼装特征。
+
 ### 运行命令（数据清洗 + 特征 / Compare 入库）
 ```bash
 python -m scpc.etl.competition_pipeline \
@@ -247,7 +253,7 @@ WHERE marketplace_id = 'US' AND week = '2025W44';
 完成 Compare 之后，可以直接在同一 CLI 中触发 Stage-1/Stage-2 LLM 编排。命令新增以下参数：
 
 - `--with-llm`：在特征 + Compare 结束后继续执行 LLM 阶段；
-- `--llm-stage`：控制执行阶段，可选 `stage1`/`stage2`/`both`（默认 `both`），当选择 `stage2` 时会自动串行跑完 Stage-1 以构建候选；
+- `--llm-stage`：控制执行阶段，可选 `stage1`/`stage2`/`stage3`/`both`/`all`（默认 `both`）。其中 `stage2` 会自动串行跑完 Stage-1 以构建候选，`stage3` 仅生成场景级 Facts 与 Prompt 快照，`all` 会依次执行 Stage-1/Stage-2/Stage-3；
 - `--llm-config`：覆盖默认的 `configs/competition_llm.yaml` 配置（阈值、模型、重试策略）；
 - `--llm-storage-root`：指定 Stage-1/Stage-2 JSON 产出的持久化目录（默认 `storage/competition_llm`）。
 
@@ -260,6 +266,19 @@ python -m scpc.etl.competition_pipeline \
   --compare-only \
   --with-llm \
   --llm-stage stage2 \
+  --llm-config configs/competition_llm.yaml \
+  --llm-storage-root storage/competition_llm
+```
+
+示例：Compare 已入库，仅生成 Stage-3 场景级 Facts 并落盘 Prompt 快照：
+
+```bash
+python -m scpc.etl.competition_pipeline \
+  --mk US \
+  --week 2025W10 \
+  --compare-only \
+  --with-llm \
+  --llm-stage stage3 \
   --llm-config configs/competition_llm.yaml \
   --llm-storage-root storage/competition_llm
 ```
