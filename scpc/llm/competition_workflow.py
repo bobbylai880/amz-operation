@@ -12,11 +12,11 @@ from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Mapping, MutableMapping, Sequence
 from typing import Literal
 
 import yaml
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -205,6 +205,7 @@ _ENTITY_DETAIL_FIELDS: tuple[str, ...] = (
     "image_cnt",
     "video_cnt",
     "bullet_cnt",
+    "title",
     "title_len",
     "aplus_flag",
     "content_score",
@@ -214,6 +215,24 @@ _ENTITY_DETAIL_FIELDS: tuple[str, ...] = (
     "badge_json",
     "brand",
 )
+
+_STAGE3_CONTENT_DIFF_FIELDS: tuple[str, ...] = (
+    "title",
+    "bullet_cnt",
+    "image_cnt",
+    "video_cnt",
+    "aplus_flag",
+    "content_score",
+    "rating",
+    "reviews",
+    "badge_json",
+)
+
+_STAGE3_OPTIONAL_CONTENT_FIELDS: Mapping[str, tuple[str, ...]] = {
+    "bullet_points": ("bullet_points", "bullet_points_array", "bullet_points_json"),
+    "image_urls": ("image_urls", "image_urls_array", "image_urls_json"),
+    "video_urls": ("video_urls", "video_urls_array", "video_urls_json"),
+}
 
 _KEYWORD_LOOKBACK_DAYS = 7
 _RULES_CONFIG_DEFAULT_PATH = Path("configs/competition_lag_rules.yaml")
@@ -480,6 +499,7 @@ class StageThreeEntityDelta:
     channel: Channel
     metric_deltas: Mapping[str, Mapping[str, Any]]
     leader_changed: bool | None = None
+    content_diffs: Sequence[Mapping[str, Any]] | None = None
 
 
 @dataclass(slots=True)
@@ -789,6 +809,7 @@ class CompetitionLLMOrchestrator:
                 leader_previous,
                 target_week,
                 prev_week,
+                marketplace_id=marketplace_id,
             )
         )
 
@@ -836,6 +857,8 @@ class CompetitionLLMOrchestrator:
         leader_previous: Mapping[tuple[Any, ...], Mapping[str, Any]],
         week: str,
         prev_week: str,
+        *,
+        marketplace_id: str | None = None,
     ) -> Sequence[StageThreeResult]:
         """Assemble Stage-3 payloads grouped by scene."""
         stage3_config = getattr(self._config, "stage_3", None)
@@ -870,6 +893,29 @@ class CompetitionLLMOrchestrator:
             scene_contexts=scene_contexts,
             scene_asins=scene_asins,
             sunday_map=sunday_previous,
+        )
+
+        entity_asins_by_week: dict[str, set[str]] = {week: set(), prev_week: set()}
+        for asin_values in scene_asins.values():
+            for asin in asin_values:
+                asin_key = str(asin)
+                if not asin_key:
+                    continue
+                entity_asins_by_week[week].add(asin_key)
+                entity_asins_by_week[prev_week].add(asin_key)
+
+        for leader_entry in leader_current.values():
+            leader_asin = leader_entry.get("leader_asin")
+            if leader_asin:
+                entity_asins_by_week[week].add(str(leader_asin))
+        for leader_entry in leader_previous.values():
+            leader_asin = leader_entry.get("leader_asin")
+            if leader_asin:
+                entity_asins_by_week[prev_week].add(str(leader_asin))
+
+        entity_details = self._load_stage3_entity_details(
+            entity_asins_by_week,
+            marketplace_id=marketplace_id,
         )
 
         results: list[StageThreeResult] = []
@@ -915,6 +961,16 @@ class CompetitionLLMOrchestrator:
                 if leader_asin and "leader_asin" not in entity_context:
                     entity_context["leader_asin"] = leader_asin
 
+                asin_key = str(asin)
+                entity_current = entity_details.get((week, asin_key))
+                entity_previous = entity_details.get((prev_week, asin_key))
+                content_diffs_self = self._compute_stage3_content_diff(
+                    entity_current,
+                    entity_previous,
+                )
+                if not content_diffs_self:
+                    content_diffs_self = None
+
                 if page_current or page_previous:
                     page_metrics = self._compute_stage3_metric_deltas(
                         current=page_current,
@@ -956,6 +1012,7 @@ class CompetitionLLMOrchestrator:
                                 opp_type=str((page_current or {}).get("opp_type")),
                                 channel="page",
                                 metric_deltas=page_metrics,
+                                content_diffs=content_diffs_self,
                             )
                         )
                     gap_page = {
@@ -1057,6 +1114,20 @@ class CompetitionLLMOrchestrator:
                     if leader_asin:
                         leader_context["leader_asin"] = leader_asin
 
+                    leader_asin_key = str(leader_asin) if leader_asin else ""
+                    leader_entity_current = (
+                        entity_details.get((week, leader_asin_key)) if leader_asin_key else None
+                    )
+                    leader_entity_previous = (
+                        entity_details.get((prev_week, leader_asin_key)) if leader_asin_key else None
+                    )
+                    content_diffs_leader = self._compute_stage3_content_diff(
+                        leader_entity_current,
+                        leader_entity_previous,
+                    )
+                    if not content_diffs_leader:
+                        content_diffs_leader = None
+
                     page_leader_metrics = self._compute_stage3_metric_deltas(
                         current=(leader_curr_entry or {}).get("page_metrics"),
                         previous=(leader_prev_entry or {}).get("page_metrics"),
@@ -1094,6 +1165,7 @@ class CompetitionLLMOrchestrator:
                                 channel="page",
                                 metric_deltas=page_leader_metrics,
                                 leader_changed=leader_changed,
+                                content_diffs=content_diffs_leader,
                             )
                         )
 
@@ -1134,6 +1206,7 @@ class CompetitionLLMOrchestrator:
                                 channel="traffic",
                                 metric_deltas=traffic_leader_metrics,
                                 leader_changed=leader_changed,
+                                content_diffs=None,
                             )
                         )
 
@@ -1401,6 +1474,184 @@ class CompetitionLLMOrchestrator:
                 entry["lag_type"] = lag_type
             results[metric] = entry
         return results
+
+    def _load_stage3_entity_details(
+        self,
+        entity_asins_by_week: Mapping[str, Collection[str]],
+        *,
+        marketplace_id: str | None = None,
+    ) -> Mapping[tuple[str, str], Mapping[str, Any]]:
+        if not entity_asins_by_week:
+            return {}
+
+        result: dict[tuple[str, str], Mapping[str, Any]] = {}
+        for week_value, asin_values in entity_asins_by_week.items():
+            asin_list = sorted({str(asin) for asin in asin_values if str(asin)})
+            if not asin_list:
+                continue
+            sql = """
+              SELECT *
+              FROM bi_amz_comp_entities_clean
+              WHERE week = :week
+            """
+            if marketplace_id:
+                sql += " AND marketplace_id = :marketplace_id"
+            sql += " AND asin IN :asins"
+            params: dict[str, Any] = {"week": week_value, "asins": tuple(asin_list)}
+            if marketplace_id:
+                params["marketplace_id"] = marketplace_id
+            try:
+                stmt = text(sql).bindparams(bindparam("asins", expanding=True))
+                with self._engine.connect() as conn:
+                    cursor_result = conn.execute(stmt, params)
+                    fetched = cursor_result.fetchall()
+                rows = [self._serialise_row(dict(row._mapping)) for row in fetched]
+            except SQLAlchemyError as exc:  # pragma: no cover - optional table linkage
+                LOGGER.warning(
+                    "competition_llm.stage3_entity_details_unavailable week=%s marketplace_id=%s error=%s",
+                    week_value,
+                    marketplace_id,
+                    exc,
+                )
+                continue
+            for row in rows:
+                asin_value = row.get("asin")
+                if not asin_value:
+                    continue
+                key = (str(row.get("week")), str(asin_value))
+                result[key] = row
+        return result
+
+    def _compute_stage3_content_diff(
+        self,
+        current_entity: Mapping[str, Any] | None,
+        previous_entity: Mapping[str, Any] | None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not current_entity and not previous_entity:
+            return ()
+
+        diffs: list[Mapping[str, Any]] = []
+        for field in _STAGE3_CONTENT_DIFF_FIELDS:
+            current_value = self._extract_stage3_content_field(current_entity, field)
+            previous_value = self._extract_stage3_content_field(previous_entity, field)
+            if self._stage3_content_values_equal(field, current_value, previous_value):
+                continue
+            diffs.append(
+                {
+                    "field": field,
+                    "previous": self._content_value_for_output(field, previous_value),
+                    "current": self._content_value_for_output(field, current_value),
+                }
+            )
+
+        for canonical, aliases in _STAGE3_OPTIONAL_CONTENT_FIELDS.items():
+            current_value = self._first_stage3_content_value(current_entity, aliases)
+            previous_value = self._first_stage3_content_value(previous_entity, aliases)
+            if self._stage3_content_values_equal(canonical, current_value, previous_value):
+                continue
+            diffs.append(
+                {
+                    "field": canonical,
+                    "previous": self._content_value_for_output(canonical, previous_value),
+                    "current": self._content_value_for_output(canonical, current_value),
+                }
+            )
+
+        return tuple(diffs)
+
+    @staticmethod
+    def _extract_stage3_content_field(
+        entity: Mapping[str, Any] | None, field: str
+    ) -> Any:
+        if not entity:
+            return None
+        return entity.get(field)
+
+    @staticmethod
+    def _first_stage3_content_value(
+        entity: Mapping[str, Any] | None, aliases: Sequence[str]
+    ) -> Any:
+        if not entity:
+            return None
+        for alias in aliases:
+            if alias in entity and entity.get(alias) not in (None, ""):
+                return entity.get(alias)
+        return None
+
+    def _stage3_content_values_equal(self, field: str, current: Any, previous: Any) -> bool:
+        return self._content_value_for_compare(field, current) == self._content_value_for_compare(
+            field, previous
+        )
+
+    def _content_value_for_output(self, field: str, value: Any) -> Any:
+        return self._normalise_stage3_content_value(field, value, for_compare=False)
+
+    def _content_value_for_compare(self, field: str, value: Any) -> Any:
+        return self._normalise_stage3_content_value(field, value, for_compare=True)
+
+    def _normalise_stage3_content_value(
+        self, field: str, value: Any, *, for_compare: bool
+    ) -> Any:
+        if value in (None, ""):
+            return None
+        if isinstance(value, Decimal):
+            value = float(value)
+        if isinstance(value, bytes):  # pragma: no cover - defensive
+            try:
+                value = value.decode("utf-8")
+            except Exception:  # pragma: no cover - decoding fallback
+                value = value.decode(errors="ignore")
+
+        if field == "aplus_flag":
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if not lowered:
+                    return None
+                value = lowered not in {"0", "false", "no", "n"}
+            else:
+                value = bool(value)
+            return value
+
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    value = json.loads(stripped)
+                except json.JSONDecodeError:
+                    value = stripped
+            else:
+                value = stripped
+
+        if isinstance(value, Mapping):
+            if for_compare:
+                return tuple(
+                    (
+                        str(key),
+                        self._normalise_stage3_content_value(field, sub_value, for_compare=True),
+                    )
+                    for key, sub_value in sorted(value.items(), key=lambda item: str(item[0]))
+                )
+            return {
+                str(key): self._normalise_stage3_content_value(field, sub_value, for_compare=False)
+                for key, sub_value in value.items()
+            }
+
+        if isinstance(value, (list, tuple, set)):
+            normalised_items = [
+                self._normalise_stage3_content_value(field, item, for_compare=False)
+                for item in value
+            ]
+            cleaned = [item for item in normalised_items if item is not None]
+            if for_compare:
+                return tuple(cleaned)
+            return cleaned
+
+        if isinstance(value, (int, float, bool)):
+            return value
+
+        return value
 
     def _collect_stage1_inputs(
         self, week: str, marketplace_id: str | None
@@ -4331,7 +4582,7 @@ class CompetitionLLMOrchestrator:
         sql = """
           SELECT price_current, price_list, coupon_pct, price_net,
                  rank_leaf, rank_root, rank_score,
-                 image_cnt, video_cnt, bullet_cnt, title_len, aplus_flag, content_score,
+                 image_cnt, video_cnt, bullet_cnt, title, title_len, aplus_flag, content_score,
                  rating, reviews, social_proof, badge_json
           FROM bi_amz_comp_entities_clean
           WHERE scene_tag=:scene_tag AND base_scene=:base_scene
