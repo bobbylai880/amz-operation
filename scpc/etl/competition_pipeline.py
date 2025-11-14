@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from datetime import date, datetime, timedelta
+from itertools import chain
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -1467,18 +1468,44 @@ def main(argv: Sequence[str] | None = None) -> None:
                         target_week,
                         marketplace_id=args.mk,
                     )
-                    total_stage3_records = 0
-                    for result_item in stage3_results:
-                        for dimension in result_item.page_dimensions:
-                            total_stage3_records += len(dimension.records)
-                        for dimension in result_item.traffic_dimensions:
-                            total_stage3_records += len(dimension.records)
-                    LOGGER.info(
-                        "competition_pipeline_stage3_completed week=%s scenes=%s records=%s",
-                        target_week,
-                        len(stage3_results),
-                        total_stage3_records,
-                    )
+                    summary = competition_orchestrator.stage3_last_summary
+                    if stage3_results:
+                        if summary:
+                            total_stage3_records = summary.record_count
+                        else:
+                            total_stage3_records = sum(
+                                len(dimension.records)
+                                for result_item in stage3_results
+                                for dimension in chain(
+                                    result_item.page_dimensions, result_item.traffic_dimensions
+                                )
+                            )
+                        LOGGER.info(
+                            "competition_pipeline_stage3_completed week=%s prev_week=%s scenes=%s records=%s",
+                            target_week,
+                            summary.week_w1 if summary else None,
+                            len(stage3_results),
+                            total_stage3_records,
+                        )
+                    else:
+                        reason = summary.reason if summary and summary.reason else "no_stage3_output"
+                        hint = None
+                        if reason == "no_delta_rows":
+                            hint = "run_with_compare_and_write"
+                        elif reason == "previous_week_missing":
+                            hint = "missing_previous_pairs"
+                        message = (
+                            "competition_pipeline_stage3_no_output week=%s prev_week=%s reason=%s"
+                        )
+                        args: list[object] = [
+                            target_week,
+                            summary.week_w1 if summary else None,
+                            reason,
+                        ]
+                        if hint:
+                            message += " hint=%s"
+                            args.append(hint)
+                        LOGGER.warning(message, *args)
             finally:
                 client.close()
     except Exception as exc:  # pragma: no cover - CLI level safeguard
