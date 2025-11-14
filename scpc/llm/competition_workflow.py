@@ -138,17 +138,6 @@ _STAGE3_CONTEXT_COLUMNS = {
     "asin_priority",
 }
 
-_STAGE3_LEADER_EXCLUDE_KEYS = {
-    "asin",
-    "opp_asin",
-    "opp_parent_asin",
-    "brand",
-    "opp_brand",
-    "intensity_band",
-    "lag_type",
-    "opp_type",
-}
-
 _LAG_TYPE_FILENAME_ALIASES: Mapping[str, str] = {
     "price": "pricing",
     "rank": "rank",
@@ -232,6 +221,21 @@ _STAGE3_OPTIONAL_CONTENT_FIELDS: Mapping[str, tuple[str, ...]] = {
     "bullet_points": ("bullet_points", "bullet_points_array", "bullet_points_json"),
     "image_urls": ("image_urls", "image_urls_array", "image_urls_json"),
     "video_urls": ("video_urls", "video_urls_array", "video_urls_json"),
+}
+
+_STAGE3_CONTENT_LABELS: Mapping[str, str] = {
+    "title": "标题",
+    "bullet_cnt": "要点",
+    "image_cnt": "图片",
+    "video_cnt": "视频",
+    "aplus_flag": "A+ 页面",
+    "content_score": "内容得分",
+    "rating": "评分",
+    "reviews": "评论",
+    "badge_json": "权益徽章",
+    "bullet_points": "五点描述",
+    "image_urls": "图片素材",
+    "video_urls": "视频素材",
 }
 
 _KEYWORD_LOOKBACK_DAYS = 7
@@ -796,17 +800,12 @@ class CompetitionLLMOrchestrator:
             self._current_marketplace_id = None
             return ()
 
-        leader_current = self._load_stage3_leaders(target_week, marketplace_id)
-        leader_previous = self._load_stage3_leaders(prev_week, marketplace_id)
-
         results = list(
             self._build_stage3_results(
                 current_overview,
                 previous_overview,
                 current_traffic,
                 previous_traffic,
-                leader_current,
-                leader_previous,
                 target_week,
                 prev_week,
                 marketplace_id=marketplace_id,
@@ -853,8 +852,6 @@ class CompetitionLLMOrchestrator:
         previous_overview: Sequence[Mapping[str, Any]],
         current_traffic: Sequence[Mapping[str, Any]],
         previous_traffic: Sequence[Mapping[str, Any]],
-        leader_current: Mapping[tuple[Any, ...], Mapping[str, Any]],
-        leader_previous: Mapping[tuple[Any, ...], Mapping[str, Any]],
         week: str,
         prev_week: str,
         *,
@@ -904,14 +901,23 @@ class CompetitionLLMOrchestrator:
                 entity_asins_by_week[week].add(asin_key)
                 entity_asins_by_week[prev_week].add(asin_key)
 
-        for leader_entry in leader_current.values():
-            leader_asin = leader_entry.get("leader_asin")
-            if leader_asin:
-                entity_asins_by_week[week].add(str(leader_asin))
-        for leader_entry in leader_previous.values():
-            leader_asin = leader_entry.get("leader_asin")
-            if leader_asin:
-                entity_asins_by_week[prev_week].add(str(leader_asin))
+        def _add_leader_candidate(target_week: str, candidate: Any) -> None:
+            asin_value = str(candidate or "").strip()
+            if asin_value:
+                entity_asins_by_week[target_week].add(asin_value)
+
+        def _normalise_leader_asin(candidate: Any) -> str:
+            asin_value = str(candidate or "").strip()
+            return asin_value
+
+        for row in current_page_lookup.values():
+            _add_leader_candidate(week, row.get("opp_asin"))
+        for row in previous_page_lookup.values():
+            _add_leader_candidate(prev_week, row.get("opp_asin"))
+        for row in current_traffic_lookup.values():
+            _add_leader_candidate(week, row.get("opp_asin"))
+        for row in previous_traffic_lookup.values():
+            _add_leader_candidate(prev_week, row.get("opp_asin"))
 
         entity_details = self._load_stage3_entity_details(
             entity_asins_by_week,
@@ -948,18 +954,20 @@ class CompetitionLLMOrchestrator:
                 page_previous = previous_page_lookup.get(row_key)
                 traffic_current = current_traffic_lookup.get(row_key)
                 traffic_previous = previous_traffic_lookup.get(row_key)
-                leader_curr_entry = leader_current.get(row_key)
-                leader_prev_entry = leader_previous.get(row_key)
-                leader_asin = None
-                if leader_curr_entry:
-                    leader_asin = leader_curr_entry.get("leader_asin")
-                elif leader_prev_entry:
-                    leader_asin = leader_prev_entry.get("leader_asin")
+
+                leader_asin_current = _normalise_leader_asin(
+                    (page_current or {}).get("opp_asin")
+                )
+                leader_asin_previous = _normalise_leader_asin(
+                    (page_previous or {}).get("opp_asin")
+                )
+                leader_asin_value = leader_asin_current or leader_asin_previous
+                leader_asin_normalised = leader_asin_value or None
 
                 entity_context = dict(base_context)
                 entity_context["my_asin"] = asin
-                if leader_asin and "leader_asin" not in entity_context:
-                    entity_context["leader_asin"] = leader_asin
+                if leader_asin_normalised and "leader_asin" not in entity_context:
+                    entity_context["leader_asin"] = leader_asin_normalised
 
                 asin_key = str(asin)
                 entity_current = entity_details.get((week, asin_key))
@@ -987,7 +995,7 @@ class CompetitionLLMOrchestrator:
                                     stage3_config.gap_tolerance,
                                 )
                             role = "gap"
-                            entity_asin_for_metric = leader_asin
+                            entity_asin_for_metric = leader_asin_normalised
                         else:
                             role = "self"
                             entity_asin_for_metric = asin
@@ -1049,7 +1057,7 @@ class CompetitionLLMOrchestrator:
                                     stage3_config.gap_tolerance,
                                 )
                             role = "gap"
-                            entity_asin_for_metric = leader_asin
+                            entity_asin_for_metric = leader_asin_normalised
                         else:
                             role = "self"
                             entity_asin_for_metric = asin
@@ -1094,33 +1102,24 @@ class CompetitionLLMOrchestrator:
                             )
                         )
 
-                if leader_curr_entry or leader_prev_entry:
-                    leader_direction_hints: Mapping[str, str] = {}
-                    if leader_curr_entry and leader_curr_entry.get("direction_hints"):
-                        leader_direction_hints = leader_curr_entry["direction_hints"]
-                    elif leader_prev_entry and leader_prev_entry.get("direction_hints"):
-                        leader_direction_hints = leader_prev_entry["direction_hints"]
+                leader_changed: bool | None = None
+                if leader_asin_current and leader_asin_previous:
+                    leader_changed = leader_asin_current != leader_asin_previous
+                elif leader_asin_current or leader_asin_previous:
+                    leader_changed = True
 
-                    leader_changed: bool | None = None
-                    if leader_curr_entry and leader_prev_entry:
-                        leader_changed = (
-                            str(leader_curr_entry.get("leader_asin") or "")
-                            != str(leader_prev_entry.get("leader_asin") or "")
-                        )
-                    elif leader_curr_entry or leader_prev_entry:
-                        leader_changed = True
-
+                if leader_asin_normalised:
                     leader_context = dict(entity_context)
-                    if leader_asin:
-                        leader_context["leader_asin"] = leader_asin
+                    leader_context["leader_asin"] = leader_asin_normalised
 
-                    leader_asin_key = str(leader_asin) if leader_asin else ""
-                    leader_entity_current = (
-                        entity_details.get((week, leader_asin_key)) if leader_asin_key else None
-                    )
-                    leader_entity_previous = (
-                        entity_details.get((prev_week, leader_asin_key)) if leader_asin_key else None
-                    )
+                    leader_row_key = (*scene_key, leader_asin_normalised)
+                    page_leader_current_data = current_page_lookup.get(leader_row_key)
+                    page_leader_previous_data = previous_page_lookup.get(leader_row_key)
+                    traffic_leader_current_data = current_traffic_lookup.get(leader_row_key)
+                    traffic_leader_previous_data = previous_traffic_lookup.get(leader_row_key)
+
+                    leader_entity_current = entity_details.get((week, leader_asin_normalised))
+                    leader_entity_previous = entity_details.get((prev_week, leader_asin_normalised))
                     content_diffs_leader = self._compute_stage3_content_diff(
                         leader_entity_current,
                         leader_entity_previous,
@@ -1129,10 +1128,9 @@ class CompetitionLLMOrchestrator:
                         content_diffs_leader = None
 
                     page_leader_metrics = self._compute_stage3_metric_deltas(
-                        current=(leader_curr_entry or {}).get("page_metrics"),
-                        previous=(leader_prev_entry or {}).get("page_metrics"),
+                        current=page_leader_current_data,
+                        previous=page_leader_previous_data,
                         channel="page",
-                        direction_hints=leader_direction_hints,
                     )
                     for metric, details in page_leader_metrics.items():
                         if _is_gap_metric(metric):
@@ -1150,18 +1148,26 @@ class CompetitionLLMOrchestrator:
                             details=details,
                             my_asin=asin,
                             entity_role="leader",
-                            entity_asin=leader_asin,
+                            entity_asin=leader_asin_normalised,
                         )
                     if page_leader_metrics:
+                        page_leader_opp_type: str | None = None
+                        for row_candidate in (
+                            page_leader_current_data,
+                            page_leader_previous_data,
+                        ):
+                            if row_candidate and row_candidate.get("opp_type") is not None:
+                                page_leader_opp_type = str(row_candidate.get("opp_type"))
+                                break
                         scene_leader.append(
                             StageThreeEntityDelta(
                                 scene_context=leader_context,
                                 week=week,
                                 prev_week=prev_week,
                                 my_asin=asin,
-                                entity_asin=leader_asin,
+                                entity_asin=leader_asin_normalised,
                                 entity_role="leader",
-                                opp_type=str((leader_curr_entry or leader_prev_entry or {}).get("opp_type")),
+                                opp_type=page_leader_opp_type,
                                 channel="page",
                                 metric_deltas=page_leader_metrics,
                                 leader_changed=leader_changed,
@@ -1170,10 +1176,9 @@ class CompetitionLLMOrchestrator:
                         )
 
                     traffic_leader_metrics = self._compute_stage3_metric_deltas(
-                        current=(leader_curr_entry or {}).get("traffic_metrics"),
-                        previous=(leader_prev_entry or {}).get("traffic_metrics"),
+                        current=traffic_leader_current_data,
+                        previous=traffic_leader_previous_data,
                         channel="traffic",
-                        direction_hints=leader_direction_hints,
                     )
                     for metric, details in traffic_leader_metrics.items():
                         if _is_gap_metric(metric):
@@ -1191,18 +1196,26 @@ class CompetitionLLMOrchestrator:
                             details=details,
                             my_asin=asin,
                             entity_role="leader",
-                            entity_asin=leader_asin,
+                            entity_asin=leader_asin_normalised,
                         )
                     if traffic_leader_metrics:
+                        traffic_leader_opp_type: str | None = None
+                        for row_candidate in (
+                            traffic_leader_current_data,
+                            traffic_leader_previous_data,
+                        ):
+                            if row_candidate and row_candidate.get("opp_type") is not None:
+                                traffic_leader_opp_type = str(row_candidate.get("opp_type"))
+                                break
                         scene_leader.append(
                             StageThreeEntityDelta(
                                 scene_context=leader_context,
                                 week=week,
                                 prev_week=prev_week,
                                 my_asin=asin,
-                                entity_asin=leader_asin,
+                                entity_asin=leader_asin_normalised,
                                 entity_role="leader",
-                                opp_type=str((leader_curr_entry or leader_prev_entry or {}).get("opp_type")),
+                                opp_type=traffic_leader_opp_type,
                                 channel="traffic",
                                 metric_deltas=traffic_leader_metrics,
                                 leader_changed=leader_changed,
@@ -1314,117 +1327,6 @@ class CompetitionLLMOrchestrator:
             return cleaned
         return value
 
-    def _load_stage3_leaders(
-        self, week: str, marketplace_id: str | None
-    ) -> Mapping[tuple[Any, ...], Mapping[str, Any]]:
-        sql = """
-          SELECT scene_tag, base_scene, morphology, marketplace_id,
-                 week, sunday, my_asin, lag_type, opp_type, evidence_json
-          FROM bi_amz_comp_llm_packet
-          WHERE week = :week
-        """
-        params: dict[str, Any] = {"week": week}
-        if marketplace_id:
-            sql += " AND marketplace_id = :marketplace_id"
-            params["marketplace_id"] = marketplace_id
-
-        try:
-            rows = self._fetch_all(sql, params)
-        except SQLAlchemyError as exc:
-            LOGGER.warning(
-                "competition_llm.stage3_packet_unavailable week=%s marketplace_id=%s error=%s",
-                week,
-                marketplace_id,
-                exc,
-            )
-            return {}
-
-        result: dict[tuple[Any, ...], Mapping[str, Any]] = {}
-        for row in rows:
-            key = self._build_stage3_row_key(row)
-            if key is None:
-                continue
-            parsed = self._parse_stage3_leader_row(row)
-            if not parsed:
-                continue
-            existing = result.get(key)
-            if not existing or parsed.get("rank_value", math.inf) < existing.get(
-                "rank_value", math.inf
-            ):
-                payload = dict(parsed)
-                if "opp_type" not in payload:
-                    payload["opp_type"] = row.get("opp_type")
-                result[key] = payload
-        return result
-
-    def _parse_stage3_leader_row(
-        self, row: Mapping[str, Any]
-    ) -> Mapping[str, Any] | None:
-        payload = row.get("evidence_json")
-        if not isinstance(payload, str) or not payload.strip():
-            return None
-        try:
-            parsed = json.loads(payload)
-        except json.JSONDecodeError:
-            LOGGER.debug(
-                "competition_llm.stage3_packet_parse_error asin=%s",
-                row.get("my_asin"),
-            )
-            return None
-        if not isinstance(parsed, Mapping):
-            return None
-
-        competitors = parsed.get("top_competitors")
-        if not isinstance(competitors, Sequence):
-            return None
-
-        leader_entry: Mapping[str, Any] | None = None
-        leader_rank = math.inf
-        for item in competitors:
-            if not isinstance(item, Mapping):
-                continue
-            asin = item.get("asin") or item.get("opp_asin")
-            if not asin:
-                continue
-            rank_value = _extract_stage3_rank_value(item)
-            if rank_value < leader_rank:
-                leader_entry = item
-                leader_rank = rank_value
-
-        if leader_entry is None:
-            return None
-
-        page_metrics: dict[str, Any] = {}
-        for key, value in leader_entry.items():
-            if key in _STAGE3_LEADER_EXCLUDE_KEYS:
-                continue
-            if isinstance(value, Mapping):
-                continue
-            page_metrics[key] = value
-
-        traffic_payload = leader_entry.get("traffic")
-        traffic_metrics: dict[str, Any] = {}
-        if isinstance(traffic_payload, Mapping):
-            for key, value in traffic_payload.items():
-                if isinstance(value, Mapping):
-                    continue
-                traffic_metrics[key] = value
-
-        result: dict[str, Any] = {
-            "leader_asin": leader_entry.get("asin") or leader_entry.get("opp_asin"),
-            "page_metrics": page_metrics,
-            "traffic_metrics": traffic_metrics,
-            "direction_hints": _normalise_direction_map(parsed.get("metric_directions")),
-            "rank_value": leader_rank,
-        }
-        lag_type = _normalize_lag_type(row.get("lag_type"))
-        if lag_type:
-            result["lag_type"] = lag_type
-        opp_type = row.get("opp_type")
-        if opp_type is not None:
-            result["opp_type"] = opp_type
-        return result
-
     def _compute_stage3_metric_deltas(
         self,
         *,
@@ -1531,31 +1433,45 @@ class CompetitionLLMOrchestrator:
             return ()
 
         diffs: list[Mapping[str, Any]] = []
+
+        def _append_diff(field: str, current_value: Any, previous_value: Any) -> None:
+            if self._stage3_content_values_equal(field, current_value, previous_value):
+                return
+            current_val_norm = self._content_value_for_output(field, current_value)
+            prev_val_norm = self._content_value_for_output(field, previous_value)
+            direction = _resolve_direction(field, "content", None) or _infer_stage3_direction(
+                field, "page"
+            )
+            delta_value = _compute_delta(current_val_norm, prev_val_norm)
+            worse_flag = _compute_worse(
+                direction,
+                current_val_norm,
+                prev_val_norm,
+                self._direction_tolerance,
+            )
+            note = _generate_stage3_diff_note(field, current_val_norm, prev_val_norm)
+            diffs.append(
+                {
+                    "metric": field,
+                    "against": "previous_week",
+                    "my_value": current_val_norm,
+                    "opp_value": prev_val_norm,
+                    "note": note,
+                    "direction": direction,
+                    "delta": delta_value,
+                    "worsen": worse_flag,
+                }
+            )
+
         for field in _STAGE3_CONTENT_DIFF_FIELDS:
             current_value = self._extract_stage3_content_field(current_entity, field)
             previous_value = self._extract_stage3_content_field(previous_entity, field)
-            if self._stage3_content_values_equal(field, current_value, previous_value):
-                continue
-            diffs.append(
-                {
-                    "field": field,
-                    "previous": self._content_value_for_output(field, previous_value),
-                    "current": self._content_value_for_output(field, current_value),
-                }
-            )
+            _append_diff(field, current_value, previous_value)
 
         for canonical, aliases in _STAGE3_OPTIONAL_CONTENT_FIELDS.items():
             current_value = self._first_stage3_content_value(current_entity, aliases)
             previous_value = self._first_stage3_content_value(previous_entity, aliases)
-            if self._stage3_content_values_equal(canonical, current_value, previous_value):
-                continue
-            diffs.append(
-                {
-                    "field": canonical,
-                    "previous": self._content_value_for_output(canonical, previous_value),
-                    "current": self._content_value_for_output(canonical, current_value),
-                }
-            )
+            _append_diff(canonical, current_value, previous_value)
 
         return tuple(diffs)
 
@@ -5579,18 +5495,6 @@ def _evaluate_stage3_trend(delta: float | None, direction: str | None, tolerance
         return "improve" if delta < 0 else "worsen"
     return "increase" if delta > 0 else "decrease"
 
-
-def _extract_stage3_rank_value(entry: Mapping[str, Any]) -> float:
-    for field in ("rank_leaf", "rank_root", "rank", "rank_pos_pct", "rank_pos"):
-        value = _coerce_float(entry.get(field))
-        if value is not None:
-            return value
-    pressure = _coerce_float(entry.get("pressure"))
-    if pressure is not None:
-        return pressure
-    return math.inf
-
-
 def _is_gap_metric(metric: str | None) -> bool:
     if not metric:
         return False
@@ -5890,6 +5794,115 @@ def _format_opp_label(row: Mapping[str, Any]) -> str:
         parts.append(str(opp_parent))
     parts.append(str(opp_asin))
     return " ".join(part for part in parts if part)
+
+
+def _stage3_value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        return bool(value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_stage3_value_present(item) for item in value)
+    return True
+
+
+def _format_s3_decimal(value: float | None) -> str:
+    if value is None:
+        return "缺失"
+    formatted = f"{value:.2f}".rstrip("0").rstrip(".")
+    return formatted or "0"
+
+
+def _format_s3_count_note(label: str, current: Any, previous: Any, unit: str) -> str:
+    current_num = _coerce_float(current)
+    previous_num = _coerce_float(previous)
+    current_int = int(round(current_num)) if current_num is not None else None
+    previous_int = int(round(previous_num)) if previous_num is not None else None
+    current_text = f"{current_int} {unit}" if current_int is not None else "缺失"
+    previous_text = f"{previous_int} {unit}" if previous_int is not None else "缺失"
+    delta_text = ""
+    if current_int is not None and previous_int is not None:
+        diff = current_int - previous_int
+        if diff > 0:
+            delta_text = f"（多出 {diff}{unit}）"
+        elif diff < 0:
+            delta_text = f"（少了 {abs(diff)}{unit}）"
+    elif current_int is not None and previous_int is None:
+        delta_text = "（上周缺失）"
+    elif current_int is None and previous_int is not None:
+        delta_text = "（本周缺失）"
+    return f"{label}：本周 {current_text} / 上周 {previous_text}{delta_text}"
+
+
+def _format_s3_value_note(label: str, current: Any, previous: Any) -> str:
+    current_num = _coerce_float(current)
+    previous_num = _coerce_float(previous)
+    current_text = _format_s3_decimal(current_num)
+    previous_text = _format_s3_decimal(previous_num)
+    delta_text = ""
+    if current_num is not None and previous_num is not None:
+        diff = current_num - previous_num
+        if abs(diff) > 1e-9:
+            trend = "上升" if diff > 0 else "下降"
+            delta_text = f"（{trend} {_format_s3_decimal(abs(diff))}）"
+    elif current_num is not None and previous_num is None:
+        delta_text = "（上周缺失）"
+    elif current_num is None and previous_num is not None:
+        delta_text = "（本周缺失）"
+    return f"{label}：本周 {current_text} / 上周 {previous_text}{delta_text}"
+
+
+def _format_s3_text_note(label: str, current: Any, previous: Any) -> str:
+    current_present = _stage3_value_present(current)
+    previous_present = _stage3_value_present(previous)
+    if current_present and previous_present:
+        return f"{label}：已变更"
+    if current_present and not previous_present:
+        return f"{label}：本周新增"
+    if not current_present and previous_present:
+        return f"{label}：本周缺失"
+    return f"{label}：无有效数据"
+
+
+def _format_s3_aplus_note(label: str, current: Any, previous: Any) -> str:
+    current_flag = None if current is None else bool(current)
+    previous_flag = None if previous is None else bool(previous)
+    if current_flag is True and previous_flag is not True:
+        return f"{label}：本周上线"
+    if current_flag is False and previous_flag is True:
+        return f"{label}：本周下线"
+    if current_flag is False and previous_flag is None:
+        return f"{label}：仍未上线"
+    if current_flag is None and previous_flag is True:
+        return f"{label}：本周缺失（上周已上线）"
+    if current_flag is None and previous_flag is False:
+        return f"{label}：本周缺失"
+    return f"{label}：状态变更"
+
+
+def _generate_stage3_diff_note(field: str, current: Any, previous: Any) -> str:
+    label = _STAGE3_CONTENT_LABELS.get(field, field)
+    if field == "image_cnt":
+        return _format_s3_count_note(label, current, previous, "张")
+    if field == "video_cnt":
+        return _format_s3_count_note(label, current, previous, "个")
+    if field == "bullet_cnt":
+        return _format_s3_count_note(label, current, previous, "条")
+    if field == "reviews":
+        return _format_s3_count_note(label, current, previous, "条")
+    if field in {"content_score", "rating"}:
+        return _format_s3_value_note(label, current, previous)
+    if field == "aplus_flag":
+        return _format_s3_aplus_note(label, current, previous)
+    if field in {"badge_json", "bullet_points", "image_urls", "video_urls", "title"}:
+        return _format_s3_text_note(label, current, previous)
+    current_num = _coerce_float(current)
+    previous_num = _coerce_float(previous)
+    if current_num is not None or previous_num is not None:
+        return _format_s3_value_note(label, current, previous)
+    return _format_s3_text_note(label, current, previous)
 
 
 def _json_default(obj: Any) -> Any:
