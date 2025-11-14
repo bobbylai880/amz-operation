@@ -38,6 +38,13 @@ class StageTwoConfig:
 
 
 @dataclass(slots=True)
+class StageThreeConfig:
+    enabled: bool = True
+    delta_tolerance: float = 1e-6
+    max_records_per_dimension: int = 50
+
+
+@dataclass(slots=True)
 class LLMRuntimeConfig:
     model: str
     temperature: float
@@ -51,6 +58,7 @@ class LLMRuntimeConfig:
 class CompetitionLLMConfig:
     stage_1: StageOneConfig
     stage_2: StageTwoConfig
+    stage_3: StageThreeConfig
     llm: LLMRuntimeConfig
 
 
@@ -72,6 +80,7 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
 
     stage1_raw = raw.get("stage_1", {})
     stage2_raw = raw.get("stage_2", {})
+    stage3_raw = raw.get("stage_3", {})
     llm_raw = raw.get("llm", {})
 
     stage1_severity_raw = stage1_raw.get("severity_thresholds") or {}
@@ -182,6 +191,28 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         direction_tolerance=direction_tolerance,
     )
 
+    tolerance_raw = stage3_raw.get("delta_tolerance", 1e-6)
+    try:
+        delta_tolerance = float(tolerance_raw)
+    except (TypeError, ValueError):
+        delta_tolerance = 1e-6
+    if delta_tolerance < 0:
+        delta_tolerance = 0.0
+
+    records_limit_raw = stage3_raw.get("max_records_per_dimension", 50)
+    try:
+        records_limit = int(records_limit_raw)
+    except (TypeError, ValueError):
+        records_limit = 50
+    if records_limit < 1:
+        records_limit = 50
+
+    stage3 = StageThreeConfig(
+        enabled=bool(stage3_raw.get("enabled", True)),
+        delta_tolerance=delta_tolerance,
+        max_records_per_dimension=records_limit,
+    )
+
     if not llm_raw.get("model"):
         raise ValueError("llm.model must be configured")
 
@@ -194,12 +225,13 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         timeout=float(llm_raw.get("timeout", 30)),
     )
 
-    return CompetitionLLMConfig(stage_1=stage1, stage_2=stage2, llm=llm)
+    return CompetitionLLMConfig(stage_1=stage1, stage_2=stage2, stage_3=stage3, llm=llm)
 
 
 __all__ = [
     "CompetitionLLMConfig",
     "LLMRuntimeConfig",
+    "StageThreeConfig",
     "StageOneConfig",
     "StageTwoConfig",
     "load_competition_llm_config",

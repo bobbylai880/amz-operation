@@ -50,6 +50,10 @@ stage_2:
       - reviews
   keyword:
     max_pairs_per_opp: 2
+stage_3:
+  enabled: true
+  delta_tolerance: 0.000001
+  max_records_per_dimension: 50
 llm:
   model: deepseek-chat
   temperature: 0.1

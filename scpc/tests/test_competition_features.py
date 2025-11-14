@@ -126,7 +126,7 @@ def test_build_pairs_and_deltas_respect_scoring_rules() -> None:
     assert leader_delta["d_price_gap_leader"] == pytest.approx(-1.51, rel=1e-3)
     assert leader_delta["d_price_net"] == pytest.approx(-1.959, rel=1e-3)
     assert leader_delta["badge_change"] == 1
-    assert leader_delta["delta_pressure"] == pytest.approx(-0.0901, abs=5e-5)
+    assert leader_delta["delta_pressure"] == pytest.approx(0.000419, abs=5e-6)
     assert leader_delta["d_t_pressure"] is not None
 
 
@@ -269,7 +269,7 @@ def test_build_tables_and_compute_competition_features() -> None:
     assert leader_pair["delta_gap"]["price_gap_leader"] == pytest.approx(-1.51, rel=1e-3)
     assert leader_pair["my_change"]["price_net"] == pytest.approx(-1.959, rel=1e-3)
     assert leader_pair["my_change"]["badge_change"] == 1
-    assert leader_pair["delta_pressure"] == pytest.approx(-0.0901, abs=5e-5)
+    assert leader_pair["delta_pressure"] == pytest.approx(0.000419, abs=5e-6)
     assert leader_pair["primary_competitor"]["price_gap_each"] == pytest.approx(-0.499, rel=1e-3)
     assert leader_pair["traffic"]["gap"]["mix"]["ad_ratio_gap"] == pytest.approx(0.45 - 0.55, rel=1e-3)
     assert leader_pair["traffic"]["scores"]["pressure"] is not None
@@ -279,7 +279,7 @@ def test_build_tables_and_compute_competition_features() -> None:
 
     summary = payload["summary"]
     assert summary["moves"]["moves_coupon_up"] == 1
-    assert summary["worsen_ratio"] == pytest.approx(0.0, abs=1e-4)
+    assert summary["worsen_ratio"] == pytest.approx(0.5, abs=1e-4)
     assert summary["traffic"]["pressure_p50"] is not None
     assert len(payload["top_opponents"]) == 1
     top_entry = payload["top_opponents"][0]

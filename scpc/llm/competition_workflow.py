@@ -8,11 +8,11 @@ import os
 import re
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Literal, Mapping, MutableMapping, Sequence
 
 import yaml
 from sqlalchemy import text
@@ -66,6 +66,77 @@ FROM vw_amz_comp_llm_overview
 {marketplace_filter}
 ORDER BY sunday DESC
 LIMIT 1
+"""
+
+_STAGE3_CURRENT_WEEK_SUNDAY_SQL_BASE = """
+SELECT sunday
+FROM bi_amz_comp_pairs
+WHERE week = :week
+{marketplace_filter}
+ORDER BY sunday DESC
+LIMIT 1
+"""
+
+_STAGE3_PREVIOUS_WEEK_SQL_BASE = """
+SELECT week, sunday
+FROM bi_amz_comp_pairs
+WHERE sunday < :sunday
+{marketplace_filter}
+ORDER BY sunday DESC
+LIMIT 1
+"""
+
+_STAGE3_DELTA_SQL_BASE = """
+SELECT
+  scene_tag,
+  base_scene,
+  morphology,
+  marketplace_id,
+  window_id,
+  my_asin,
+  opp_type,
+  week_w0,
+  week_w1,
+  my_parent_asin,
+  d_price_net,
+  d_rank_score,
+  d_social_proof,
+  d_content_score,
+  badge_change,
+  d_price_gap_leader,
+  d_price_index_med,
+  d_rank_pos_pct,
+  d_content_gap,
+  d_social_gap,
+  delta_pressure
+FROM bi_amz_comp_delta
+WHERE week_w0 = :week_w0
+  AND week_w1 = :week_w1
+{marketplace_filter}
+"""
+
+_STAGE3_PAIRS_SQL_BASE = """
+SELECT
+  scene_tag,
+  base_scene,
+  morphology,
+  marketplace_id,
+  week,
+  sunday,
+  my_asin,
+  opp_type,
+  my_parent_asin,
+  opp_asin,
+  price_gap_leader,
+  price_index_med,
+  rank_pos_pct,
+  content_gap,
+  social_gap,
+  badge_delta_sum,
+  pressure
+FROM bi_amz_comp_pairs
+WHERE week IN (:week_w0, :week_w1)
+{marketplace_filter}
 """
 
 _STAGE1_KEY_FIELDS = (
@@ -427,6 +498,94 @@ class CompetitionRunResult:
     storage_paths: Sequence[Path]
 
 
+Channel = Literal["page", "traffic"]
+
+
+@dataclass(slots=True)
+class StageThreeChangeRecord:
+    scene_context: Mapping[str, Any]
+    week_w0: str
+    week_w1: str
+    window_id: str
+    channel: Channel
+    my_asin: str
+    my_parent_asin: str | None
+    opp_type: str
+    leader_asin_w0: str | None
+    leader_asin_w1: str | None
+    leader_changed: bool | None
+    lag_type: str
+    metric: str
+    change_type: str
+    direction: str | None
+    value_w0: float | None
+    value_w1: float | None
+    delta_value: float | None
+    change_summary: str
+    change_payload: Mapping[str, Any]
+
+
+@dataclass(slots=True)
+class StageThreeDimensionChange:
+    scene_context: Mapping[str, Any]
+    week_w0: str
+    week_w1: str
+    channel: Channel
+    lag_type: str
+    total_changes: int
+    total_changes_leader: int
+    total_changes_median: int
+    records: Sequence[StageThreeChangeRecord]
+
+
+@dataclass(slots=True)
+class StageThreeResult:
+    context: Mapping[str, Any]
+    page_dimensions: Sequence[StageThreeDimensionChange]
+    traffic_dimensions: Sequence[StageThreeDimensionChange]
+
+
+_PAGE_METRIC_TO_LAG_TYPE: Mapping[str, str] = {
+    "d_price_net": "price",
+    "d_price_gap_leader": "price",
+    "d_price_index_med": "price",
+    "d_rank_score": "rank",
+    "d_rank_pos_pct": "rank",
+    "d_content_score": "content",
+    "d_content_gap": "content",
+    "d_social_proof": "social",
+    "d_social_gap": "social",
+    "badge_change": "badge",
+    "delta_pressure": "confidence",
+}
+
+_PAGE_METRIC_TO_CHANGE_TYPE: Mapping[str, str] = {
+    "d_price_net": "self_price_change",
+    "d_price_gap_leader": "gap_price_vs_leader_change",
+    "d_price_index_med": "price_index_med_change",
+    "d_rank_score": "self_rank_score_change",
+    "d_rank_pos_pct": "rank_pos_pct_change",
+    "d_content_score": "self_content_score_change",
+    "d_content_gap": "content_gap_change",
+    "d_social_proof": "self_social_proof_change",
+    "d_social_gap": "social_gap_change",
+    "badge_change": "badge_count_change",
+    "delta_pressure": "pressure_change",
+}
+
+_PAGE_METRIC_TO_PAIR_FIELD: Mapping[str, str] = {
+    "d_price_gap_leader": "price_gap_leader",
+    "d_price_index_med": "price_index_med",
+    "d_rank_pos_pct": "rank_pos_pct",
+    "d_content_gap": "content_gap",
+    "d_social_gap": "social_gap",
+    "badge_change": "badge_delta_sum",
+    "delta_pressure": "pressure",
+}
+
+_STAGE3_PAGE_CHANNEL: Channel = "page"
+
+
 def _normalize_lag_type(value: object) -> str:
     mapping = {
         "pricing": "price",
@@ -610,6 +769,78 @@ class CompetitionLLMOrchestrator:
             stage2_processed=len(stage2_outputs),
             storage_paths=tuple(storage_paths),
         )
+
+    def run_stage3(
+        self,
+        week: str | None,
+        *,
+        marketplace_id: str | None = None,
+    ) -> Sequence[StageThreeResult]:
+        """Compute Stage-3 structured change facts without invoking the LLM."""
+
+        if not getattr(self._config, "stage_3", None) or not self._config.stage_3.enabled:
+            LOGGER.info("competition_llm.stage3_disabled")
+            return ()
+
+        target_week = self._resolve_week(week, marketplace_id)
+        prev_week = self._resolve_previous_week(target_week, marketplace_id)
+        if not prev_week:
+            LOGGER.warning(
+                "competition_llm.stage3_prev_week_missing week=%s marketplace_id=%s",
+                target_week,
+                marketplace_id,
+            )
+            return ()
+
+        delta_rows = self._fetch_stage3_delta_rows(target_week, prev_week, marketplace_id)
+        if not delta_rows:
+            LOGGER.debug(
+                "competition_llm.stage3_no_delta week_w0=%s week_w1=%s marketplace_id=%s",
+                target_week,
+                prev_week,
+                marketplace_id,
+            )
+            return ()
+
+        pairs_w0, pairs_w1 = self._fetch_stage3_pairs(target_week, prev_week, marketplace_id)
+        config = self._config.stage_3
+        all_records: list[StageThreeChangeRecord] = []
+        for row in delta_rows:
+            records = self._build_stage3_change_records(row, pairs_w0, pairs_w1, config)
+            if records:
+                all_records.extend(records)
+
+        if not all_records:
+            LOGGER.debug(
+                "competition_llm.stage3_no_records week_w0=%s week_w1=%s marketplace_id=%s",
+                target_week,
+                prev_week,
+                marketplace_id,
+            )
+            return ()
+
+        results = self._assemble_stage3_results(all_records, config.max_records_per_dimension)
+
+        storage_paths: list[Path] = []
+        for result in results:
+            try:
+                storage_paths.append(self._write_stage3_output(result))
+            except OSError as exc:  # pragma: no cover - unexpected filesystem issue
+                LOGGER.warning(
+                    "competition_llm.stage3_write_failed scene=%s error=%s",
+                    result.context,
+                    exc,
+                )
+
+        LOGGER.info(
+            "competition_llm.stage3_completed week_w0=%s week_w1=%s scenes=%s records=%s",
+            target_week,
+            prev_week,
+            len(results),
+            len(all_records),
+        )
+
+        return tuple(results)
 
     def _collect_stage1_inputs(
         self, week: str, marketplace_id: str | None
@@ -1690,6 +1921,40 @@ class CompetitionLLMOrchestrator:
         )
         return resolved_week
 
+    def _resolve_previous_week(self, week: str, marketplace_id: str | None) -> str | None:
+        marketplace_filter = " AND marketplace_id = :marketplace_id" if marketplace_id else ""
+        current_sql = _STAGE3_CURRENT_WEEK_SUNDAY_SQL_BASE.format(
+            marketplace_filter=marketplace_filter
+        )
+        params: dict[str, Any] = {"week": week}
+        if marketplace_id:
+            params["marketplace_id"] = marketplace_id
+        current_row = self._fetch_one(current_sql, params)
+        sunday = current_row.get("sunday") if current_row else None
+        if not sunday:
+            LOGGER.warning(
+                "competition_llm.stage3_current_week_missing week=%s marketplace_id=%s",
+                week,
+                marketplace_id,
+            )
+            return None
+
+        prev_sql = _STAGE3_PREVIOUS_WEEK_SQL_BASE.format(marketplace_filter=marketplace_filter)
+        prev_params: dict[str, Any] = {"sunday": sunday}
+        if marketplace_id:
+            prev_params["marketplace_id"] = marketplace_id
+        prev_row = self._fetch_one(prev_sql, prev_params)
+        if not prev_row or not prev_row.get("week"):
+            return None
+        prev_week = str(prev_row.get("week"))
+        LOGGER.info(
+            "competition_llm.stage3_prev_week_resolved week=%s prev_week=%s marketplace_id=%s",
+            week,
+            prev_week,
+            marketplace_id,
+        )
+        return prev_week
+
     @staticmethod
     def _parse_confidence(value: Any) -> float | None:
         if value is None:
@@ -1714,6 +1979,254 @@ class CompetitionLLMOrchestrator:
             sql += " AND marketplace_id = :marketplace_id"
             params["marketplace_id"] = marketplace_id
         return self._fetch_all(sql, params)
+
+    def _fetch_stage3_delta_rows(
+        self, week_w0: str, week_w1: str, marketplace_id: str | None
+    ) -> Sequence[Mapping[str, Any]]:
+        marketplace_filter = " AND marketplace_id = :marketplace_id" if marketplace_id else ""
+        sql = _STAGE3_DELTA_SQL_BASE.format(marketplace_filter=marketplace_filter)
+        params: dict[str, Any] = {"week_w0": week_w0, "week_w1": week_w1}
+        if marketplace_id:
+            params["marketplace_id"] = marketplace_id
+        return self._fetch_all(sql, params)
+
+    def _fetch_stage3_pairs(
+        self, week_w0: str, week_w1: str, marketplace_id: str | None
+    ) -> tuple[Mapping[tuple[Any, ...], Mapping[str, Any]], Mapping[tuple[Any, ...], Mapping[str, Any]]]:
+        marketplace_filter = " AND marketplace_id = :marketplace_id" if marketplace_id else ""
+        sql = _STAGE3_PAIRS_SQL_BASE.format(marketplace_filter=marketplace_filter)
+        params: dict[str, Any] = {"week_w0": week_w0, "week_w1": week_w1}
+        if marketplace_id:
+            params["marketplace_id"] = marketplace_id
+        rows = self._fetch_all(sql, params)
+        pairs_w0: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        pairs_w1: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        for row in rows:
+            scene_key = (
+                str(row.get("scene_tag") or ""),
+                str(row.get("base_scene") or ""),
+                str(row.get("morphology") or ""),
+                str(row.get("marketplace_id") or ""),
+            )
+            key = (scene_key, str(row.get("my_asin") or ""), str(row.get("opp_type") or ""))
+            week_value = str(row.get("week") or "")
+            if week_value == week_w0:
+                pairs_w0[key] = row
+            elif week_value == week_w1:
+                pairs_w1[key] = row
+        return pairs_w0, pairs_w1
+
+    def _build_stage3_change_records(
+        self,
+        row_delta: Mapping[str, Any],
+        pairs_w0: Mapping[tuple[Any, ...], Mapping[str, Any]],
+        pairs_w1: Mapping[tuple[Any, ...], Mapping[str, Any]],
+        config: "StageThreeConfig",
+    ) -> Sequence[StageThreeChangeRecord]:
+        scene_key = (
+            str(row_delta.get("scene_tag") or ""),
+            str(row_delta.get("base_scene") or ""),
+            str(row_delta.get("morphology") or ""),
+            str(row_delta.get("marketplace_id") or ""),
+        )
+        week_w0 = str(row_delta.get("week_w0") or "")
+        week_w1 = str(row_delta.get("week_w1") or "")
+        window_id = str(row_delta.get("window_id") or "")
+        my_asin = str(row_delta.get("my_asin") or "")
+        opp_type = str(row_delta.get("opp_type") or "")
+        my_parent_asin = row_delta.get("my_parent_asin")
+
+        key_pairs = (scene_key, str(row_delta.get("my_asin") or ""), opp_type)
+        row_w0 = pairs_w0.get(key_pairs)
+        row_w1 = pairs_w1.get(key_pairs)
+
+        leader_asin_w0: str | None = None
+        leader_asin_w1: str | None = None
+        leader_changed: bool | None = None
+        if opp_type.lower() == "leader":
+            leader_asin_w0 = str(row_w0.get("opp_asin")) if row_w0 and row_w0.get("opp_asin") else None
+            leader_asin_w1 = str(row_w1.get("opp_asin")) if row_w1 and row_w1.get("opp_asin") else None
+            if leader_asin_w0 and leader_asin_w1:
+                leader_changed = leader_asin_w0 != leader_asin_w1
+
+        scene_context = {
+            "scene_tag": scene_key[0],
+            "base_scene": scene_key[1],
+            "morphology": scene_key[2],
+            "marketplace_id": scene_key[3],
+        }
+
+        records: list[StageThreeChangeRecord] = []
+        for metric, lag_type in _PAGE_METRIC_TO_LAG_TYPE.items():
+            delta_raw = row_delta.get(metric)
+            delta_numeric = _coerce_float(delta_raw)
+            if delta_numeric is None:
+                continue
+            if abs(delta_numeric) < config.delta_tolerance:
+                continue
+
+            change_type = _PAGE_METRIC_TO_CHANGE_TYPE.get(metric)
+            if not change_type:
+                continue
+
+            direction: str | None
+            if delta_numeric > 0:
+                direction = "up"
+            elif delta_numeric < 0:
+                direction = "down"
+            else:
+                direction = "neutral"
+
+            value_field = _PAGE_METRIC_TO_PAIR_FIELD.get(metric)
+            value_w0 = _coerce_float(row_w0.get(value_field)) if row_w0 and value_field else None
+            value_w1 = _coerce_float(row_w1.get(value_field)) if row_w1 and value_field else None
+
+            change_summary = _build_stage3_change_summary(lag_type, metric, direction, delta_numeric)
+
+            change_payload = {
+                "metric": metric,
+                "lag_type": lag_type,
+                "delta": float(delta_numeric),
+                "week_w0": week_w0,
+                "week_w1": week_w1,
+                "value_w0": value_w0,
+                "value_w1": value_w1,
+                "opp_type": opp_type,
+                "leader_asin_w0": leader_asin_w0,
+                "leader_asin_w1": leader_asin_w1,
+                "window_id": window_id,
+                "my_asin": my_asin,
+            }
+            if value_field:
+                change_payload["value_field"] = value_field
+
+            records.append(
+                StageThreeChangeRecord(
+                    scene_context=scene_context,
+                    week_w0=week_w0,
+                    week_w1=week_w1,
+                    window_id=window_id,
+                    channel=_STAGE3_PAGE_CHANNEL,
+                    my_asin=my_asin,
+                    my_parent_asin=my_parent_asin,
+                    opp_type=opp_type,
+                    leader_asin_w0=leader_asin_w0,
+                    leader_asin_w1=leader_asin_w1,
+                    leader_changed=leader_changed,
+                    lag_type=lag_type,
+                    metric=metric,
+                    change_type=change_type,
+                    direction=direction,
+                    value_w0=value_w0,
+                    value_w1=value_w1,
+                    delta_value=float(delta_numeric),
+                    change_summary=change_summary,
+                    change_payload=change_payload,
+                )
+            )
+
+        return tuple(records)
+
+    def _assemble_stage3_results(
+        self, records: Sequence[StageThreeChangeRecord], max_records_per_dimension: int
+    ) -> Sequence[StageThreeResult]:
+        grouped: dict[tuple[Any, ...], list[StageThreeChangeRecord]] = {}
+        for record in records:
+            key = (
+                record.scene_context.get("scene_tag"),
+                record.scene_context.get("base_scene"),
+                record.scene_context.get("morphology"),
+                record.scene_context.get("marketplace_id"),
+                record.week_w0,
+                record.week_w1,
+            )
+            grouped.setdefault(key, []).append(record)
+
+        results: list[StageThreeResult] = []
+        for key, scene_records in grouped.items():
+            scene_context = {
+                "scene_tag": key[0],
+                "base_scene": key[1],
+                "morphology": key[2],
+                "marketplace_id": key[3],
+                "week_w0": key[4],
+                "week_w1": key[5],
+            }
+            dimension_map: dict[tuple[Channel, str], list[StageThreeChangeRecord]] = {}
+            for record in scene_records:
+                dim_key = (record.channel, record.lag_type)
+                dimension_map.setdefault(dim_key, []).append(record)
+
+            page_dimensions: list[StageThreeDimensionChange] = []
+            traffic_dimensions: list[StageThreeDimensionChange] = []
+            for (channel, lag_type), dim_records in sorted(
+                dimension_map.items(), key=lambda item: (item[0][0], item[0][1])
+            ):
+                sorted_records = sorted(
+                    dim_records,
+                    key=lambda r: (
+                        0 if str(r.opp_type).lower() == "leader" else 1,
+                        -abs(r.delta_value or 0.0),
+                        r.my_asin,
+                    ),
+                )
+                limited_records = tuple(sorted_records[: max_records_per_dimension or len(sorted_records)])
+                dimension = StageThreeDimensionChange(
+                    scene_context=scene_context,
+                    week_w0=scene_context["week_w0"],
+                    week_w1=scene_context["week_w1"],
+                    channel=channel,
+                    lag_type=lag_type,
+                    total_changes=len(dim_records),
+                    total_changes_leader=sum(
+                        1 for item in dim_records if str(item.opp_type).lower() == "leader"
+                    ),
+                    total_changes_median=sum(
+                        1 for item in dim_records if str(item.opp_type).lower() == "median"
+                    ),
+                    records=limited_records,
+                )
+                if channel == _STAGE3_PAGE_CHANNEL:
+                    page_dimensions.append(dimension)
+                else:
+                    traffic_dimensions.append(dimension)
+
+            results.append(
+                StageThreeResult(
+                    context=scene_context,
+                    page_dimensions=tuple(page_dimensions),
+                    traffic_dimensions=tuple(traffic_dimensions),
+                )
+            )
+
+        return tuple(results)
+
+    def _write_stage3_output(self, result: StageThreeResult) -> Path:
+        context = result.context
+        week_w0 = str(context.get("week_w0") or "unknown")
+        storage_name = self._build_stage3_storage_name(context)
+        path = self._storage_root / week_w0 / "stage3" / f"{storage_name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = asdict(result)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
+            encoding="utf-8",
+        )
+        return path
+
+    def _build_stage3_storage_name(self, context: Mapping[str, Any]) -> str:
+        parts = [
+            _sanitize_storage_fragment(context.get("scene_tag")),
+            _sanitize_storage_fragment(context.get("base_scene")),
+            _sanitize_storage_fragment(context.get("morphology")),
+        ]
+        name = "_".join(part for part in parts if part)
+        if not name:
+            name = "scene"
+        marketplace = _sanitize_storage_fragment(context.get("marketplace_id"))
+        if marketplace:
+            name = f"{name}_{marketplace}"
+        return name
 
     def _load_rules_config(self) -> Mapping[str, Any]:
         path_value = self._config.stage_1.rules_config_path or str(_RULES_CONFIG_DEFAULT_PATH)
@@ -4336,6 +4849,118 @@ def _compute_worse(
     return None
 
 
+def _build_stage3_change_summary(
+    lag_type: str, metric: str, direction: str | None, delta_value: float
+) -> str:
+    normalized_direction = direction or "neutral"
+    amount_text = _format_stage3_amount(delta_value)
+    if metric == "d_price_net":
+        if normalized_direction == "up":
+            return f"我方净价较上周上升 {amount_text}"
+        if normalized_direction == "down":
+            return f"我方净价较上周下降 {amount_text}"
+        return "我方净价与上周基本持平"
+    if metric == "d_price_gap_leader":
+        if normalized_direction == "up":
+            return f"与 leader 的净价差拉大 {amount_text}"
+        if normalized_direction == "down":
+            return f"与 leader 的净价差缩小 {amount_text}"
+        return "与 leader 的净价差基本持平"
+    if metric == "d_price_index_med":
+        if normalized_direction == "up":
+            return f"相对中位数的价格指数上升 {amount_text}"
+        if normalized_direction == "down":
+            return f"相对中位数的价格指数下降 {amount_text}"
+        return "相对中位数的价格指数保持稳定"
+    if metric == "d_rank_score":
+        if normalized_direction == "up":
+            return f"排名得分提升 {amount_text}"
+        if normalized_direction == "down":
+            return f"排名得分下降 {amount_text}"
+        return "排名得分保持稳定"
+    if metric == "d_rank_pos_pct":
+        if normalized_direction == "up":
+            return f"排名百分位上升 {amount_text}"
+        if normalized_direction == "down":
+            return f"排名百分位下降 {amount_text}"
+        return "排名百分位基本持平"
+    if metric == "d_content_score":
+        if normalized_direction == "up":
+            return f"内容得分提升 {amount_text}"
+        if normalized_direction == "down":
+            return f"内容得分下降 {amount_text}"
+        return "内容得分保持稳定"
+    if metric == "d_content_gap":
+        if normalized_direction == "up":
+            return f"与竞品的内容差距扩大 {amount_text}"
+        if normalized_direction == "down":
+            return f"与竞品的内容差距缩小 {amount_text}"
+        return "与竞品的内容差距基本持平"
+    if metric == "d_social_proof":
+        if normalized_direction == "up":
+            return f"我方社交证据增加 {amount_text}"
+        if normalized_direction == "down":
+            return f"我方社交证据下降 {amount_text}"
+        return "我方社交证据变化不大"
+    if metric == "d_social_gap":
+        if normalized_direction == "up":
+            return f"与竞品的社交差距扩大 {amount_text}"
+        if normalized_direction == "down":
+            return f"与竞品的社交差距缩小 {amount_text}"
+        return "与竞品的社交差距保持稳定"
+    if metric == "badge_change":
+        count = _format_stage3_badge_delta(delta_value)
+        if normalized_direction == "up":
+            return f"我方新增徽章 {count} 个"
+        if normalized_direction == "down":
+            return f"我方减少徽章 {count} 个"
+        return "我方徽章数保持不变"
+    if metric == "delta_pressure":
+        if normalized_direction == "up":
+            return f"相对压力上升 {amount_text}"
+        if normalized_direction == "down":
+            return f"相对压力下降 {amount_text}"
+        return "相对压力保持稳定"
+
+    direction_phrase = _stage3_direction_phrase(normalized_direction)
+    if direction_phrase:
+        return f"{lag_type} 指标{direction_phrase}{amount_text}"
+    return f"{lag_type} 指标变化 {amount_text}"
+
+
+def _format_stage3_amount(delta_value: float) -> str:
+    magnitude = abs(float(delta_value))
+    if not math.isfinite(magnitude):
+        return "0.00"
+    if magnitude >= 100:
+        return f"{magnitude:.0f}"
+    return f"{magnitude:.2f}"
+
+
+def _format_stage3_badge_delta(delta_value: float) -> int:
+    magnitude = abs(float(delta_value))
+    if not math.isfinite(magnitude):
+        return 0
+    return int(round(magnitude))
+
+
+def _stage3_direction_phrase(direction: str) -> str:
+    if direction == "up":
+        return "上升 "
+    if direction == "down":
+        return "下降 "
+    return ""
+
+
+def _sanitize_storage_fragment(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    if not text:
+        return ""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", text)
+
+
 def _format_signed_value(value: Any) -> str:
     number = _coerce_float(value)
     if number is None:
@@ -4619,6 +5244,9 @@ def _serialise_value(value: Any) -> Any:
 __all__ = [
     "CompetitionLLMOrchestrator",
     "CompetitionRunResult",
+    "StageThreeChangeRecord",
+    "StageThreeDimensionChange",
+    "StageThreeResult",
     "StageOneLLMResult",
     "StageOneResult",
     "StageTwoAggregateResult",

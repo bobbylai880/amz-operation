@@ -23,7 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from scpc.db.engine import create_doris_engine
 from scpc.db.io import replace_into
 from scpc.llm.competition_config import load_competition_llm_config
-from scpc.llm.competition_workflow import CompetitionLLMOrchestrator
+from scpc.llm.competition_workflow import CompetitionLLMOrchestrator, CompetitionRunResult
 from scpc.llm.deepseek_client import create_client_from_env
 from scpc.llm.orchestrator import LLMOrchestrator
 from scpc.etl.competition_features import (
@@ -1274,9 +1274,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--llm-stage",
-        choices=("both", "stage1", "stage2"),
+        choices=("both", "stage1", "stage2", "stage3"),
         default="both",
-        help="Select which LLM stages to execute when running the competition workflow (default: both)",
+        help=(
+            "Select which LLM stages to execute when running the competition workflow "
+            "(default: both). Use 'stage3' to only emit Stage-3 structured deltas."
+        ),
     )
     parser.add_argument(
         "--llm-config",
@@ -1433,19 +1436,49 @@ def main(argv: Sequence[str] | None = None) -> None:
                     stage_selection: Sequence[str] | None = ("stage1", "stage2")
                 else:
                     stage_selection = (args.llm_stage,)
-                result = competition_orchestrator.run(
-                    target_week,
-                    marketplace_id=args.mk,
-                    stages=stage_selection,
-                )
-                LOGGER.info(
-                    "competition_pipeline_llm_completed week=%s stage1=%s stage2_candidates=%s stage2=%s storage=%s",
-                    result.week,
-                    result.stage1_processed,
-                    result.stage2_candidates,
-                    result.stage2_processed,
-                    [str(path) for path in result.storage_paths],
-                )
+
+                stage3_requested = "stage3" in stage_selection
+                stages_12 = tuple(stage for stage in stage_selection if stage in {"stage1", "stage2"})
+
+                result: CompetitionRunResult | None = None
+                if stages_12:
+                    result = competition_orchestrator.run(
+                        target_week,
+                        marketplace_id=args.mk,
+                        stages=stages_12,
+                    )
+                    LOGGER.info(
+                        "competition_pipeline_llm_completed week=%s stage1=%s stage2_candidates=%s stage2=%s storage=%s",
+                        result.week,
+                        result.stage1_processed,
+                        result.stage2_candidates,
+                        result.stage2_processed,
+                        [str(path) for path in result.storage_paths],
+                    )
+                else:
+                    LOGGER.info(
+                        "competition_pipeline_llm_stage12_skipped week=%s selection=%s",
+                        target_week,
+                        stage_selection,
+                    )
+
+                if stage3_requested:
+                    stage3_results = competition_orchestrator.run_stage3(
+                        target_week,
+                        marketplace_id=args.mk,
+                    )
+                    total_stage3_records = 0
+                    for result_item in stage3_results:
+                        for dimension in result_item.page_dimensions:
+                            total_stage3_records += len(dimension.records)
+                        for dimension in result_item.traffic_dimensions:
+                            total_stage3_records += len(dimension.records)
+                    LOGGER.info(
+                        "competition_pipeline_stage3_completed week=%s scenes=%s records=%s",
+                        target_week,
+                        len(stage3_results),
+                        total_stage3_records,
+                    )
             finally:
                 client.close()
     except Exception as exc:  # pragma: no cover - CLI level safeguard

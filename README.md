@@ -244,10 +244,10 @@ WHERE marketplace_id = 'US' AND week = '2025W44';
 测试用例通过 `scpc/tests/data/competition_samples.py` 构造页面与流量事实表，覆盖 `build_traffic_features`、`clean_competition_entities`、主/逐对配对、环比汇总以及 `compute_competition_features` 生成的页面 + 流量双维度判断链，确保第二层竞争主逻辑顺畅运行。
 
 ### 启用 LLM 第二层诊断
-完成 Compare 之后，可以直接在同一 CLI 中触发 Stage-1/Stage-2 LLM 编排。命令新增以下参数：
+完成 Compare 之后，可以直接在同一 CLI 中触发 Stage-1/Stage-2 LLM 编排，或生成 Stage-3 结构化环比变化。命令新增以下参数：
 
 - `--with-llm`：在特征 + Compare 结束后继续执行 LLM 阶段；
-- `--llm-stage`：控制执行阶段，可选 `stage1`/`stage2`/`both`（默认 `both`），当选择 `stage2` 时会自动串行跑完 Stage-1 以构建候选；
+- `--llm-stage`：控制执行阶段，可选 `stage1`/`stage2`/`both`/`stage3`（默认 `both`）。选择 `stage2` 时会自动串行跑完 Stage-1 以构建候选，选择 `stage3` 则仅产出页面侧环比 JSON；
 - `--llm-config`：覆盖默认的 `configs/competition_llm.yaml` 配置（阈值、模型、重试策略）；
 - `--llm-storage-root`：指定 Stage-1/Stage-2 JSON 产出的持久化目录（默认 `storage/competition_llm`）。
 
@@ -264,9 +264,9 @@ python -m scpc.etl.competition_pipeline \
   --llm-storage-root storage/competition_llm
 ```
 
-CLI 会基于配置文件加载 Stage-1 阈值、Stage-2 动作白名单与 DeepSeek 连接参数，依次请求 `vw_amz_comp_llm_overview` 与 `vw_amz_comp_llm_overview_traffic`，完成所选阶段的诊断后把 Schema 校验通过的 JSON 及 Markdown 输出存入目标目录。每次向 LLM 发送请求前，系统会将实际使用的 Prompt+Facts 落盘到 `stage2/prompts/` 目录，便于复核与审计；运行日志会记录提示、重试和跳过原因（如缺失 `llm_packet`）。
+CLI 会基于配置文件加载 Stage-1 阈值、Stage-2 动作白名单与 DeepSeek 连接参数，依次请求 `vw_amz_comp_llm_overview` 与 `vw_amz_comp_llm_overview_traffic`，完成所选阶段的诊断后把 Schema 校验通过的 JSON 及 Markdown 输出存入目标目录。Stage-3 会直接消费 `bi_amz_comp_delta`/`bi_amz_comp_pairs`，生成按维度聚合的环比事实，而不会触发 LLM 调用。每次向 LLM 发送请求前，系统会将实际使用的 Prompt+Facts 落盘到 `stage2/prompts/` 目录，便于复核与审计；运行日志会记录提示、重试和跳过原因（如缺失 `llm_packet`）。
 
-Stage-1 与 Stage-2 的持久化结果位于 `storage/competition_llm/<WEEK>/stage*/` 目录：Stage-1 保留 `B0XXXXXX_<opp>.json`（含上下文、维度列表）；Stage-2 仅输出 `B0XXXXXX_ALL.json` 主 JSON（包含 `machine_json` 与渲染好的差异 Markdown），不会再生成 `_summary.json` / `_summary.md` 附件，避免重复的人工摘要文件占用存储。
+Stage-1 与 Stage-2 的持久化结果位于 `storage/competition_llm/<WEEK>/stage*/` 目录：Stage-1 保留 `B0XXXXXX_<opp>.json`（含上下文、维度列表）；Stage-2 仅输出 `B0XXXXXX_ALL.json` 主 JSON（包含 `machine_json` 与渲染好的差异 Markdown），不会再生成 `_summary.json` / `_summary.md` 附件，避免重复的人工摘要文件占用存储。Stage-3 结构化结果存放于 `storage/competition_llm/<WEEK>/stage3/`，文件以 `scene_tag_baseScene_morphology.json` 命名，供后续 LLM 解读或自助排查使用。
 
 ## 目录结构
 ```
