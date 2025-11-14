@@ -148,7 +148,7 @@ def test_summarize_scene_retries_on_schema_error(
     result = summarize_scene(engine=DummyEngine(), scene="X", mk="US", topn=5)
 
     assert "scene_forecast" in result
-    assert len(result["scene_forecast"]["weeks"]) == 6
+    assert len(result["scene_forecast"]["weeks"]) == 5
     assert "analysis_summary" in result
     assert calls, "expected DeepSeek to be invoked"
     parsed = json.loads(calls[0])
@@ -160,7 +160,7 @@ def test_summarize_scene_retries_on_schema_error(
     scene_guidance = forecast_guidance.get("scene", {}) if isinstance(forecast_guidance, dict) else {}
     weeks = scene_guidance.get("forecast_weeks", []) if isinstance(scene_guidance, dict) else []
     if weeks:
-        assert len(weeks) == 6
+        assert len(weeks) == 5
         first_week = weeks[0]
         assert isinstance(first_week.get("pct_change"), str)
         assert first_week["pct_change"].endswith("%")
@@ -171,7 +171,7 @@ def test_summarize_scene_retries_on_schema_error(
     for kw in keyword_guidance:
         weeks = kw.get("forecast_weeks", [])
         if weeks:
-            assert len(weeks) == 6
+            assert len(weeks) == 5
             first_kw_week = weeks[0]
             assert "projected_vol" in first_kw_week
             assert isinstance(first_kw_week.get("pct_change"), str)
@@ -181,7 +181,14 @@ def test_summarize_scene_retries_on_schema_error(
     assert len(artifacts) == 2
     latest = artifacts[-1]
     stored = json.loads(latest.read_text(encoding="utf-8"))
-    assert stored["system_prompt"] == summarize_scene.__globals__["SYSTEM_PROMPT"]
+    output_config = summarize_scene_module._config_section("output")
+    history_window = summarize_scene_module._as_int(
+        output_config.get("history_window_weeks"),
+        summarize_scene_module.DEFAULT_HISTORY_WINDOW_WEEKS,
+        minimum=1,
+    )
+    expected_prompt = summarize_scene_module._build_system_prompt(history_window)
+    assert stored["system_prompt"] == expected_prompt
     assert stored["scene"] == "X"
     assert stored["marketplace_id"] == "US"
     assert isinstance(stored["facts"], dict)
