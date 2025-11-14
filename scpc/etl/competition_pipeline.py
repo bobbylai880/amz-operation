@@ -1403,11 +1403,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 chunk_size=args.chunk_size,
             )
 
+        compare_results: dict[str, pd.DataFrame] | None = None
         if run_compare:
             current_entities = None
             if feature_results is not None:
                 current_entities = feature_results.get("entities_full")
-            run_competition_compare_pipeline(
+            compare_results = run_competition_compare_pipeline(
                 args.mk,
                 week=resolved_week,
                 previous_week=previous_week,
@@ -1467,6 +1468,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     stage3_results = competition_orchestrator.run_stage3(
                         target_week,
                         marketplace_id=args.mk,
+                        previous_week=previous_week,
+                        compare_tables=compare_results,
                     )
                     summary = competition_orchestrator.stage3_last_summary
                     if stage3_results:

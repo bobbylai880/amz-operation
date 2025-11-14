@@ -3,6 +3,7 @@ import logging
 from dataclasses import replace
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 sqlalchemy = pytest.importorskip("sqlalchemy")
@@ -2508,6 +2509,174 @@ def test_run_stage3_builds_change_records(sqlite_engine, tmp_path):
     output_files = list(stage3_dir.glob("*.json"))
     assert output_files
 
+
+def test_run_stage3_uses_compare_tables(sqlite_engine, tmp_path):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    delta_rows = [
+        {
+            "scene_tag": "SCN-STAGE3",
+            "base_scene": "Kitchen",
+            "morphology": "standard",
+            "marketplace_id": "US",
+            "window_id": "2025-W02__2025-W01",
+            "my_asin": "B0STAGE3",
+            "opp_type": "leader",
+            "week_w0": "2025-W02",
+            "week_w1": "2025-W01",
+            "my_parent_asin": "PARENT-S3",
+            "d_price_net": -2.0,
+            "d_rank_score": 0.3,
+            "d_social_proof": 0.0,
+            "d_content_score": -0.1,
+            "badge_change": 1.0,
+            "d_price_gap_leader": 2.0,
+            "d_price_index_med": None,
+            "d_rank_pos_pct": -0.1,
+            "d_content_gap": 0.05,
+            "d_social_gap": -0.1,
+            "delta_pressure": 0.0,
+        },
+        {
+            "scene_tag": "SCN-STAGE3",
+            "base_scene": "Kitchen",
+            "morphology": "standard",
+            "marketplace_id": "US",
+            "window_id": "2025-W02__2025-W01",
+            "my_asin": "B0STAGE3",
+            "opp_type": "median",
+            "week_w0": "2025-W02",
+            "week_w1": "2025-W01",
+            "my_parent_asin": "PARENT-S3",
+            "d_price_net": None,
+            "d_rank_score": None,
+            "d_social_proof": None,
+            "d_content_score": None,
+            "badge_change": 0.0,
+            "d_price_gap_leader": None,
+            "d_price_index_med": -0.05,
+            "d_rank_pos_pct": None,
+            "d_content_gap": None,
+            "d_social_gap": None,
+            "delta_pressure": 0.2,
+        },
+    ]
+    pairs_rows = [
+        {
+            "scene_tag": "SCN-STAGE3",
+            "base_scene": "Kitchen",
+            "morphology": "standard",
+            "marketplace_id": "US",
+            "week": "2025-W02",
+            "sunday": "2025-01-12",
+            "my_parent_asin": "PARENT-S3",
+            "my_asin": "B0STAGE3",
+            "opp_type": "leader",
+            "opp_asin": "BLEADER-W0",
+            "price_gap_leader": 5.0,
+            "price_index_med": 1.1,
+            "price_z": 0.0,
+            "rank_pos_pct": 0.45,
+            "content_gap": 0.2,
+            "social_gap": 0.1,
+            "badge_delta_sum": 1.0,
+            "pressure": 0.6,
+        },
+        {
+            "scene_tag": "SCN-STAGE3",
+            "base_scene": "Kitchen",
+            "morphology": "standard",
+            "marketplace_id": "US",
+            "week": "2025-W01",
+            "sunday": "2025-01-05",
+            "my_parent_asin": "PARENT-S3",
+            "my_asin": "B0STAGE3",
+            "opp_type": "leader",
+            "opp_asin": "BLEADER-W1",
+            "price_gap_leader": 3.0,
+            "price_index_med": 1.0,
+            "price_z": 0.0,
+            "rank_pos_pct": 0.55,
+            "content_gap": 0.3,
+            "social_gap": 0.2,
+            "badge_delta_sum": 0.0,
+            "pressure": 0.4,
+        },
+        {
+            "scene_tag": "SCN-STAGE3",
+            "base_scene": "Kitchen",
+            "morphology": "standard",
+            "marketplace_id": "US",
+            "week": "2025-W02",
+            "sunday": "2025-01-12",
+            "my_parent_asin": "PARENT-S3",
+            "my_asin": "B0STAGE3",
+            "opp_type": "median",
+            "opp_asin": None,
+            "price_gap_leader": None,
+            "price_index_med": 1.05,
+            "price_z": 0.0,
+            "rank_pos_pct": 0.5,
+            "content_gap": 0.1,
+            "social_gap": 0.0,
+            "badge_delta_sum": 0.0,
+            "pressure": 0.7,
+        },
+        {
+            "scene_tag": "SCN-STAGE3",
+            "base_scene": "Kitchen",
+            "morphology": "standard",
+            "marketplace_id": "US",
+            "week": "2025-W01",
+            "sunday": "2025-01-05",
+            "my_parent_asin": "PARENT-S3",
+            "my_asin": "B0STAGE3",
+            "opp_type": "median",
+            "opp_asin": None,
+            "price_gap_leader": None,
+            "price_index_med": 1.1,
+            "price_z": 0.0,
+            "rank_pos_pct": 0.52,
+            "content_gap": 0.12,
+            "social_gap": 0.05,
+            "badge_delta_sum": 0.0,
+            "pressure": 0.5,
+        },
+    ]
+
+    compare_tables = {
+        "delta": pd.DataFrame(delta_rows),
+        "pairs": pd.DataFrame(pairs_rows),
+    }
+
+    results = orchestrator.run_stage3(
+        "2025-W02",
+        marketplace_id="US",
+        previous_week="2025-W01",
+        compare_tables=compare_tables,
+    )
+
+    assert len(results) == 1
+    summary = orchestrator.stage3_last_summary
+    assert summary.reason is None
+    assert summary.scene_count == 1
+    assert summary.week_w1 == "2025-W01"
+
+    result = results[0]
+    price_dim = next(dim for dim in result.page_dimensions if dim.lag_type == "price")
+    assert price_dim.total_changes == 3
+    assert price_dim.total_changes_leader == 2
+    assert price_dim.total_changes_median == 1
+
+    stage3_dir = tmp_path / "2025-W02" / "stage3"
+    assert stage3_dir.exists()
+    assert list(stage3_dir.glob("*.json"))
 
 def test_run_stage3_without_delta_logs_reason(sqlite_engine, tmp_path, caplog):
     config = load_competition_llm_config(Path("configs/competition_llm.yaml"))

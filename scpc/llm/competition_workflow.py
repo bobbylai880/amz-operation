@@ -793,6 +793,8 @@ class CompetitionLLMOrchestrator:
         week: str | None,
         *,
         marketplace_id: str | None = None,
+        previous_week: str | None = None,
+        compare_tables: Mapping[str, Any] | None = None,
     ) -> Sequence[StageThreeResult]:
         """Compute Stage-3 structured change facts without invoking the LLM."""
 
@@ -808,7 +810,19 @@ class CompetitionLLMOrchestrator:
             return ()
 
         target_week = self._resolve_week(week, marketplace_id)
-        prev_week = self._resolve_previous_week(target_week, marketplace_id)
+        compare_delta_rows: Sequence[Mapping[str, Any]] | None = None
+        compare_pairs_rows: Sequence[Mapping[str, Any]] | None = None
+        if compare_tables:
+            compare_delta_rows = self._normalise_stage3_records(compare_tables.get("delta"))
+            compare_pairs_rows = self._normalise_stage3_records(compare_tables.get("pairs"))
+
+        prev_week = (
+            str(previous_week)
+            if previous_week
+            else self._infer_previous_week_from_delta(compare_delta_rows, target_week)
+        )
+        if not prev_week:
+            prev_week = self._resolve_previous_week(target_week, marketplace_id)
 
         def set_summary(
             reason: str | None,
@@ -833,7 +847,10 @@ class CompetitionLLMOrchestrator:
             )
             return ()
 
-        delta_rows = self._fetch_stage3_delta_rows(target_week, prev_week, marketplace_id)
+        if compare_delta_rows is not None:
+            delta_rows = compare_delta_rows
+        else:
+            delta_rows = self._fetch_stage3_delta_rows(target_week, prev_week, marketplace_id)
         if not delta_rows:
             reason = "no_delta_rows"
             set_summary(reason)
@@ -846,7 +863,12 @@ class CompetitionLLMOrchestrator:
             )
             return ()
 
-        pairs_w0, pairs_w1 = self._fetch_stage3_pairs(target_week, prev_week, marketplace_id)
+        if compare_pairs_rows is not None:
+            pairs_w0, pairs_w1 = self._build_stage3_pairs_from_rows(
+                compare_pairs_rows, target_week, prev_week
+            )
+        else:
+            pairs_w0, pairs_w1 = self._fetch_stage3_pairs(target_week, prev_week, marketplace_id)
         config = self._config.stage_3
         all_records: list[StageThreeChangeRecord] = []
         for row in delta_rows:
@@ -889,6 +911,117 @@ class CompetitionLLMOrchestrator:
         )
 
         return tuple(results)
+
+    @staticmethod
+    def _normalise_stage3_records(data: Any) -> Sequence[Mapping[str, Any]]:
+        if data is None:
+            return ()
+
+        if hasattr(data, "to_dict"):
+            to_dict = getattr(data, "to_dict")
+            if callable(to_dict):
+                try:
+                    data = to_dict(orient="records")  # type: ignore[call-arg]
+                except TypeError:
+                    try:
+                        data = to_dict("records")  # type: ignore[call-arg]
+                    except TypeError:
+                        data = to_dict()
+
+        def sanitize(mapping: Mapping[str, Any]) -> dict[str, Any]:
+            cleaned: dict[str, Any] = {}
+            for key, value in mapping.items():
+                if isinstance(value, float) and math.isnan(value):
+                    cleaned[key] = None
+                else:
+                    cleaned[key] = value
+            return cleaned
+
+        def as_mapping(item: Any) -> Mapping[str, Any] | None:
+            if isinstance(item, Mapping):
+                return sanitize(dict(item))
+            if hasattr(item, "_asdict") and callable(getattr(item, "_asdict")):
+                return sanitize(dict(item._asdict()))
+            return None
+
+        if isinstance(data, Mapping):
+            keys = list(data.keys())
+            if not keys:
+                return ()
+            lengths = []
+            rows: list[dict[str, Any]] = []
+            for key in keys:
+                values = data[key]
+                if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                    lengths.append(len(values))
+                else:
+                    return ()
+            row_count = min(lengths) if lengths else 0
+            for index in range(row_count):
+                row = {key: data[key][index] for key in keys}
+                rows.append(sanitize(row))
+            return tuple(rows)
+
+        if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+            rows = []
+            for item in data:
+                mapping = as_mapping(item)
+                if mapping is not None:
+                    rows.append(mapping)
+            return tuple(rows)
+
+        mapping = as_mapping(data)
+        return (mapping,) if mapping is not None else ()
+
+    @staticmethod
+    def _infer_previous_week_from_delta(
+        delta_rows: Sequence[Mapping[str, Any]] | None, target_week: str
+    ) -> str | None:
+        if not delta_rows:
+            return None
+
+        candidates: set[str] = set()
+        for row in delta_rows:
+            if not isinstance(row, Mapping):
+                continue
+            week_w0 = str(row.get("week_w0") or "")
+            week_w1 = str(row.get("week_w1") or "")
+            if week_w0 and week_w0 != target_week:
+                continue
+            if week_w1:
+                candidates.add(week_w1)
+
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        if candidates:
+            return sorted(candidates)[0]
+        return None
+
+    @staticmethod
+    def _build_stage3_pairs_from_rows(
+        rows: Sequence[Mapping[str, Any]],
+        week_w0: str,
+        week_w1: str,
+    ) -> tuple[Mapping[tuple[Any, ...], Mapping[str, Any]], Mapping[tuple[Any, ...], Mapping[str, Any]]]:
+        pairs_w0: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        pairs_w1: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            scene_key = (
+                str(row.get("scene_tag") or ""),
+                str(row.get("base_scene") or ""),
+                str(row.get("morphology") or ""),
+                str(row.get("marketplace_id") or ""),
+            )
+            key = (scene_key, str(row.get("my_asin") or ""), str(row.get("opp_type") or ""))
+            week_value = str(row.get("week") or "")
+            record = dict(row)
+            if week_value == week_w0:
+                pairs_w0[key] = record
+            elif week_value == week_w1:
+                pairs_w1[key] = record
+        return pairs_w0, pairs_w1
 
     def _collect_stage1_inputs(
         self, week: str, marketplace_id: str | None
