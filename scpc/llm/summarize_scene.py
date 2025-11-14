@@ -20,6 +20,9 @@ from sqlalchemy.engine import Engine
 
 from scpc.llm.deepseek_client import DeepSeekError, create_client_from_env
 from scpc.settings import get_deepseek_settings
+from scpc.utils.dependencies import ensure_packages
+
+ensure_packages([("yaml", "PyYAML")])
 
 import yaml
 

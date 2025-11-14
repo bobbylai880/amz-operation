@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from scpc.utils.dependencies import ensure_packages
+
+ensure_packages([("yaml", "PyYAML"), ("pydantic", "pydantic")])
+
 import yaml
+from pydantic import BaseModel
 
 
 @dataclass(slots=True)
@@ -37,11 +42,11 @@ class StageTwoConfig:
     direction_tolerance: float = 1e-6
 
 
-@dataclass(slots=True)
-class StageThreeConfig:
+class StageThreeConfig(BaseModel):
     enabled: bool = True
-    delta_tolerance: float = 1e-6
-    max_records_per_dimension: int = 50
+    direction_tolerance: float = 1e-6
+    gap_tolerance: float = 1e-6
+    top_n_per_dimension: int = 5
 
 
 @dataclass(slots=True)
@@ -191,26 +196,35 @@ def load_competition_llm_config(path: str | Path) -> CompetitionLLMConfig:
         direction_tolerance=direction_tolerance,
     )
 
-    tolerance_raw = stage3_raw.get("delta_tolerance", 1e-6)
+    direction_tolerance_raw = stage3_raw.get("direction_tolerance", 1e-6)
     try:
-        delta_tolerance = float(tolerance_raw)
+        direction_tolerance = float(direction_tolerance_raw)
     except (TypeError, ValueError):
-        delta_tolerance = 1e-6
-    if delta_tolerance < 0:
-        delta_tolerance = 0.0
+        direction_tolerance = 1e-6
+    if direction_tolerance < 0:
+        direction_tolerance = 0.0
 
-    records_limit_raw = stage3_raw.get("max_records_per_dimension", 50)
+    gap_tolerance_raw = stage3_raw.get("gap_tolerance", 1e-6)
     try:
-        records_limit = int(records_limit_raw)
+        gap_tolerance = float(gap_tolerance_raw)
     except (TypeError, ValueError):
-        records_limit = 50
-    if records_limit < 1:
-        records_limit = 50
+        gap_tolerance = 1e-6
+    if gap_tolerance < 0:
+        gap_tolerance = 0.0
+
+    top_n_raw = stage3_raw.get("top_n_per_dimension", 5)
+    try:
+        top_n_per_dimension = int(top_n_raw)
+    except (TypeError, ValueError):
+        top_n_per_dimension = 5
+    if top_n_per_dimension < 1:
+        top_n_per_dimension = 5
 
     stage3 = StageThreeConfig(
         enabled=bool(stage3_raw.get("enabled", True)),
-        delta_tolerance=delta_tolerance,
-        max_records_per_dimension=records_limit,
+        direction_tolerance=direction_tolerance,
+        gap_tolerance=gap_tolerance,
+        top_n_per_dimension=top_n_per_dimension,
     )
 
     if not llm_raw.get("model"):
