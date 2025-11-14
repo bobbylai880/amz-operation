@@ -3913,15 +3913,24 @@ def _detect_moves(current: pd.DataFrame, previous: pd.DataFrame) -> dict[str, in
     })
 
     merged = current_my.merge(previous_my, on="asin", how="left")
-    coupon_prev = merged["coupon_pct_prev"].fillna(merged["coupon_pct"])
-    price_prev = merged["price_current_prev"].fillna(merged["price_current"])
-    video_prev = merged["video_cnt_prev"].fillna(merged["video_cnt"])
+
+    coupon_curr = pd.to_numeric(merged.get("coupon_pct"), errors="coerce")
+    coupon_prev_raw = pd.to_numeric(merged.get("coupon_pct_prev"), errors="coerce")
+    coupon_prev = coupon_prev_raw.fillna(coupon_curr)
+
+    price_curr = pd.to_numeric(merged.get("price_current"), errors="coerce")
+    price_prev_raw = pd.to_numeric(merged.get("price_current_prev"), errors="coerce")
+    price_prev = price_prev_raw.fillna(price_curr)
+
+    video_curr = pd.to_numeric(merged.get("video_cnt"), errors="coerce")
+    video_prev_raw = pd.to_numeric(merged.get("video_cnt_prev"), errors="coerce")
+    video_prev = video_prev_raw.fillna(video_curr)
     badge_prev = merged["badge_json_prev"].apply(_badge_count)
     badge_curr = merged["badge_json"].apply(_normalise_badges).apply(_badge_count)
 
-    moves_coupon_up = int(((merged["coupon_pct"] - coupon_prev) > 1e-6).sum())
-    moves_price_down = int(((price_prev - merged["price_current"]) > 1e-6).sum())
-    moves_new_video = int(((merged["video_cnt"] - video_prev) > 0).sum())
+    moves_coupon_up = int(((coupon_curr - coupon_prev) > 1e-6).sum())
+    moves_price_down = int(((price_prev - price_curr) > 1e-6).sum())
+    moves_new_video = int(((video_curr - video_prev) > 0).sum())
     moves_badge_gain = int(((badge_curr - badge_prev) > 0).sum())
 
     return {
