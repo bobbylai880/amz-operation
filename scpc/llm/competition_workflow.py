@@ -14,6 +14,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, MutableMapping, Sequence
 
+from scpc.utils.dependencies import ensure_packages
+
+ensure_packages([("yaml", "PyYAML")])
+
 import yaml
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -182,6 +186,21 @@ _METRIC_DIRECTION_MAP: Mapping[str, str] = {
     "rank_score": "higher_better",
     "content_score": "higher_better",
     "price_net": "lower_better",
+    "price_index_med": "lower_better",
+    "price_gap_leader": "lower_better",
+    "content_gap": "higher_better",
+    "social_gap": "higher_better",
+    "badge_delta_sum": "higher_better",
+    "traffic_gap": "higher_better",
+    "ad_ratio_index_med": "higher_better",
+    "ad_to_natural_gap": "higher_better",
+    "sp_share_in_ad_gap": "higher_better",
+    "kw_top3_share_gap": "higher_better",
+    "kw_brand_share_gap": "higher_better",
+    "kw_competitor_share_gap": "higher_better",
+    "pressure": "lower_better",
+    "t_confidence": "higher_better",
+    "confidence": "higher_better",
 }
 
 _ABSOLUTE_RANK_METRICS: frozenset[str] = frozenset({"rank_leaf", "rank_root"})
@@ -796,7 +815,8 @@ class CompetitionLLMOrchestrator:
     ) -> Sequence[StageThreeResult]:
         """Compute Stage-3 structured change facts without invoking the LLM."""
 
-        if not getattr(self._config, "stage_3", None) or not self._config.stage_3.enabled:
+        stage3_config = getattr(self._config, "stage_3", None)
+        if not stage3_config or not stage3_config.enabled:
             self._stage3_last_summary = StageThreeRunSummary(
                 week_w0=None,
                 week_w1=None,
@@ -806,6 +826,8 @@ class CompetitionLLMOrchestrator:
             )
             LOGGER.info("competition_llm.stage3_disabled")
             return ()
+
+        config = stage3_config
 
         target_week = self._resolve_week(week, marketplace_id)
         compare_delta_rows: Sequence[Mapping[str, Any]] | None = None

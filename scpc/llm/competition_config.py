@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from scpc.utils.dependencies import ensure_packages
+
+ensure_packages([("yaml", "PyYAML")])
+
 import yaml
 from pydantic import BaseModel
 
