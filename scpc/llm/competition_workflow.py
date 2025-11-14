@@ -545,6 +545,17 @@ class StageThreeResult:
     traffic_dimensions: Sequence[StageThreeDimensionChange]
 
 
+@dataclass(slots=True)
+class StageThreeRunSummary:
+    """Lightweight summary for the most recent Stage-3 execution."""
+
+    week_w0: str | None
+    week_w1: str | None
+    scene_count: int
+    record_count: int
+    reason: str | None = None
+
+
 _PAGE_METRIC_TO_LAG_TYPE: Mapping[str, str] = {
     "d_price_net": "price",
     "d_price_gap_leader": "price",
@@ -635,6 +646,7 @@ class CompetitionLLMOrchestrator:
         self._current_marketplace_id: str | None = None
         self._brand_cache: dict[str, str | None] = {}
         self._brand_path_tokens: list[str] | None = None
+        self._stage3_last_summary: StageThreeRunSummary | None = None
         env_flag = os.getenv("COMP_RANK_FIX_ENABLED")
         if env_flag is None:
             self._rank_fix_enabled = bool(
@@ -660,6 +672,12 @@ class CompetitionLLMOrchestrator:
             "dropped": 0,
             "evidence_dropped": 0,
         }
+
+    @property
+    def stage3_last_summary(self) -> StageThreeRunSummary | None:
+        """Return the cached summary for the latest Stage-3 invocation."""
+
+        return self._stage3_last_summary
 
     def run(
         self,
@@ -779,12 +797,35 @@ class CompetitionLLMOrchestrator:
         """Compute Stage-3 structured change facts without invoking the LLM."""
 
         if not getattr(self._config, "stage_3", None) or not self._config.stage_3.enabled:
+            self._stage3_last_summary = StageThreeRunSummary(
+                week_w0=None,
+                week_w1=None,
+                scene_count=0,
+                record_count=0,
+                reason="disabled",
+            )
             LOGGER.info("competition_llm.stage3_disabled")
             return ()
 
         target_week = self._resolve_week(week, marketplace_id)
         prev_week = self._resolve_previous_week(target_week, marketplace_id)
+
+        def set_summary(
+            reason: str | None,
+            *,
+            scene_count: int = 0,
+            record_count: int = 0,
+        ) -> None:
+            self._stage3_last_summary = StageThreeRunSummary(
+                week_w0=target_week,
+                week_w1=prev_week,
+                scene_count=scene_count,
+                record_count=record_count,
+                reason=reason,
+            )
+
         if not prev_week:
+            set_summary("previous_week_missing")
             LOGGER.warning(
                 "competition_llm.stage3_prev_week_missing week=%s marketplace_id=%s",
                 target_week,
@@ -794,11 +835,14 @@ class CompetitionLLMOrchestrator:
 
         delta_rows = self._fetch_stage3_delta_rows(target_week, prev_week, marketplace_id)
         if not delta_rows:
-            LOGGER.debug(
-                "competition_llm.stage3_no_delta week_w0=%s week_w1=%s marketplace_id=%s",
+            reason = "no_delta_rows"
+            set_summary(reason)
+            LOGGER.info(
+                "competition_llm.stage3_skipped week_w0=%s week_w1=%s marketplace_id=%s reason=%s hint=compare_outputs_missing",
                 target_week,
                 prev_week,
                 marketplace_id,
+                reason,
             )
             return ()
 
@@ -811,11 +855,14 @@ class CompetitionLLMOrchestrator:
                 all_records.extend(records)
 
         if not all_records:
-            LOGGER.debug(
-                "competition_llm.stage3_no_records week_w0=%s week_w1=%s marketplace_id=%s",
+            reason = "no_matching_changes"
+            set_summary(reason)
+            LOGGER.info(
+                "competition_llm.stage3_skipped week_w0=%s week_w1=%s marketplace_id=%s reason=%s",
                 target_week,
                 prev_week,
                 marketplace_id,
+                reason,
             )
             return ()
 
@@ -832,6 +879,7 @@ class CompetitionLLMOrchestrator:
                     exc,
                 )
 
+        set_summary(None, scene_count=len(results), record_count=len(all_records))
         LOGGER.info(
             "competition_llm.stage3_completed week_w0=%s week_w1=%s scenes=%s records=%s",
             target_week,
@@ -5247,6 +5295,7 @@ __all__ = [
     "StageThreeChangeRecord",
     "StageThreeDimensionChange",
     "StageThreeResult",
+    "StageThreeRunSummary",
     "StageOneLLMResult",
     "StageOneResult",
     "StageTwoAggregateResult",

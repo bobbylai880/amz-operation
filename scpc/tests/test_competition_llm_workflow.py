@@ -1,4 +1,5 @@
 import json
+import logging
 from dataclasses import replace
 from pathlib import Path
 
@@ -2506,3 +2507,89 @@ def test_run_stage3_builds_change_records(sqlite_engine, tmp_path):
     assert stage3_dir.exists()
     output_files = list(stage3_dir.glob("*.json"))
     assert output_files
+
+
+def test_run_stage3_without_delta_logs_reason(sqlite_engine, tmp_path, caplog):
+    config = load_competition_llm_config(Path("configs/competition_llm.yaml"))
+    orchestrator = CompetitionLLMOrchestrator(
+        engine=sqlite_engine,
+        llm_orchestrator=StubLLM(),
+        config=config,
+        storage_root=tmp_path,
+    )
+
+    insert_pairs_sql = text(
+        """
+        INSERT INTO bi_amz_comp_pairs (
+            scene_tag, base_scene, morphology, marketplace_id,
+            week, sunday, my_parent_asin, my_asin, opp_type, opp_asin,
+            price_gap_leader, price_index_med, price_z, rank_pos_pct,
+            content_gap, social_gap, badge_delta_sum, pressure
+        )
+        VALUES (
+            :scene_tag, :base_scene, :morphology, :marketplace_id,
+            :week, :sunday, :my_parent_asin, :my_asin, :opp_type, :opp_asin,
+            :price_gap_leader, :price_index_med, :price_z, :rank_pos_pct,
+            :content_gap, :social_gap, :badge_delta_sum, :pressure
+        )
+        """
+    )
+
+    with sqlite_engine.begin() as conn:
+        conn.execute(text("DELETE FROM bi_amz_comp_pairs"))
+        conn.execute(text("DELETE FROM bi_amz_comp_delta"))
+        base_row = {
+            "scene_tag": "SCN-STAGE3",
+            "base_scene": "Kitchen",
+            "morphology": "standard",
+            "marketplace_id": "US",
+            "week": "2025-W02",
+            "sunday": "2025-01-12",
+            "my_parent_asin": "PARENT-S3",
+            "my_asin": "B0STAGE3",
+            "opp_type": "leader",
+            "opp_asin": "BLEADER-W0",
+            "price_gap_leader": 5.0,
+            "price_index_med": 1.1,
+            "price_z": 0.0,
+            "rank_pos_pct": 0.45,
+            "content_gap": 0.2,
+            "social_gap": 0.1,
+            "badge_delta_sum": 1.0,
+            "pressure": 0.6,
+        }
+        conn.execute(insert_pairs_sql, base_row)
+        prev_row = dict(base_row)
+        prev_row.update(
+            {
+                "week": "2025-W01",
+                "sunday": "2025-01-05",
+                "opp_asin": "BLEADER-W1",
+                "price_gap_leader": 3.0,
+                "price_index_med": 1.0,
+                "rank_pos_pct": 0.5,
+                "content_gap": 0.15,
+                "social_gap": 0.05,
+                "badge_delta_sum": 0.5,
+                "pressure": 0.55,
+            }
+        )
+        conn.execute(insert_pairs_sql, prev_row)
+
+    with caplog.at_level(logging.INFO, logger="scpc.llm.competition_workflow"):
+        results = orchestrator.run_stage3("2025-W02", marketplace_id="US")
+
+    assert results == ()
+    summary = orchestrator.stage3_last_summary
+    assert summary is not None
+    assert summary.reason == "no_delta_rows"
+    assert summary.week_w0 == "2025-W02"
+    assert summary.week_w1 == "2025-W01"
+    assert summary.scene_count == 0
+    assert summary.record_count == 0
+    assert any(
+        "competition_llm.stage3_skipped" in record.message
+        and "reason=no_delta_rows" in record.message
+        for record in caplog.records
+        if record.name == "scpc.llm.competition_workflow"
+    )
