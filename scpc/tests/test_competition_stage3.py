@@ -449,11 +449,13 @@ def test_run_stage3_generates_results(stage3_engine, tmp_path):
     )
     price_gap = page_gap.gap_deltas["price_index_med"]
     assert price_gap["direction"] == "improve"
+    assert price_gap["lag_type"] == "price"
 
     leader_page = next(
         entity for entity in result.leader_entities if entity.channel == "page"
     )
     assert leader_page.leader_changed is True
+    assert leader_page.entity_asin == "LEADER-NEW"
 
     dimension = next(dim for dim in result.dimensions if dim.lag_type == "price")
     assert dimension.aggregates["total_entities"] >= 1

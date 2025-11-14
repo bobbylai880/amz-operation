@@ -542,66 +542,49 @@ class StageThreeRunSummary:
 
 _STAGE3_PAGE_CHANNEL: Channel = "page"
 
-_PAGE_ENTITY_METRICS: Mapping[str, str] = {
+_PAGE_ENTITY_METRICS: tuple[str, ...] = (
+    "price_net",
+    "rank_score",
+    "rank_pos_pct",
+    "content_score",
+    "social_proof",
+    "confidence",
+)
+
+_PAGE_GAP_METRICS: tuple[str, ...] = (
+    "price_gap_leader",
+    "price_index_med",
+    "content_gap",
+    "social_gap",
+    "badge_delta_sum",
+    "pressure",
+)
+
+_TRAFFIC_ENTITY_METRICS: tuple[str, ...] = ("t_confidence",)
+
+_TRAFFIC_GAP_METRICS: tuple[str, ...] = (
+    "traffic_gap",
+    "ad_ratio_index_med",
+    "ad_to_natural_gap",
+    "sp_share_in_ad_gap",
+    "kw_top3_share_gap",
+    "kw_brand_share_gap",
+    "kw_competitor_share_gap",
+)
+
+_STAGE3_METRIC_LAG_MAP: Mapping[str, str] = {
     "price_net": "price",
     "rank_score": "rank",
     "rank_pos_pct": "rank",
     "content_score": "content",
     "social_proof": "social",
-    "price_gap_leader": "price",
-    "price_index_med": "price",
-    "content_gap": "content",
-    "social_gap": "social",
-    "badge_delta_sum": "badge",
-    "pressure": "confidence",
     "confidence": "confidence",
-}
-
-_PAGE_ENTITY_GAP_METRICS: frozenset[str] = frozenset(
-    {
-        "price_gap_leader",
-        "price_index_med",
-        "content_gap",
-        "social_gap",
-        "badge_delta_sum",
-        "pressure",
-    }
-)
-
-_PAGE_GAP_METRICS: Mapping[str, str] = {
     "price_gap_leader": "price",
     "price_index_med": "price",
     "content_gap": "content",
     "social_gap": "social",
-    "rank_pos_pct": "rank",
     "badge_delta_sum": "badge",
     "pressure": "confidence",
-}
-
-_TRAFFIC_ENTITY_METRICS: Mapping[str, str] = {
-    "traffic_gap": "traffic_mix",
-    "ad_ratio_index_med": "traffic_mix",
-    "ad_to_natural_gap": "traffic_mix",
-    "sp_share_in_ad_gap": "traffic_mix",
-    "kw_top3_share_gap": "keyword",
-    "kw_brand_share_gap": "keyword",
-    "kw_competitor_share_gap": "keyword",
-    "t_confidence": "confidence",
-}
-
-_TRAFFIC_ENTITY_GAP_METRICS: frozenset[str] = frozenset(
-    {
-        "traffic_gap",
-        "ad_ratio_index_med",
-        "ad_to_natural_gap",
-        "sp_share_in_ad_gap",
-        "kw_top3_share_gap",
-        "kw_brand_share_gap",
-        "kw_competitor_share_gap",
-    }
-)
-
-_TRAFFIC_GAP_METRICS: Mapping[str, str] = {
     "traffic_gap": "traffic_mix",
     "ad_ratio_index_med": "traffic_mix",
     "ad_to_natural_gap": "traffic_mix",
@@ -2352,13 +2335,6 @@ class CompetitionLLMOrchestrator:
                 return "leader"
             return None
 
-        def extract_asin_from_row(row: Mapping[str, Any]) -> str | None:
-            for key in ("entity_asin", "leader_asin", "opp_asin", "asin"):
-                value = row.get(key)
-                if value:
-                    return str(value)
-            return None
-
         def resolve_week(row: Mapping[str, Any], *, fallback: str = "") -> str:
             for key in ("week", "week_w0", "week_curr", "week_current"):
                 value = row.get(key)
@@ -2403,25 +2379,18 @@ class CompetitionLLMOrchestrator:
                     base_keys.add(key[:-1])
             return base_keys
 
-        def resolve_tolerance(metric: str, gap_metrics: frozenset[str]) -> float:
-            if metric in gap_metrics:
-                tolerance_value = config.gap_tolerance
-            else:
-                tolerance_value = config.direction_tolerance
-            try:
-                tolerance = float(tolerance_value)
-            except (TypeError, ValueError):
-                tolerance = 0.0
-            if tolerance < 0:
-                tolerance = 0.0
-            return tolerance
+        try:
+            entity_tolerance = float(config.direction_tolerance)
+        except (TypeError, ValueError):
+            entity_tolerance = 0.0
+        if entity_tolerance < 0:
+            entity_tolerance = 0.0
 
         def build_entity(
             base_key: tuple[str, str, str, str, str, Channel],
             *,
             role: EntityRole,
-            metrics_map: Mapping[str, str],
-            gap_metrics: frozenset[str],
+            metrics: Sequence[str],
             row_curr: Mapping[str, Any] | None,
             row_prev: Mapping[str, Any] | None,
         ) -> StageThreeEntityDelta | None:
@@ -2454,18 +2423,20 @@ class CompetitionLLMOrchestrator:
             }
 
             metric_payload: dict[str, Mapping[str, float | str | None]] = {}
-            for metric, lag_type in metrics_map.items():
+            for metric in metrics:
+                lag_type = _STAGE3_METRIC_LAG_MAP.get(metric)
+                if not lag_type:
+                    continue
                 value_curr = _coerce_float(row_curr.get(metric)) if row_curr else None
                 value_prev = _coerce_float(row_prev.get(metric)) if row_prev else None
                 if value_curr is None and value_prev is None:
                     continue
-                tolerance = resolve_tolerance(metric, gap_metrics)
                 classification = self._classify_delta(
                     metric,
                     lag_type,
                     value_curr,
                     value_prev,
-                    tolerance=tolerance,
+                    tolerance=entity_tolerance,
                 )
                 classification["lag_type"] = lag_type
                 metric_payload[metric] = classification
@@ -2496,15 +2467,23 @@ class CompetitionLLMOrchestrator:
                 )
                 leader_curr = leader_index_curr.get(leader_curr_key) if week_curr else None
                 leader_prev = leader_index_prev.get(leader_prev_key) if prev_week else None
-                if leader_curr is None and row_curr is not None:
-                    leader_curr = extract_asin_from_row(row_curr)
-                if leader_prev is None and row_prev is not None:
-                    leader_prev = extract_asin_from_row(row_prev)
                 entity_asin = leader_curr or leader_prev
                 if leader_curr is not None and leader_prev is not None:
                     leader_changed = leader_curr != leader_prev
                 elif leader_curr is None or leader_prev is None:
                     leader_changed = None
+
+                if entity_asin is None:
+                    LOGGER.warning(
+                        "competition_llm.stage3_leader_asin_missing scene_tag=%s base_scene=%s morphology=%s marketplace_id=%s my_asin=%s week=%s",
+                        scene_tag,
+                        base_scene,
+                        morphology,
+                        marketplace_id,
+                        my_asin,
+                        week_curr,
+                    )
+                    return None
 
             return StageThreeEntityDelta(
                 scene_context=scene_context,
@@ -2530,8 +2509,7 @@ class CompetitionLLMOrchestrator:
         def process_channel(
             *,
             channel: Channel,
-            metrics_map: Mapping[str, str],
-            gap_metrics: frozenset[str],
+            metrics: Sequence[str],
             curr_index: Mapping[tuple[str, str, str, str, str, Channel, str], Mapping[str, Any]],
             prev_index: Mapping[tuple[str, str, str, str, str, Channel, str], Mapping[str, Any]],
         ) -> None:
@@ -2544,8 +2522,7 @@ class CompetitionLLMOrchestrator:
                 entity_self = build_entity(
                     base_key,
                     role="self",
-                    metrics_map=metrics_map,
-                    gap_metrics=gap_metrics,
+                    metrics=metrics,
                     row_curr=row_curr_self,
                     row_prev=row_prev_self,
                 )
@@ -2557,8 +2534,7 @@ class CompetitionLLMOrchestrator:
                 entity_leader = build_entity(
                     base_key,
                     role="leader",
-                    metrics_map=metrics_map,
-                    gap_metrics=gap_metrics,
+                    metrics=metrics,
                     row_curr=row_curr_leader,
                     row_prev=row_prev_leader,
                 )
@@ -2567,15 +2543,13 @@ class CompetitionLLMOrchestrator:
 
         process_channel(
             channel="page",
-            metrics_map=_PAGE_ENTITY_METRICS,
-            gap_metrics=_PAGE_ENTITY_GAP_METRICS,
+            metrics=_PAGE_ENTITY_METRICS,
             curr_index=page_curr_index,
             prev_index=page_prev_index,
         )
         process_channel(
             channel="traffic",
-            metrics_map=_TRAFFIC_ENTITY_METRICS,
-            gap_metrics=_TRAFFIC_ENTITY_GAP_METRICS,
+            metrics=_TRAFFIC_ENTITY_METRICS,
             curr_index=traffic_curr_index,
             prev_index=traffic_prev_index,
         )
@@ -2660,7 +2634,7 @@ class CompetitionLLMOrchestrator:
         def process_channel(
             *,
             channel: Channel,
-            metrics_map: Mapping[str, str],
+            metrics: Sequence[str],
             curr_index: Mapping[tuple[str, str, str, str, str], Sequence[Mapping[str, Any]]],
             prev_index: Mapping[tuple[str, str, str, str, str], Sequence[Mapping[str, Any]]],
             results: list[StageThreeGapDelta],
@@ -2685,7 +2659,10 @@ class CompetitionLLMOrchestrator:
                     "prev_week": prev_week,
                 }
                 gap_payload: dict[str, Mapping[str, float | str | None]] = {}
-                for metric, lag_type in metrics_map.items():
+                for metric in metrics:
+                    lag_type = _STAGE3_METRIC_LAG_MAP.get(metric)
+                    if not lag_type:
+                        continue
                     value_curr = extract_metric_value(rows_curr, metric)
                     value_prev = extract_metric_value(rows_prev, metric)
                     if value_curr is None and value_prev is None:
@@ -2720,14 +2697,14 @@ class CompetitionLLMOrchestrator:
         results: list[StageThreeGapDelta] = []
         process_channel(
             channel="page",
-            metrics_map=_PAGE_GAP_METRICS,
+            metrics=_PAGE_GAP_METRICS,
             curr_index=page_curr_index,
             prev_index=page_prev_index,
             results=results,
         )
         process_channel(
             channel="traffic",
-            metrics_map=_TRAFFIC_GAP_METRICS,
+            metrics=_TRAFFIC_GAP_METRICS,
             curr_index=traffic_curr_index,
             prev_index=traffic_prev_index,
             results=results,
@@ -2752,7 +2729,7 @@ class CompetitionLLMOrchestrator:
         leader_entities: Sequence[StageThreeEntityDelta],
         gap_deltas: Sequence[StageThreeGapDelta],
         config: StageThreeConfig,
-    ) -> Sequence[StageThreeDimensionChange]:
+        ) -> Sequence[StageThreeDimensionChange]:
         def add_record(
             groups: MutableMapping[
                 tuple[str, str, str, str, str, str, str, Channel],
@@ -2774,6 +2751,8 @@ class CompetitionLLMOrchestrator:
             entity_role: str,
         ) -> None:
             normalized_lag = str(lag_type or "").strip().lower()
+            if not normalized_lag:
+                return
             key = (
                 str(scene_context.get("scene_tag") or ""),
                 str(scene_context.get("base_scene") or ""),
@@ -2866,7 +2845,7 @@ class CompetitionLLMOrchestrator:
                     continue
                 lag_type = str(payload.get("lag_type") or "")
                 if not lag_type:
-                    lag_type = _PAGE_GAP_METRICS.get(metric) or _TRAFFIC_GAP_METRICS.get(metric) or ""
+                    lag_type = _STAGE3_METRIC_LAG_MAP.get(metric, "")
                 direction = payload.get("direction")
                 delta_value = payload.get("delta")
                 if delta_value is not None:
@@ -2937,7 +2916,6 @@ class CompetitionLLMOrchestrator:
                 "count_improve": sum(1 for entry in records if entry.get("direction") == "improve"),
                 "count_worsen": sum(1 for entry in records if entry.get("direction") == "worsen"),
                 "count_stable": sum(1 for entry in records if entry.get("direction") == "stable"),
-                "count_unknown": sum(1 for entry in records if entry.get("direction") == "unknown"),
                 "total_entities": len(records),
             }
 

@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 
 from scpc.utils.dependencies import ensure_packages
 
-ensure_packages([("yaml", "PyYAML")])
+ensure_packages([("yaml", "PyYAML"), ("pydantic", "pydantic")])
 
 import yaml
 from pydantic import BaseModel
