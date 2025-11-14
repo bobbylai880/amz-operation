@@ -545,6 +545,17 @@ class StageThreeResult:
     traffic_dimensions: Sequence[StageThreeDimensionChange]
 
 
+@dataclass(slots=True)
+class StageThreeRunSummary:
+    """Lightweight summary for the most recent Stage-3 execution."""
+
+    week_w0: str | None
+    week_w1: str | None
+    scene_count: int
+    record_count: int
+    reason: str | None = None
+
+
 _PAGE_METRIC_TO_LAG_TYPE: Mapping[str, str] = {
     "d_price_net": "price",
     "d_price_gap_leader": "price",
@@ -635,6 +646,7 @@ class CompetitionLLMOrchestrator:
         self._current_marketplace_id: str | None = None
         self._brand_cache: dict[str, str | None] = {}
         self._brand_path_tokens: list[str] | None = None
+        self._stage3_last_summary: StageThreeRunSummary | None = None
         env_flag = os.getenv("COMP_RANK_FIX_ENABLED")
         if env_flag is None:
             self._rank_fix_enabled = bool(
@@ -660,6 +672,12 @@ class CompetitionLLMOrchestrator:
             "dropped": 0,
             "evidence_dropped": 0,
         }
+
+    @property
+    def stage3_last_summary(self) -> StageThreeRunSummary | None:
+        """Return the cached summary for the latest Stage-3 invocation."""
+
+        return self._stage3_last_summary
 
     def run(
         self,
@@ -775,16 +793,53 @@ class CompetitionLLMOrchestrator:
         week: str | None,
         *,
         marketplace_id: str | None = None,
+        previous_week: str | None = None,
+        compare_tables: Mapping[str, Any] | None = None,
     ) -> Sequence[StageThreeResult]:
         """Compute Stage-3 structured change facts without invoking the LLM."""
 
         if not getattr(self._config, "stage_3", None) or not self._config.stage_3.enabled:
+            self._stage3_last_summary = StageThreeRunSummary(
+                week_w0=None,
+                week_w1=None,
+                scene_count=0,
+                record_count=0,
+                reason="disabled",
+            )
             LOGGER.info("competition_llm.stage3_disabled")
             return ()
 
         target_week = self._resolve_week(week, marketplace_id)
-        prev_week = self._resolve_previous_week(target_week, marketplace_id)
+        compare_delta_rows: Sequence[Mapping[str, Any]] | None = None
+        compare_pairs_rows: Sequence[Mapping[str, Any]] | None = None
+        if compare_tables:
+            compare_delta_rows = self._normalise_stage3_records(compare_tables.get("delta"))
+            compare_pairs_rows = self._normalise_stage3_records(compare_tables.get("pairs"))
+
+        prev_week = (
+            str(previous_week)
+            if previous_week
+            else self._infer_previous_week_from_delta(compare_delta_rows, target_week)
+        )
         if not prev_week:
+            prev_week = self._resolve_previous_week(target_week, marketplace_id)
+
+        def set_summary(
+            reason: str | None,
+            *,
+            scene_count: int = 0,
+            record_count: int = 0,
+        ) -> None:
+            self._stage3_last_summary = StageThreeRunSummary(
+                week_w0=target_week,
+                week_w1=prev_week,
+                scene_count=scene_count,
+                record_count=record_count,
+                reason=reason,
+            )
+
+        if not prev_week:
+            set_summary("previous_week_missing")
             LOGGER.warning(
                 "competition_llm.stage3_prev_week_missing week=%s marketplace_id=%s",
                 target_week,
@@ -792,17 +847,28 @@ class CompetitionLLMOrchestrator:
             )
             return ()
 
-        delta_rows = self._fetch_stage3_delta_rows(target_week, prev_week, marketplace_id)
+        if compare_delta_rows is not None:
+            delta_rows = compare_delta_rows
+        else:
+            delta_rows = self._fetch_stage3_delta_rows(target_week, prev_week, marketplace_id)
         if not delta_rows:
-            LOGGER.debug(
-                "competition_llm.stage3_no_delta week_w0=%s week_w1=%s marketplace_id=%s",
+            reason = "no_delta_rows"
+            set_summary(reason)
+            LOGGER.info(
+                "competition_llm.stage3_skipped week_w0=%s week_w1=%s marketplace_id=%s reason=%s hint=compare_outputs_missing",
                 target_week,
                 prev_week,
                 marketplace_id,
+                reason,
             )
             return ()
 
-        pairs_w0, pairs_w1 = self._fetch_stage3_pairs(target_week, prev_week, marketplace_id)
+        if compare_pairs_rows is not None:
+            pairs_w0, pairs_w1 = self._build_stage3_pairs_from_rows(
+                compare_pairs_rows, target_week, prev_week
+            )
+        else:
+            pairs_w0, pairs_w1 = self._fetch_stage3_pairs(target_week, prev_week, marketplace_id)
         config = self._config.stage_3
         all_records: list[StageThreeChangeRecord] = []
         for row in delta_rows:
@@ -811,11 +877,14 @@ class CompetitionLLMOrchestrator:
                 all_records.extend(records)
 
         if not all_records:
-            LOGGER.debug(
-                "competition_llm.stage3_no_records week_w0=%s week_w1=%s marketplace_id=%s",
+            reason = "no_matching_changes"
+            set_summary(reason)
+            LOGGER.info(
+                "competition_llm.stage3_skipped week_w0=%s week_w1=%s marketplace_id=%s reason=%s",
                 target_week,
                 prev_week,
                 marketplace_id,
+                reason,
             )
             return ()
 
@@ -832,6 +901,7 @@ class CompetitionLLMOrchestrator:
                     exc,
                 )
 
+        set_summary(None, scene_count=len(results), record_count=len(all_records))
         LOGGER.info(
             "competition_llm.stage3_completed week_w0=%s week_w1=%s scenes=%s records=%s",
             target_week,
@@ -841,6 +911,117 @@ class CompetitionLLMOrchestrator:
         )
 
         return tuple(results)
+
+    @staticmethod
+    def _normalise_stage3_records(data: Any) -> Sequence[Mapping[str, Any]]:
+        if data is None:
+            return ()
+
+        if hasattr(data, "to_dict"):
+            to_dict = getattr(data, "to_dict")
+            if callable(to_dict):
+                try:
+                    data = to_dict(orient="records")  # type: ignore[call-arg]
+                except TypeError:
+                    try:
+                        data = to_dict("records")  # type: ignore[call-arg]
+                    except TypeError:
+                        data = to_dict()
+
+        def sanitize(mapping: Mapping[str, Any]) -> dict[str, Any]:
+            cleaned: dict[str, Any] = {}
+            for key, value in mapping.items():
+                if isinstance(value, float) and math.isnan(value):
+                    cleaned[key] = None
+                else:
+                    cleaned[key] = value
+            return cleaned
+
+        def as_mapping(item: Any) -> Mapping[str, Any] | None:
+            if isinstance(item, Mapping):
+                return sanitize(dict(item))
+            if hasattr(item, "_asdict") and callable(getattr(item, "_asdict")):
+                return sanitize(dict(item._asdict()))
+            return None
+
+        if isinstance(data, Mapping):
+            keys = list(data.keys())
+            if not keys:
+                return ()
+            lengths = []
+            rows: list[dict[str, Any]] = []
+            for key in keys:
+                values = data[key]
+                if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                    lengths.append(len(values))
+                else:
+                    return ()
+            row_count = min(lengths) if lengths else 0
+            for index in range(row_count):
+                row = {key: data[key][index] for key in keys}
+                rows.append(sanitize(row))
+            return tuple(rows)
+
+        if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+            rows = []
+            for item in data:
+                mapping = as_mapping(item)
+                if mapping is not None:
+                    rows.append(mapping)
+            return tuple(rows)
+
+        mapping = as_mapping(data)
+        return (mapping,) if mapping is not None else ()
+
+    @staticmethod
+    def _infer_previous_week_from_delta(
+        delta_rows: Sequence[Mapping[str, Any]] | None, target_week: str
+    ) -> str | None:
+        if not delta_rows:
+            return None
+
+        candidates: set[str] = set()
+        for row in delta_rows:
+            if not isinstance(row, Mapping):
+                continue
+            week_w0 = str(row.get("week_w0") or "")
+            week_w1 = str(row.get("week_w1") or "")
+            if week_w0 and week_w0 != target_week:
+                continue
+            if week_w1:
+                candidates.add(week_w1)
+
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        if candidates:
+            return sorted(candidates)[0]
+        return None
+
+    @staticmethod
+    def _build_stage3_pairs_from_rows(
+        rows: Sequence[Mapping[str, Any]],
+        week_w0: str,
+        week_w1: str,
+    ) -> tuple[Mapping[tuple[Any, ...], Mapping[str, Any]], Mapping[tuple[Any, ...], Mapping[str, Any]]]:
+        pairs_w0: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        pairs_w1: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            scene_key = (
+                str(row.get("scene_tag") or ""),
+                str(row.get("base_scene") or ""),
+                str(row.get("morphology") or ""),
+                str(row.get("marketplace_id") or ""),
+            )
+            key = (scene_key, str(row.get("my_asin") or ""), str(row.get("opp_type") or ""))
+            week_value = str(row.get("week") or "")
+            record = dict(row)
+            if week_value == week_w0:
+                pairs_w0[key] = record
+            elif week_value == week_w1:
+                pairs_w1[key] = record
+        return pairs_w0, pairs_w1
 
     def _collect_stage1_inputs(
         self, week: str, marketplace_id: str | None
@@ -5247,6 +5428,7 @@ __all__ = [
     "StageThreeChangeRecord",
     "StageThreeDimensionChange",
     "StageThreeResult",
+    "StageThreeRunSummary",
     "StageOneLLMResult",
     "StageOneResult",
     "StageTwoAggregateResult",
