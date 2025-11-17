@@ -78,7 +78,7 @@ python -m scpc.etl.scene_pipeline \
 与 WoW 正负驱动，确保关键逻辑在无真实数据库时也能复现。
 
 ## Competition 模块
-第二层（LLM 判因）竞争对比逻辑及其页面/流量清洗、特征与对比表已下线，当前仅保留 Stage-1 规则诊断与 Stage-3 结构化输出。
+第二层（LLM 判因）竞争对比逻辑及其页面/流量清洗、特征与对比表已下线，当前仅保留特征工程 + Compare 结果（Stage-1/Stage-2/Stage-3 判因全部停用）。
 
 ### 主逻辑：事实 → 特征 → 对比
 1. **事实表（Facts）**
@@ -92,7 +92,7 @@ python -m scpc.etl.scene_pipeline \
    - 逐对配对与环比：`build_competition_pairs_each()`、`build_competition_delta()`、`summarise_competition_scene()` 分别刻画具体竞品、WoW 变化及场景周报指标，对应 `bi_amz_comp_pairs_each`、`bi_amz_comp_traffic_pairs_each`、`bi_amz_comp_delta`、`bi_amz_comp_scene_week_metrics`。
 4. **环比与汇总（Delta & Summary）**
    - 评分参数取自 `configs/competition_scoring.yaml` 与 `default_traffic`，在主配对与逐对配对中计算 `score_*`、`t_score_*`、`pressure`、`t_pressure` 等结构化分值，形成页面 + 流量两条判断链；
-   - Stage-2 LLM 聚合与相关页面/流量特征输出已移除，当前流程止于 Stage-1 规则结果与 Stage-3 结构化事实。
+   - LLM 判因阶段（Stage-1/2/3）已整体下线，Compare 生成的结构化事实即为最终产出。
 
 ### 数据契约
 - **输入事实层**：页面与场景标签 (`bi_amz_asin_product_snapshot`、`bi_amz_asin_scene_tag`)；
@@ -220,30 +220,7 @@ WHERE marketplace_id = 'US' AND week = '2025W44';
 
 测试用例通过 `scpc/tests/data/competition_samples.py` 构造页面与流量事实表，覆盖 `build_traffic_features`、`clean_competition_entities`、主/逐对配对与环比汇总，确保页面/流量特征与 Compare 生成链路稳定。
 
-### LLM 诊断
-Compare 完成后，可以在同一 CLI 中触发 Stage-1（规则 + 可选 LLM）或 Stage-3 结构化环比变化。命令新增以下参数：
-
-- `--with-llm`：在特征 + Compare 结束后继续执行 LLM 阶段；
-- `--llm-stage`：控制执行阶段，可选 `stage1`/`stage3`/`both`（默认 `both`，即 Stage-1 + Stage-3）；
-- `--llm-config`：覆盖默认的 `configs/competition_llm.yaml` 配置（阈值、模型、重试策略）；
-- `--llm-storage-root`：指定 Stage-1/Stage-3 JSON 产出的持久化目录（默认 `storage/competition_llm`）。
-
-示例：Compare 已入库，仅重跑 Stage-1 LLM 并将结果写入 `storage/competition_llm/2025W10/`：
-
-```bash
-python -m scpc.etl.competition_pipeline \
-  --mk US \
-  --week 2025W10 \
-  --compare-only \
-  --with-llm \
-  --llm-stage stage1 \
-  --llm-config configs/competition_llm.yaml \
-  --llm-storage-root storage/competition_llm
-```
-
-CLI 会基于配置文件加载 Stage-1 阈值与 DeepSeek 连接参数，依次请求 `vw_amz_comp_llm_overview` 与 `vw_amz_comp_llm_overview_traffic`，完成所选阶段的诊断后把 Schema 校验通过的 JSON 输出存入目标目录。Stage-3 会直接消费 `bi_amz_comp_delta`/`bi_amz_comp_pairs`，生成按维度聚合的环比事实。运行日志会记录提示、重试和跳过原因（如缺失 `llm_packet`）。
-
-Stage-1 的持久化结果位于 `storage/competition_llm/<WEEK>/stage1/` 目录；Stage-3 结构化结果存放于 `storage/competition_llm/<WEEK>/stage3/`，文件以 `scene_tag_baseScene_morphology.json` 命名，供后续 LLM 解读或自助排查使用。
+> **说明**：原 LLM 判因（Stage-1/2/3）不再提供 CLI 开关或持久化产物，如需诊断可直接消费 Compare 结果或接入外部分析工具。
 
 ## 目录结构
 ```
@@ -281,7 +258,7 @@ SCPC_LOG_DIR=storage/logs
 ## 配置文件
 - `configs/prod.yaml`：定义时区、Cron 调度、特征参数（如 `theta_days`、`alpha_effective_woc`）、预算闸门以及本地 `storage/` 输出目录前缀；
 - `configs/scoring_rules.yaml`：给出父体/子体的基准阈值（例如 GMROI、PPAD）供收益优先策略使用。
-- `configs/competition_llm.yaml`：配置竞争 LLM 工作流的 Stage-1 阈值、Stage-3 参数与模型连接，可通过 `--llm-config` 覆盖。
+- `configs/competition_scoring.yaml`：控制竞品 Compare 评分参数（页面/流量权重、阈值等）。
 
 ## 数据模型
 `schema.sql` 提供最小可运行的建表语句，覆盖：

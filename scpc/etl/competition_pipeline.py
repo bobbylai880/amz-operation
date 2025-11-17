@@ -7,7 +7,6 @@ import logging
 import os
 import re
 from datetime import date, datetime, timedelta
-from itertools import chain
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -23,10 +22,6 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from scpc.db.engine import create_doris_engine
 from scpc.db.io import replace_into
-from scpc.llm.competition_config import load_competition_llm_config
-from scpc.llm.competition_workflow import CompetitionLLMOrchestrator, CompetitionRunResult
-from scpc.llm.deepseek_client import create_client_from_env
-from scpc.llm.orchestrator import LLMOrchestrator
 from scpc.etl.competition_features import (
     build_competition_tables_from_entities,
     build_traffic_features,
@@ -1269,30 +1264,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Traffic scoring rule name (default: default_traffic)",
     )
     parser.add_argument(
-        "--with-llm",
-        action="store_true",
-        help="Execute the competition LLM workflow after compare outputs",
-    )
-    parser.add_argument(
-        "--llm-stage",
-        choices=("both", "stage1", "stage3"),
-        default="both",
-        help=(
-            "Select which LLM stages to execute when running the competition workflow "
-            "(default: both). Stage-2 is temporarily disabled; 'both' runs Stage-1 and Stage-3."
-        ),
-    )
-    parser.add_argument(
-        "--llm-config",
-        default="configs/competition_llm.yaml",
-        help="Path to the competition LLM configuration YAML",
-    )
-    parser.add_argument(
-        "--llm-storage-root",
-        default=None,
-        help="Directory to store Stage-1/Stage-3 LLM artefacts (defaults to storage/competition_llm)",
-    )
-    parser.add_argument(
         "--chunk-size",
         type=int,
         default=500,
@@ -1327,12 +1298,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     try:
         engine = create_doris_engine()
-        with_llm = args.with_llm
         compare_only = args.compare_only
 
         with_compare = args.with_compare or compare_only
-        if with_llm:
-            with_compare = True
 
         resolved_week = None
         if args.week:
@@ -1422,93 +1390,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 rebuild_leader_only=args.rebuild_leader_only,
             )
 
-        if with_llm:
-            llm_config = load_competition_llm_config(args.llm_config)
-            client = create_client_from_env()
-            try:
-                llm_orchestrator = LLMOrchestrator(client)
-                competition_orchestrator = CompetitionLLMOrchestrator(
-                    engine=engine,
-                    llm_orchestrator=llm_orchestrator,
-                    config=llm_config,
-                    storage_root=args.llm_storage_root,
-                )
-                target_week = resolved_week or args.week
-                if args.llm_stage == "both":
-                    stage_selection: Sequence[str] | None = ("stage1", "stage3")
-                else:
-                    stage_selection = (args.llm_stage,)
-
-                stage3_requested = "stage3" in stage_selection
-                stages_12 = tuple(stage for stage in stage_selection if stage == "stage1")
-
-                result: CompetitionRunResult | None = None
-                if stages_12:
-                    result = competition_orchestrator.run(
-                        target_week,
-                        marketplace_id=args.mk,
-                        stages=stages_12,
-                    )
-                    LOGGER.info(
-                        "competition_pipeline_llm_completed week=%s stage1=%s storage=%s",
-                        result.week,
-                        result.stage1_processed,
-                        [str(path) for path in result.storage_paths],
-                    )
-                else:
-                    LOGGER.info(
-                        "competition_pipeline_llm_stage12_skipped week=%s selection=%s",
-                        target_week,
-                        stage_selection,
-                    )
-
-                if stage3_requested:
-                    stage3_results = competition_orchestrator.run_stage3(
-                        target_week,
-                        marketplace_id=args.mk,
-                        previous_week=previous_week,
-                        compare_tables=compare_results,
-                    )
-                    summary = competition_orchestrator.stage3_last_summary
-                    if stage3_results:
-                        if summary:
-                            total_stage3_records = summary.record_count
-                        else:
-                            total_stage3_records = sum(
-                                len(dimension.records)
-                                for result_item in stage3_results
-                                for dimension in chain(
-                                    result_item.page_dimensions, result_item.traffic_dimensions
-                                )
-                            )
-                        LOGGER.info(
-                            "competition_pipeline_stage3_completed week=%s prev_week=%s scenes=%s records=%s",
-                            target_week,
-                            summary.week_w1 if summary else None,
-                            len(stage3_results),
-                            total_stage3_records,
-                        )
-                    else:
-                        reason = summary.reason if summary and summary.reason else "no_stage3_output"
-                        hint = None
-                        if reason == "no_delta_rows":
-                            hint = "run_with_compare_and_write"
-                        elif reason == "previous_week_missing":
-                            hint = "missing_previous_pairs"
-                        message = (
-                            "competition_pipeline_stage3_no_output week=%s prev_week=%s reason=%s"
-                        )
-                        args: list[object] = [
-                            target_week,
-                            summary.week_w1 if summary else None,
-                            reason,
-                        ]
-                        if hint:
-                            message += " hint=%s"
-                            args.append(hint)
-                        LOGGER.warning(message, *args)
-            finally:
-                client.close()
     except Exception as exc:  # pragma: no cover - CLI level safeguard
         LOGGER.exception(
             "competition_pipeline_failed week=%s mk=%s error=%s",
