@@ -14,6 +14,7 @@ class SceneCacheKey:
 
     scene_id: str
     iso_weeks: Tuple[str, ...]
+    end_week: str | None = None
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class CompetitionCacheKey:
     parent_id: str
     iso_weeks: Tuple[str, ...]
     scene_id: str | None = None
+    end_week: str | None = None
 
 
 @dataclass(slots=True)

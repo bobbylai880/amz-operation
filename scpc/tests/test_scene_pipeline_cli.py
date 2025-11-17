@@ -51,6 +51,16 @@ def test_parse_args_write_summary_enables_with_llm():
     assert args.write_summary is True
 
 
+def test_parse_args_accepts_end_week():
+    args = parse_args(["--scene", "S", "--mk", "US", "--end-week", "2024-W35"])
+    assert args.end_week == "2024-W35"
+
+
+def test_parse_args_rejects_invalid_end_week():
+    with pytest.raises(SystemExit):
+        parse_args(["--scene", "S", "--mk", "US", "--end-week", "2024-35"])
+
+
 def test_main_writes_summary_to_db(tmp_path, monkeypatch):
     log_dir = tmp_path / "logs"
     features = pd.DataFrame(
@@ -104,6 +114,44 @@ def test_main_writes_summary_to_db(tmp_path, monkeypatch):
     assert captured["llm_version"] == "v1.0"
     assert captured["confidence"] == 0.81
     assert captured["sunday"] == date(2024, 3, 17)
+
+
+def test_main_passes_end_week_to_pipeline(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    monkeypatch.setenv("SCPC_LOG_DIR", str(log_dir))
+    captured: dict[str, object] = {}
+
+    def _capture_pipeline(scene, mk, weeks_back, *, engine, write, topn, end_yearweek=None):
+        captured.update(
+            {
+                "scene": scene,
+                "mk": mk,
+                "weeks_back": weeks_back,
+                "end_yearweek": end_yearweek,
+                "write": write,
+                "topn": topn,
+            }
+        )
+        return {"clean": pd.DataFrame(), "features": pd.DataFrame(), "drivers": pd.DataFrame()}
+
+    monkeypatch.setattr("scpc.etl.scene_pipeline.run_scene_pipeline", _capture_pipeline)
+    monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: DummyEngine())
+
+    main([
+        "--scene",
+        "历史场景",
+        "--mk",
+        "US",
+        "--weeks-back",
+        "12",
+        "--end-week",
+        "2023-W45",
+    ])
+
+    assert captured["scene"] == "历史场景"
+    assert captured["mk"] == "US"
+    assert captured["weeks_back"] == 12
+    assert captured["end_yearweek"] == 202345
 
 
 def test_main_emits_scene_summary_json(tmp_path, monkeypatch):
