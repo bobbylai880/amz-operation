@@ -49,13 +49,14 @@ python -m scpc.etl.scene_pipeline \
   --scene "Storage Rack" \
   --mk US \
   --weeks-back 60 \
+  --start-week 2024W10 \
   --write \
   --with-llm \
   --emit-json \
   --emit-md \
   --outputs-dir storage/outputs/scene
 ```
-默认只在 `--write` 传入时写库；不传 `--write` 将返回清洗/特征/驱动 DataFrame 的行数摘要，便于本地调试。运行前请通过环境变量或仓库根目录的 `.env` 提供 Doris 2.x 配置（`DORIS_HOST/PORT/USER/PASSWORD/DATABASE`），`scpc.db.engine` 会自动拼接连接串；如需自定义可直接设置 `DB_URI` 覆盖。`SCENE_TOPN` 环境变量可控制驱动词 TopN。运行过程中会在 `SCPC_LOG_DIR`（默认 `storage/logs`）下生成以场景和站点命名的日志文件，所有 `ERROR` 级别记录都会标注触发失败的具体函数调用，便于排查。
+默认只在 `--write` 传入时写库；不传 `--write` 将返回清洗/特征/驱动 DataFrame 的行数摘要，便于本地调试。如需固定回溯的起始周，可通过 `--start-week 2024W10`（或 `2024-W10`）覆盖 `--weeks-back` 推导的起点。运行前请通过环境变量或仓库根目录的 `.env` 提供 Doris 2.x 配置（`DORIS_HOST/PORT/USER/PASSWORD/DATABASE`），`scpc.db.engine` 会自动拼接连接串；如需自定义可直接设置 `DB_URI` 覆盖。`SCENE_TOPN` 环境变量可控制驱动词 TopN。运行过程中会在 `SCPC_LOG_DIR`（默认 `storage/logs`）下生成以场景和站点命名的日志文件，所有 `ERROR` 级别记录都会标注触发失败的具体函数调用，便于排查。
 
 若数据库已存在最新的 `scene_features/scene_drivers` 数据，可使用 `--llm-only` 直接触发 DeepSeek 调用并生成 JSON/Markdown（跳过清洗与写库），缩短调试时间：
 
@@ -269,7 +270,7 @@ SCPC_LOG_DIR=storage/logs
 部署前请在 Doris 2.x 集群执行建表脚本（兼容 MySQL 方言），或在现有库上通过 `ALTER TABLE` 兼容更新。
 
 ## 任务入口
-- 场景大盘：`python -m scpc.etl.scene_pipeline --scene <SCENE> --mk <MK> --weeks-back 60 --write`
+- 场景大盘：`python -m scpc.etl.scene_pipeline --scene <SCENE> --mk <MK> --weeks-back 60 --start-week 2024W10 --write`
 - 周度主跑：`python -m scpc.jobs.weekly_main --scene_id <SCENE> --parent_id <PARENT>`
 
 任务会在启动阶段读取 `.env` 中的数据库与 DeepSeek 配置，日志记录（脱敏）后的运行环境，随后按流水线依次执行特征计算、LLM 裁决、预算分配与报告生成。场景与竞品特征结果会缓存在进程内的 `FeatureCache` 中，便于在多父体任务中重用。

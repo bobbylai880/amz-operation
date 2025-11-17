@@ -34,6 +34,8 @@ LOGGER = logging.getLogger(__name__)
 SCENE_SUMMARY_TABLE = "bi_amz_scene_summary"
 SCENE_SUMMARY_VERSION = "v1.0"
 
+YEARWEEK_PATTERN = re.compile(r"^(?P<year>\d{4})(?:[-_/]?[Ww])?(?P<week>\d{2})$")
+
 
 KEYWORD_SQL = """
 SELECT scene, keyword_norm, marketplace_id, weight
@@ -90,6 +92,24 @@ def _compute_min_yrwk(weeks_back: int) -> int:
     target = today - timedelta(weeks=weeks_back)
     iso = target.isocalendar()
     return iso[0] * 100 + iso[1]
+
+
+def _parse_yearweek_argument(value: str) -> int:
+    cleaned = value.strip()
+    match = YEARWEEK_PATTERN.fullmatch(cleaned)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"Invalid ISO yearweek '{value}'. Expected formats like 202445 or 2024-W45."
+        )
+    year = int(match.group("year"))
+    week = int(match.group("week"))
+    try:
+        date.fromisocalendar(year, week, 1)
+    except ValueError as exc:  # pragma: no cover - defensive validation
+        raise argparse.ArgumentTypeError(
+            f"Invalid ISO yearweek '{value}': {exc}"
+        ) from exc
+    return year * 100 + week
 
 
 def _current_yearweek(today: date | None = None) -> int:
@@ -590,6 +610,7 @@ def run_scene_pipeline(
     marketplace_id: str,
     weeks_back: int,
     *,
+    start_yearweek: int | None = None,
     engine: Engine | None = None,
     write: bool,
     topn: int,
@@ -599,14 +620,19 @@ def run_scene_pipeline(
         engine = create_doris_engine()
         close_engine = True
     try:
-        min_yrwk = _compute_min_yrwk(weeks_back)
+        min_yrwk = start_yearweek if start_yearweek is not None else _compute_min_yrwk(weeks_back)
         total_start = perf_counter()
         LOGGER.info(
             "scene_pipeline_start scene=%s mk=%s min_yrwk=%s",
             scene,
             marketplace_id,
             min_yrwk,
-            extra={"scene": scene, "mk": marketplace_id, "min_yrwk": min_yrwk},
+            extra={
+                "scene": scene,
+                "mk": marketplace_id,
+                "min_yrwk": min_yrwk,
+                "start_week_override": start_yearweek,
+            },
         )
 
         with _stage_timer(
@@ -815,6 +841,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scene", required=True, help="Scene name")
     parser.add_argument("--mk", required=True, help="Marketplace identifier")
     parser.add_argument("--weeks-back", type=int, default=60, help="Number of weeks to backfill")
+    parser.add_argument(
+        "--start-week",
+        type=_parse_yearweek_argument,
+        help="ISO yearweek (e.g. 202445 or 2024-W45) to use as the earliest data week",
+    )
     parser.add_argument("--write", action="store_true", help="Persist results to Doris")
     parser.add_argument(
         "--scene-topn",
@@ -844,6 +875,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         argv_list = list(argv)
 
     namespace = parser.parse_args(_normalise_argv(argv_list))
+    if namespace.start_week is not None:
+        namespace.weeks_back = max(namespace.weeks_back, 0)
     if namespace.llm_only and namespace.write:
         parser.error("--llm-only cannot be combined with --write")
     if namespace.llm_only:
@@ -881,6 +914,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.scene,
                     args.mk,
                     args.weeks_back,
+                    start_yearweek=args.start_week,
                     engine=engine,
                     write=args.write,
                     topn=topn,

@@ -24,6 +24,7 @@ def test_parse_args_strips_leading_space_tokens(monkeypatch):
     assert args.scene == "浴室袋"
     assert args.mk == "US"
     assert args.weeks_back == 12
+    assert args.start_week is None
     assert args.write is True
     assert args.scene_topn is None
     assert args.with_llm is False
@@ -49,6 +50,16 @@ def test_parse_args_write_summary_enables_with_llm():
     args = parse_args(["--scene", "S", "--mk", "US", "--write-summary"])
     assert args.with_llm is True
     assert args.write_summary is True
+
+
+def test_parse_args_accepts_start_week_token():
+    args = parse_args(["--scene", "S", "--mk", "US", "--start-week", "2024-W45"])
+    assert args.start_week == 202445
+
+
+def test_parse_args_rejects_invalid_start_week():
+    with pytest.raises(SystemExit):
+        parse_args(["--scene", "S", "--mk", "US", "--start-week", "2024-W99"])
 
 
 def test_main_writes_summary_to_db(tmp_path, monkeypatch):
@@ -104,6 +115,46 @@ def test_main_writes_summary_to_db(tmp_path, monkeypatch):
     assert captured["llm_version"] == "v1.0"
     assert captured["confidence"] == 0.81
     assert captured["sunday"] == date(2024, 3, 17)
+
+
+def test_main_passes_start_week_override(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    monkeypatch.setenv("SCPC_LOG_DIR", str(log_dir))
+
+    features = pd.DataFrame(
+        {"year": [2024], "week_num": [5], "start_date": [pd.Timestamp("2024-02-04")]}
+    )
+    outputs = {"clean": pd.DataFrame(), "features": features, "drivers": pd.DataFrame()}
+
+    captured: dict[str, object] = {}
+
+    def _capture_run(scene, mk, weeks_back, *, start_yearweek=None, **kwargs):
+        captured.update(
+            {
+                "scene": scene,
+                "mk": mk,
+                "weeks_back": weeks_back,
+                "start_yearweek": start_yearweek,
+            }
+        )
+        return outputs
+
+    monkeypatch.setattr("scpc.etl.scene_pipeline.run_scene_pipeline", _capture_run)
+    monkeypatch.setattr("scpc.etl.scene_pipeline.create_doris_engine", lambda: DummyEngine())
+
+    main([
+        "--scene",
+        "StartWeekScene",
+        "--mk",
+        "CA",
+        "--weeks-back",
+        "8",
+        "--start-week",
+        "2023W48",
+    ])
+
+    assert captured["start_yearweek"] == 202348
+    assert captured["weeks_back"] == 8
 
 
 def test_main_emits_scene_summary_json(tmp_path, monkeypatch):
