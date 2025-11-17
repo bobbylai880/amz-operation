@@ -13,7 +13,7 @@ def load_prompt(name: str) -> str:
     ----------
     name:
         File name relative to the prompts package. The ``.md`` suffix should
-        be included (e.g. ``"competition_stage2_aggregate.md"``).
+        be included (e.g. ``"competition.md"``).
     """
 
     path = _PROMPTS_DIR / name

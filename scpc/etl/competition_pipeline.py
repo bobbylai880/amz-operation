@@ -1275,11 +1275,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--llm-stage",
-        choices=("both", "stage1", "stage2", "stage3"),
+        choices=("both", "stage1", "stage3"),
         default="both",
         help=(
             "Select which LLM stages to execute when running the competition workflow "
-            "(default: both). Use 'stage3' to only emit Stage-3 structured deltas."
+            "(default: both). Stage-2 is temporarily disabled; 'both' runs Stage-1 and Stage-3."
         ),
     )
     parser.add_argument(
@@ -1290,7 +1290,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--llm-storage-root",
         default=None,
-        help="Directory to store Stage-1/Stage-2 LLM artefacts (defaults to storage/competition_llm)",
+        help="Directory to store Stage-1/Stage-3 LLM artefacts (defaults to storage/competition_llm)",
     )
     parser.add_argument(
         "--chunk-size",
@@ -1435,12 +1435,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
                 target_week = resolved_week or args.week
                 if args.llm_stage == "both":
-                    stage_selection: Sequence[str] | None = ("stage1", "stage2")
+                    stage_selection: Sequence[str] | None = ("stage1", "stage3")
                 else:
                     stage_selection = (args.llm_stage,)
 
                 stage3_requested = "stage3" in stage_selection
-                stages_12 = tuple(stage for stage in stage_selection if stage in {"stage1", "stage2"})
+                stages_12 = tuple(stage for stage in stage_selection if stage == "stage1")
 
                 result: CompetitionRunResult | None = None
                 if stages_12:
@@ -1450,11 +1450,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         stages=stages_12,
                     )
                     LOGGER.info(
-                        "competition_pipeline_llm_completed week=%s stage1=%s stage2_candidates=%s stage2=%s storage=%s",
+                        "competition_pipeline_llm_completed week=%s stage1=%s storage=%s",
                         result.week,
                         result.stage1_processed,
-                        result.stage2_candidates,
-                        result.stage2_processed,
                         [str(path) for path in result.storage_paths],
                     )
                 else:
