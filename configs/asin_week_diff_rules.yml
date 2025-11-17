@@ -1,0 +1,33 @@
+price_action:
+  new_asin_label: "新ASIN"
+  unknown_label: "价格未知"
+  thresholds:
+    big_drop: -0.10
+    small_drop: -0.03
+    small_raise: 0.03
+    big_raise: 0.10
+  labels:
+    big_drop: "大幅降价"
+    small_drop: "小幅降价"
+    stable: "价格稳定"
+    small_raise: "小幅涨价"
+    big_raise: "大幅涨价"
+
+rank_trend:
+  new_asin_label: "新ASIN"
+  unknown_label: "未知"
+  thresholds:
+    big_up: 50
+    big_down: -50
+  labels:
+    big_up: "排名明显上升"
+    big_down: "排名明显下降"
+    stable: "排名基本稳定"
+
+promo_action:
+  labels:
+    new_promo: "新增优惠"
+    cancel_promo: "取消优惠"
+    none: "优惠无"
+    changed: "优惠内容变化"
+    unchanged: "优惠无明显变化"
