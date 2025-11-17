@@ -77,6 +77,24 @@ python -m scpc.etl.scene_pipeline \
 中构造的“浴室架”场景样例（关键词：shower caddy / shower bag，周度事实来自 Doris 视图快照），可模拟缺失周、长缺口
 与 WoW 正负驱动，确保关键逻辑在无真实数据库时也能复现。
 
+## 亚马逊 ASIN 周度对比 ETL
+
+`scpc/etl/asin_week_diff.py` 与 `scpc/jobs/asin_week_diff_job.py` 负责基于 `bi_amz_asin_product_snapshot` 生成周度对比结果
+并落库到 `bi_amz_asin_product_week_diff`。ETL 以周日（`sunday` 字段）为锚点，将“本周 vs 上一周”数据左连接后在 Python 中计算排名、价格、
+评价、内容、badge 差集以及规则标签（`price_action/rank_trend/promo_action`）。规则阈值与文案来源于 `configs/asin_week_diff_rules.yml`
+配置，可按需调整。
+
+- **依赖表**：`bi_amz_asin_product_snapshot`（源）与 `bi_amz_asin_product_week_diff`（目标）。
+- **入参**：`--week`（必填），格式 `YYYY-Www`，与 snapshot 表的 `week` 字段一致，例如 `2025-W45`。
+- **运行命令**：
+
+  ```bash
+  python -m scpc.jobs.asin_week_diff_job --week 2025-W45
+  ```
+
+- **前置条件**：指定周的 snapshot 已写入 Doris（`bi_amz_asin_product_snapshot.week = 参数值`），否则 Job 会以 ERROR 级别退出。
+- **配置**：可选 `--config` 参数覆盖默认的 `configs/asin_week_diff_rules.yml`，用于自定义价/排/优惠标签阈值。
+
 ## Competition 模块
 第二层（LLM 判因）竞争对比逻辑及其页面/流量清洗、特征与对比表已下线，当前仅保留特征工程 + Compare 结果（Stage-1/Stage-2/Stage-3 判因全部停用）。
 
