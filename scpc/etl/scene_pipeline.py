@@ -31,6 +31,9 @@ from scpc.settings import get_deepseek_settings
 LOGGER = logging.getLogger(__name__)
 
 
+ISO_WEEK_PATTERN = re.compile(r"^(?P<year>\d{4})-W(?P<week>\d{2})$")
+
+
 SCENE_SUMMARY_TABLE = "bi_amz_scene_summary"
 SCENE_SUMMARY_VERSION = "v1.0"
 
@@ -90,6 +93,49 @@ def _compute_min_yrwk(weeks_back: int) -> int:
     target = today - timedelta(weeks=weeks_back)
     iso = target.isocalendar()
     return iso[0] * 100 + iso[1]
+
+
+def _parse_iso_week_label(label: str) -> tuple[int, int]:
+    match = ISO_WEEK_PATTERN.fullmatch(label)
+    if not match:
+        raise ValueError(f"invalid ISO week label: {label!r}")
+    year = int(match.group("year"))
+    week = int(match.group("week"))
+    try:
+        date.fromisocalendar(year, week, 1)
+    except ValueError as exc:
+        raise ValueError(f"invalid ISO week label: {label!r}") from exc
+    return year, week
+
+
+def _yearweek_from_label(label: str) -> int:
+    year, week = _parse_iso_week_label(label)
+    return year * 100 + week
+
+
+def _label_from_yearweek(value: int | None) -> str | None:
+    if value is None:
+        return None
+    year = value // 100
+    week = value % 100
+    return f"{year:04d}-W{week:02d}"
+
+
+def _date_to_iso_week_label(value: date) -> str:
+    iso = value.isocalendar()
+    return f"{iso[0]:04d}-W{iso[1]:02d}"
+
+
+def _resolve_window_bounds(weeks_back: int, end_yearweek: int | None) -> tuple[int, int | None]:
+    if end_yearweek is None:
+        return _compute_min_yrwk(weeks_back), None
+    year = end_yearweek // 100
+    week = end_yearweek % 100
+    delta_weeks = max(weeks_back - 1, 0)
+    start_monday = date.fromisocalendar(year, week, 1) - timedelta(weeks=delta_weeks)
+    start_iso = start_monday.isocalendar()
+    min_yrwk = start_iso[0] * 100 + start_iso[1]
+    return min_yrwk, end_yearweek
 
 
 def _current_yearweek(today: date | None = None) -> int:
@@ -593,20 +639,28 @@ def run_scene_pipeline(
     engine: Engine | None = None,
     write: bool,
     topn: int,
+    end_yearweek: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     close_engine = False
     if engine is None:
         engine = create_doris_engine()
         close_engine = True
     try:
-        min_yrwk = _compute_min_yrwk(weeks_back)
+        min_yrwk, max_yrwk = _resolve_window_bounds(weeks_back, end_yearweek)
         total_start = perf_counter()
         LOGGER.info(
-            "scene_pipeline_start scene=%s mk=%s min_yrwk=%s",
+            "scene_pipeline_start scene=%s mk=%s min_yrwk=%s max_yrwk=%s",
             scene,
             marketplace_id,
             min_yrwk,
-            extra={"scene": scene, "mk": marketplace_id, "min_yrwk": min_yrwk},
+            extra={
+                "scene": scene,
+                "mk": marketplace_id,
+                "min_yrwk": min_yrwk,
+                "max_yrwk": max_yrwk,
+                "analysis_start": _label_from_yearweek(min_yrwk),
+                "analysis_end": _label_from_yearweek(max_yrwk),
+            },
         )
 
         with _stage_timer(
@@ -650,6 +704,9 @@ def run_scene_pipeline(
                     params={"mk": marketplace_id, "kw_list": kw_list, "min_yrwk": min_yrwk},
                 )
             record(fact_rows=len(facts_df))
+        if max_yrwk is not None and not facts_df.empty:
+            mask = (facts_df["year"].astype(int) * 100 + facts_df["week_num"].astype(int)) <= max_yrwk
+            facts_df = facts_df.loc[mask].reset_index(drop=True)
 
         coverage_df = pd.DataFrame()
         with _stage_timer(
@@ -665,6 +722,9 @@ def run_scene_pipeline(
                     params={"scene": scene, "mk": marketplace_id, "min_yrwk": min_yrwk},
                 )
             record(coverage_rows=len(coverage_df))
+        if max_yrwk is not None and not coverage_df.empty:
+            mask = (coverage_df["year"].astype(int) * 100 + coverage_df["week_num"].astype(int)) <= max_yrwk
+            coverage_df = coverage_df.loc[mask].reset_index(drop=True)
 
         with _stage_timer(
             "prepare_clean_data",
@@ -676,6 +736,26 @@ def run_scene_pipeline(
             clean_result = clean_keyword_panel(facts_df, week_index=week_index)
             clean_df = _prepare_clean_output(clean_result, scene, marketplace_id)
             record(clean_weeks=len(week_index), clean_rows=len(clean_df))
+            if week_index:
+                start_label = _date_to_iso_week_label(week_index[0])
+                end_label = _date_to_iso_week_label(week_index[-1])
+            else:
+                start_label = end_label = None
+            LOGGER.info(
+                "scene_pipeline_analysis_window scene=%s mk=%s start_week=%s end_week=%s week_count=%s",
+                scene,
+                marketplace_id,
+                start_label,
+                end_label,
+                len(week_index),
+                extra={
+                    "scene": scene,
+                    "mk": marketplace_id,
+                    "analysis_start": start_label,
+                    "analysis_end": end_label,
+                    "week_count": len(week_index),
+                },
+            )
 
         with _stage_timer(
             "compute_features",
@@ -815,6 +895,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scene", required=True, help="Scene name")
     parser.add_argument("--mk", required=True, help="Marketplace identifier")
     parser.add_argument("--weeks-back", type=int, default=60, help="Number of weeks to backfill")
+    parser.add_argument(
+        "--end-week",
+        type=_argparse_iso_week,
+        help="ISO week label (YYYY-Www) representing the analysis end week",
+    )
     parser.add_argument("--write", action="store_true", help="Persist results to Doris")
     parser.add_argument(
         "--scene-topn",
@@ -855,6 +940,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return namespace
 
 
+def _argparse_iso_week(value: str) -> str:
+    cleaned = value.strip()
+    try:
+        year, week = _parse_iso_week_label(cleaned)
+    except ValueError as exc:  # pragma: no cover - argparse handles message formatting
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return f"{year:04d}-W{week:02d}"
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     log_level = os.getenv("LOG_LEVEL", "INFO")
@@ -884,6 +978,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     engine=engine,
                     write=args.write,
                     topn=topn,
+                    end_yearweek=_yearweek_from_label(args.end_week) if args.end_week else None,
                 )
             except OperationalError as exc:
                 LOGGER.error(
