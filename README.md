@@ -160,6 +160,20 @@ SCPC_LOG_DIR=storage/logs
 - **阈值配置**：`configs/scene_traffic_rules.yml` 定义了广告占比变化(`ad_change_thresholds`)、流量结构判定(`traffic_mix_thresholds`)与关键词画像变化(`keyword_profile_change`)的全局阈值，每个字段都配有中文注释说明含义。调整该文件会直接影响 `ad_change_type`、`traffic_mix_type`、`change_type` 等衍生标签；若配置缺失或文件不存在，程序会记录 WARN 并回退到内置默认值。
 - **注意事项**：Job 会在日志中输出样本覆盖数、周度数据是否缺失、配置加载结果以及 JSON 写入路径；若 Doris 缺失上一周流量或关键词数据，依旧会生成 JSON，但对应字段将为 `null` 并记录 WARN 便于排查。
 
+生成 JSON 后，可使用同场景的 Markdown Job 将两章报告落地：
+
+```bash
+python -m scpc.jobs.generate_scene_traffic_report \
+  --week 2025-W45 \
+  --scene_tag 浴室袋 \
+  --marketplace US \
+  --storage output/weekly_report
+```
+
+- **作用**：读取 `traffic/flow_change.json` 与 `traffic/keyword_change.json`，分别调用 DeepSeek 生成 `06_traffic_flow.md`（场景流量结构与投放策略）和 `07_keyword_opportunity.md`（搜索需求与关键词机会）。如任一 JSON 缺失，将写出仅含“数据缺失”说明的 Markdown，并在日志中记录 ERROR。
+- **输出路径**：`{storage}/{week}/{scene_tag}/reports/06_traffic_flow.md` 与 `reports/07_keyword_opportunity.md`，文件命名与既有五章一致，方便 Report 汇总 Job 直接拼接。
+- **提示**：Job 会沿用统一的 DeepSeek Client/日志框架，可在 `storage/logs` 查看两次 LLM 调用的耗时与 token 信息；若上一周的流量或关键词数据缺失，生成的 Markdown 会显式提示“只基于本周静态分析”。
+
 任务会在启动阶段读取 `.env` 中的数据库与 DeepSeek 配置，日志记录（脱敏）后的运行环境，随后按流水线依次执行特征计算、LLM 裁决、预算分配与报告生成。场景与竞品特征结果会缓存在进程内的 `FeatureCache` 中，便于在多父体任务中重用。
 
 ## 特征工程亮点
