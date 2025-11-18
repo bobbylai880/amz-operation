@@ -54,7 +54,7 @@ SELECT asin,
        marketplace_id,
        keyword,
        snapshot_date,
-       effective_impr_share
+       `有效曝光占比` AS effective_impr_share
 FROM bi_sif_keyword_daily
 WHERE marketplace_id = :marketplace_id
   AND snapshot_date IN (:sunday_this, :sunday_last)
