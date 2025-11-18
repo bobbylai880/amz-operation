@@ -146,6 +146,8 @@ SCPC_LOG_DIR=storage/logs
 ## 任务入口
 - 场景大盘：`python -m scpc.etl.scene_pipeline --scene <SCENE> --mk <MK> --weeks-back 60 --write`
 - 周度主跑：`python -m scpc.jobs.weekly_main --scene_id <SCENE> --parent_id <PARENT>`
+- 场景周报 JSON：`python -m scpc.jobs.generate_weekly_scene_json --week 2025-W45 --scene_tag 浴室袋 --marketplace US`
+  - 默认输出目录为 `storage/weekly_report/{week}/{scene_tag}`，可通过 `--storage` 重写。
 
 任务会在启动阶段读取 `.env` 中的数据库与 DeepSeek 配置，日志记录（脱敏）后的运行环境，随后按流水线依次执行特征计算、LLM 裁决、预算分配与报告生成。场景与竞品特征结果会缓存在进程内的 `FeatureCache` 中，便于在多父体任务中重用。
 
@@ -166,6 +168,13 @@ SCPC_LOG_DIR=storage/logs
 ## 测试
 运行 `pytest` 可验证父体/子体特征计算与 LLM Schema 校验逻辑。建议在扩展特征、接入真实数据或完善编排后同步新增测试用例；本仓库提供的样例
 数据能够复刻常见边界场景，便于离线模拟与回归。
+
+常规测试流程：
+
+1. `make install-dev` 安装/更新开发依赖。
+2. `make test` 执行完整的 80+ 项单元测试套件。
+
+在 CI 环境中也可以直接复用上述命令，确保测试体验与本地一致。
 
 ## 下一步建议
 - 接入真实 SQLAlchemy 引擎并落地 UPSERT；
