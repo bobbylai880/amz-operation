@@ -37,16 +37,16 @@ WHERE scene_tag = :scene_tag AND marketplace_id = :marketplace_id
 FLOW_SQL = """
 SELECT asin,
        marketplace_id,
-       monday,
-       `广告流量占比` AS ad_flow_share,
-       `自然流量占比` AS organic_flow_share,
-       `推荐流量占比` AS reco_flow_share,
-       `SP广告流量占比` AS sp_flow_share,
-       `视频广告流量占比` AS video_flow_share,
-       `品牌广告流量占比` AS brand_flow_share
-FROM bi_sif_asin_flow_overview_weekly
+       today,
+       ad_ratio,
+       nf_ratio,
+       recommend_ratio,
+       sp_ratio,
+       sbv_ratio,
+       sb_ratio
+FROM HYY_DW_MYSQL.hyy.sif_asin_flow_overview
 WHERE marketplace_id = :marketplace_id
-  AND monday IN (:monday_this, :monday_last)
+  AND today BETWEEN :date_start AND :date_end
 """
 
 KEYWORD_SQL = """
@@ -184,8 +184,8 @@ class SceneTrafficJsonGenerator:
             FLOW_SQL,
             {
                 "marketplace_id": params.marketplace_id,
-                "monday_this": monday_this,
-                "monday_last": monday_last,
+                "date_start": monday_last.strftime("%Y%m%d"),
+                "date_end": sunday_this.strftime("%Y%m%d"),
             },
         )
         df_flow = _prepare_flow_dataframe(scene_scope, flow_df, monday_this, monday_last, rules)
@@ -410,22 +410,59 @@ def _prepare_flow_dataframe(
     monday_last: date,
     rules: Mapping[str, Mapping[str, float]],
 ) -> pd.DataFrame:
+    share_cols = [
+        "ad_flow_share",
+        "organic_flow_share",
+        "reco_flow_share",
+        "sp_flow_share",
+        "video_flow_share",
+        "brand_flow_share",
+    ]
+
     df = flow_df.copy()
-    if not df.empty:
-        df["monday"] = pd.to_datetime(df.get("monday"), errors="coerce").dt.date
-        share_cols = [
-            "ad_flow_share",
-            "organic_flow_share",
-            "reco_flow_share",
-            "sp_flow_share",
-            "video_flow_share",
-            "brand_flow_share",
-        ]
-        for col in share_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-    else:
+    if df.empty:
         LOGGER.warning("scene_traffic_json_flow_missing", extra={"rows": 0})
+        df = pd.DataFrame(columns=["asin", "marketplace_id", "monday", *share_cols])
+    elif "today" in df.columns:
+        # 日表：按周聚合成周一锚点的数据
+        today_raw = df["today"].apply(lambda v: str(v).split(".")[0])
+        df["date"] = pd.to_datetime(today_raw, format="%Y%m%d", errors="coerce").dt.date
+        df = df[df["date"].notna()].copy()
+        df["monday"] = df["date"].apply(lambda d: d - timedelta(days=d.weekday()))
+        df = df[df["monday"].isin({monday_this, monday_last})].copy()
+
+        ratio_map = {
+            "ad_ratio": "ad_flow_share",
+            "nf_ratio": "organic_flow_share",
+            "recommend_ratio": "reco_flow_share",
+            "sp_ratio": "sp_flow_share",
+            "sbv_ratio": "video_flow_share",
+            "sb_ratio": "brand_flow_share",
+        }
+        agg_cols = {src: "mean" for src in ratio_map if src in df.columns}
+        if agg_cols:
+            grouped = (
+                df.groupby(["asin", "marketplace_id", "monday"], as_index=False)
+                .agg(agg_cols)
+                .rename(columns={src: ratio_map[src] for src in agg_cols})
+            )
+        else:
+            grouped = df.loc[:, ["asin", "marketplace_id", "monday"]].drop_duplicates()
+        df = grouped
+    else:
+        df["monday"] = pd.to_datetime(df.get("monday"), errors="coerce").dt.date
+
+    if "monday" in df.columns:
+        df = df[df["monday"].notna()]
+        df = df[df["monday"].isin({monday_this, monday_last})]
+    else:
+        df["monday"] = pd.NaT
+
+    for col in share_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = math.nan
 
     def _pivot(subset_date: date, suffix: str) -> pd.DataFrame:
         subset = df[df["monday"] == subset_date].copy()
