@@ -49,6 +49,7 @@ WHERE marketplace_id = :marketplace_id
   AND today BETWEEN :date_start AND :date_end
 """
 
+# `bi_sif_keyword_daily` 真实列名为「有效曝光流量占比」，此处做别名兼容下游逻辑。
 KEYWORD_SQL = """
 SELECT asin,
        marketplace_id,
