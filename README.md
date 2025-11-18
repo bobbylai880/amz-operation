@@ -148,6 +148,8 @@ SCPC_LOG_DIR=storage/logs
 - 周度主跑：`python -m scpc.jobs.weekly_main --scene_id <SCENE> --parent_id <PARENT>`
 - 场景周报 JSON：`python -m scpc.jobs.generate_weekly_scene_json --week 2025-W45 --scene_tag 浴室袋 --marketplace US`
   - 默认输出目录为 `storage/weekly_report/{week}/{scene_tag}`，可通过 `--storage` 重写。
+- 场景 Markdown 周报：`python -m scpc.jobs.generate_weekly_scene_report --week 2025-W45 --scene_tag 浴室袋 --marketplace US --storage output/weekly_report`
+  - 要求 `overall_summary.json` 等五个模块 JSON 已存在于 `{storage}/{week}/{scene_tag}`，命令会在 `reports/` 目录生成 5 个模块 Markdown 与汇总报告；`--storage` 可省略使用默认 `storage/weekly_report`。
 
 任务会在启动阶段读取 `.env` 中的数据库与 DeepSeek 配置，日志记录（脱敏）后的运行环境，随后按流水线依次执行特征计算、LLM 裁决、预算分配与报告生成。场景与竞品特征结果会缓存在进程内的 `FeatureCache` 中，便于在多父体任务中重用。
 
