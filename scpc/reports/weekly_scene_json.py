@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover
     np = None  # type: ignore[assignment]
 
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 
 from scpc.db.engine import create_doris_engine
 from scpc.db.io import fetch_dataframe
@@ -43,6 +44,12 @@ WHERE week_this = :week AND marketplace_id = :marketplace_id
 SNAPSHOT_BRAND_SQL = """
 SELECT asin, marketplace_id, brand
 FROM bi_amz_asin_product_snapshot_v2
+WHERE week = :week AND marketplace_id = :marketplace_id
+"""
+
+SNAPSHOT_BRAND_FALLBACK_SQL = """
+SELECT asin, marketplace_id, brand
+FROM bi_amz_asin_product_snapshot
 WHERE week = :week AND marketplace_id = :marketplace_id
 """
 
@@ -173,12 +180,7 @@ class WeeklySceneJsonGenerator:
             },
         )
 
-        brand_df = fetch_dataframe(
-            self.engine,
-            SNAPSHOT_BRAND_SQL,
-            {"week": params.week, "marketplace_id": params.marketplace_id},
-        )
-        brand_scope = _aggregate_brands(brand_df)
+        brand_scope = _fetch_brand_scope(self.engine, params)
 
         diff_tagged = diff_scene.merge(
             brand_scope, on=["asin", "marketplace_id"], how="left"
@@ -253,6 +255,38 @@ class WeeklySceneJsonGenerator:
 # ----------------------------------------------------------------------
 
 
+def _fetch_brand_scope(engine: Engine, params: WeeklySceneJobParams) -> pd.DataFrame:
+    """Fetch and aggregate brand info with graceful fallback."""
+
+    query_params = {"week": params.week, "marketplace_id": params.marketplace_id}
+    try:
+        brand_df = fetch_dataframe(engine, SNAPSHOT_BRAND_SQL, query_params)
+    except OperationalError as exc:
+        if _is_unknown_table_error(exc):
+            LOGGER.warning(
+                "weekly_scene_json_brand_table_missing",
+                extra={
+                    "scene_tag": params.scene_tag,
+                    "marketplace": params.marketplace_id,
+                    "week": params.week,
+                    "table": "bi_amz_asin_product_snapshot_v2",
+                },
+            )
+            brand_df = fetch_dataframe(engine, SNAPSHOT_BRAND_FALLBACK_SQL, query_params)
+            LOGGER.info(
+                "weekly_scene_json_brand_table_fallback",
+                extra={
+                    "scene_tag": params.scene_tag,
+                    "marketplace": params.marketplace_id,
+                    "week": params.week,
+                    "table": "bi_amz_asin_product_snapshot",
+                },
+            )
+        else:
+            raise
+    return _aggregate_brands(brand_df)
+
+
 def _aggregate_scene_tags(scene_df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate scene-tag rows to unique (asin, marketplace) pairs."""
 
@@ -285,6 +319,19 @@ def _aggregate_brands(brand_df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["asin", "marketplace_id", "brand"], ascending=[True, True, False])
     deduped = df.drop_duplicates(subset=["asin", "marketplace_id"], keep="first")
     return deduped.loc[:, ["asin", "marketplace_id", "brand"]]
+
+
+def _is_unknown_table_error(exc: OperationalError) -> bool:
+    """Best-effort detection for MySQL/Doris unknown-table errors."""
+
+    orig = getattr(exc, "orig", exc)
+    args = getattr(orig, "args", None)
+    if args:
+        code = args[0]
+        if isinstance(code, int) and code in {1051, 1146}:
+            return True
+    message = str(orig).lower()
+    return "unknown table" in message or "doesn't exist" in message
 
 
 def _prepare_diff_dataframe(diff_df: pd.DataFrame) -> pd.DataFrame:
