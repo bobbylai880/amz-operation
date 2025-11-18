@@ -66,6 +66,7 @@ PRICE_ACTION_BUCKETS: Mapping[str, set[str]] = {
     "stable": {"价格稳定"},
     "small_raise": {"小幅涨价"},
     "big_raise": {"大幅涨价"},
+    "new_asin": {"新ASIN"},
 }
 
 PROMO_ACTION_BUCKETS: Mapping[str, set[str]] = {
@@ -361,7 +362,26 @@ def _prepare_diff_dataframe(diff_df: pd.DataFrame) -> pd.DataFrame:
         df[col] = df[col].apply(_ensure_json_list)
     df["hyy_asin"] = df["hyy_asin"].fillna(0).astype(int)
     df["brand"] = df["brand"].fillna("")
+    df["badge_removed_cnt"] = df["badge_removed_json"].apply(lambda x: len(x))
+    df["new_reviews"] = _normalise_new_reviews(df)
     return df
+
+
+def _normalise_new_reviews(df: pd.DataFrame) -> pd.Series:
+    """Ensure exposed new_reviews values are non-negative integers."""
+
+    index = df.index
+    if "new_reviews" in df.columns:
+        series = pd.to_numeric(df["new_reviews"], errors="coerce").fillna(0)
+    elif {"reviews_this", "reviews_last"}.issubset(df.columns):
+        series = (
+            pd.to_numeric(df["reviews_this"], errors="coerce").fillna(0)
+            - pd.to_numeric(df["reviews_last"], errors="coerce").fillna(0)
+        )
+    else:
+        return pd.Series(0, index=index, dtype=int)
+
+    return series.clip(lower=0).round().astype(int)
 
 
 def _first_non_null(series: pd.Series) -> Any:
@@ -651,13 +671,16 @@ def _top_price_moves(df: pd.DataFrame, *, direction: str) -> pd.DataFrame:
 def _select_risk_rows(df: pd.DataFrame, rules: Mapping[str, Any]) -> pd.DataFrame:
     if df.empty:
         return df
-    mask = pd.Series(False, index=df.index)
     rank_down = df["rank_trend"].eq(rules["rank_trend"])
-    rating_drop = df["rating_diff"].fillna(0) <= rules["rating_diff_threshold"]
-    review_active = df["new_reviews"].fillna(0) >= rules["new_reviews_min"]
+    rating_drop = df["rating_diff"].fillna(0).lt(rules["rating_diff_threshold"])
+    review_active = df["new_reviews"].fillna(0).ge(rules["new_reviews_min"])
     promo_cancel = df["promo_action"].eq("取消优惠")
-    badge_removed = df["badge_removed_json"].apply(lambda x: bool(x))
-    mask = rank_down | (rating_drop & review_active) | (promo_cancel & rank_down) | badge_removed
+    rank_loss = df["rank_leaf_diff"].fillna(0).lt(0)
+    badge_removed = (
+        df.get("has_badge_change", pd.Series(0, index=df.index)).fillna(0).eq(1)
+        & df.get("badge_removed_cnt", pd.Series(0, index=df.index)).fillna(0).gt(0)
+    )
+    mask = rank_down | (rating_drop & review_active) | (promo_cancel & rank_loss) | badge_removed
     selected = df.loc[mask].copy()
     columns = TOP_LIST_COLUMNS + [
         "price_action",
