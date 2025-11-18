@@ -151,6 +151,15 @@ SCPC_LOG_DIR=storage/logs
 - 场景 Markdown 周报：`python -m scpc.jobs.generate_weekly_scene_report --week 2025-W45 --scene_tag 浴室袋 --marketplace US --storage output/weekly_report`
   - 要求 `overall_summary.json` 等五个模块 JSON 已存在于 `{storage}/{week}/{scene_tag}`，命令会在 `reports/` 目录生成 5 个模块 Markdown 与汇总报告；`--storage` 可省略使用默认 `storage/weekly_report`。
 
+### 流量模块（flow_change/keyword_change）
+`python -m scpc.jobs.generate_scene_traffic_json --week 2025-W45 --scene_tag 浴室袋 --marketplace US --storage output/weekly_report`
+
+- **作用**：在已有的「页面变化+竞品分析」基础上，额外输出 `traffic/flow_change.json` 与 `traffic/keyword_change.json`，供后续 LLM 生成「流量 & 核心关键词」章节。Job 会自动完成周维度对齐、ASIN 样本筛选、广告/自然/推荐流量结构计算以及关键词头部池比对。
+- **输入**：`week`（ISO 周字符串，周起始 Sunday）、`scene_tag`、`marketplace`，可选 `--storage` 重写输出目录（默认 `storage/weekly_report`）。
+- **输出路径**：`{storage}/{week}/{scene_tag}/traffic/flow_change.json` 与 `traffic/keyword_change.json`，结构遵循 PRD 中的 overview/top list/关键词 diff 约定，全部 ASIN 明细均包含 `hyy_asin/marketplace_id/scene_tag` 字段便于 LLM 消费。
+- **阈值配置**：`configs/scene_traffic_rules.yml` 定义了广告占比变化(`ad_change_thresholds`)、流量结构判定(`traffic_mix_thresholds`)与关键词画像变化(`keyword_profile_change`)的全局阈值，每个字段都配有中文注释说明含义。调整该文件会直接影响 `ad_change_type`、`traffic_mix_type`、`change_type` 等衍生标签；若配置缺失或文件不存在，程序会记录 WARN 并回退到内置默认值。
+- **注意事项**：Job 会在日志中输出样本覆盖数、周度数据是否缺失、配置加载结果以及 JSON 写入路径；若 Doris 缺失上一周流量或关键词数据，依旧会生成 JSON，但对应字段将为 `null` 并记录 WARN 便于排查。
+
 任务会在启动阶段读取 `.env` 中的数据库与 DeepSeek 配置，日志记录（脱敏）后的运行环境，随后按流水线依次执行特征计算、LLM 裁决、预算分配与报告生成。场景与竞品特征结果会缓存在进程内的 `FeatureCache` 中，便于在多父体任务中重用。
 
 ## 特征工程亮点
