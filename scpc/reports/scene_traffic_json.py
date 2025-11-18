@@ -38,12 +38,12 @@ FLOW_SQL = """
 SELECT asin,
        marketplace_id,
        monday,
-       ad_flow_share,
-       organic_flow_share,
-       reco_flow_share,
-       sp_flow_share,
-       video_flow_share,
-       brand_flow_share
+       `广告流量占比` AS ad_flow_share,
+       `自然流量占比` AS organic_flow_share,
+       `推荐流量占比` AS reco_flow_share,
+       `SP广告流量占比` AS sp_flow_share,
+       `视频广告流量占比` AS video_flow_share,
+       `品牌广告流量占比` AS brand_flow_share
 FROM bi_sif_asin_flow_overview_weekly
 WHERE marketplace_id = :marketplace_id
   AND monday IN (:monday_this, :monday_last)
