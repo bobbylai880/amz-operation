@@ -1,6 +1,7 @@
 """Unit tests for weekly scene JSON helpers."""
 
 import pandas as pd
+import pytest
 from pandas.api.types import is_integer_dtype
 
 from scpc.reports import weekly_scene_json as wsj
@@ -86,3 +87,13 @@ def test_select_risk_rows_follows_defined_rules():
     }
     selected = wsj._select_risk_rows(df, rules)
     assert list(selected["asin"]) == ["ASIN0", "ASIN1", "ASIN2", "ASIN3"]
+
+
+def test_scene_storage_dir_accepts_unicode_and_trims_spaces():
+    assert wsj._scene_storage_dir(" 浴室袋 ") == "浴室袋"
+
+
+@pytest.mark.parametrize("invalid", ["", "..", ".", "../etc", "foo/bar", "foo\\bar"])
+def test_scene_storage_dir_rejects_invalid_inputs(invalid: str) -> None:
+    with pytest.raises(wsj.WeeklySceneJsonError):
+        wsj._scene_storage_dir(invalid)

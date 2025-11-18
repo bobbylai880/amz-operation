@@ -57,6 +57,17 @@ def _prepare_inputs(tmp_path: Path) -> Path:
     return base
 
 
+def _prepare_slug_inputs(tmp_path: Path) -> Path:
+    base = tmp_path / "2025-W45" / "scene"
+    base.mkdir(parents=True, exist_ok=True)
+    _write_json(base / "overall_summary.json", {"week": "2025-W45"})
+    _write_json(base / "self_analysis.json", {"overview": {}})
+    _write_json(base / "competitor_analysis.json", {"overview": {}})
+    _write_json(base / "self_risk_opportunity.json", {"rules": "demo", "risk_asin": []})
+    _write_json(base / "competitor_actions.json", {"price_and_rank_moves": []})
+    return base
+
+
 def _generator(client: StubClient) -> WeeklySceneReportGenerator:
     settings = DeepSeekSettings(
         base_url="https://example.com",
@@ -118,4 +129,17 @@ def test_generator_wraps_deepseek_errors(tmp_path: Path) -> None:
 
     with pytest.raises(WeeklySceneReportError):
         generator.run(_params(tmp_path))
+
+
+def test_generator_supports_slugged_scene_directory(tmp_path: Path) -> None:
+    base = _prepare_slug_inputs(tmp_path)
+    responses = ["# overall", "# self", "# competitor", "# risk", "# actions", "# full"]
+    client = StubClient(responses)
+    generator = _generator(client)
+
+    outputs = generator.run(_params(tmp_path))
+
+    report_dir = base / "reports"
+    assert outputs["overall_summary"].parent == report_dir
+    assert report_dir.exists()
 

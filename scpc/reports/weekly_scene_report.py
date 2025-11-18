@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from scpc.llm.deepseek_client import DeepSeekClient, DeepSeekError, DeepSeekResponse
 from scpc.llm.deepseek_client import create_client_from_env
 from scpc.settings import DeepSeekSettings, get_deepseek_settings
 
 LOGGER = logging.getLogger(__name__)
+SAFE_SCENE_TAG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 @dataclass(slots=True)
@@ -138,7 +140,7 @@ class WeeklySceneReportGenerator:
             "scene_tag": params.scene_tag,
             "marketplace_id": params.marketplace_id,
         }
-        base_dir = params.storage_dir / params.week / params.scene_tag
+        base_dir = self._resolve_scene_dir(params.storage_dir, params.week, params.scene_tag)
         report_dir = base_dir / "reports"
         report_dir.mkdir(parents=True, exist_ok=True)
 
@@ -194,11 +196,37 @@ class WeeklySceneReportGenerator:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _resolve_scene_dir(self, storage: Path, week: str, scene_tag: str) -> Path:
+        """Locate the directory containing the JSON modules for ``scene_tag``."""
+
+        week_dir = storage / week
+        candidates = list(_scene_dir_candidates(scene_tag))
+        for candidate in candidates:
+            candidate_dir = week_dir / candidate
+            if all((candidate_dir / spec.input_filename).exists() for spec in MODULE_SPECS):
+                if candidate != candidates[0]:
+                    LOGGER.info(
+                        "weekly_scene_report_scene_dir_fallback",
+                        extra={
+                            "week": week,
+                            "scene_tag": scene_tag,
+                            "selected": candidate,
+                        },
+                    )
+                return candidate_dir
+
+        # Default to the first candidate to keep error messages intuitive.
+        return week_dir / candidates[0]
+
     def _load_json(self, path: Path) -> Any:
         try:
             raw = path.read_text(encoding="utf-8")
         except FileNotFoundError as exc:
-            LOGGER.error("weekly_scene_report_missing_json", extra={"path": str(path)})
+            LOGGER.error(
+                "weekly_scene_report_missing_json %s",
+                path,
+                extra={"path": str(path)},
+            )
             raise WeeklySceneReportError(f"Required JSON file missing: {path}") from exc
         try:
             data = json.loads(raw)
@@ -266,6 +294,20 @@ class WeeklySceneReportGenerator:
             )
         except DeepSeekError as exc:
             raise WeeklySceneReportError("DeepSeek request failed") from exc
+
+
+def _scene_dir_candidates(scene_tag: str) -> Iterable[str]:
+    """Yield potential storage directory names for ``scene_tag``."""
+
+    cleaned = scene_tag.strip()
+    seen: set[str] = set()
+    if cleaned:
+        seen.add(cleaned)
+        yield cleaned
+    slug = SAFE_SCENE_TAG_RE.sub("_", cleaned or scene_tag)
+    slug = slug.strip("_") or "scene"
+    if slug not in seen:
+        yield slug
 
 
 __all__ = [
