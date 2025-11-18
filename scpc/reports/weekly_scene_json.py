@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-import re
+import os
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -77,9 +77,6 @@ PROMO_ACTION_BUCKETS: Mapping[str, set[str]] = {
 }
 
 TOP_N = 20
-
-SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
 
 @dataclass(slots=True)
 class WeeklySceneJobParams:
@@ -221,7 +218,8 @@ class WeeklySceneJsonGenerator:
             "competitor_actions": build_competitor_actions(tagged, meta),
         }
 
-        base_dir = params.storage_dir / params.week / _safe_scene_tag(meta.scene_tag)
+        scene_dir = _scene_storage_dir(meta.scene_tag)
+        base_dir = params.storage_dir / params.week / scene_dir
         base_dir.mkdir(parents=True, exist_ok=True)
         written: dict[str, Path] = {}
         for module_name, payload in outputs.items():
@@ -410,9 +408,20 @@ def _ensure_json_list(value: Any) -> list[Any]:
     return [value]
 
 
-def _safe_scene_tag(scene_tag: str) -> str:
-    slug = SAFE_FILENAME_RE.sub("_", scene_tag.strip()) or "scene"
-    return slug.strip("_") or "scene"
+def _scene_storage_dir(scene_tag: str) -> str:
+    """Return a safe directory name matching the provided ``scene_tag``."""
+
+    candidate = scene_tag.strip()
+    if not candidate:
+        raise WeeklySceneJsonError("scene_tag cannot be empty for storage outputs")
+    if candidate in {".", ".."}:
+        raise WeeklySceneJsonError("scene_tag cannot be '.' or '..'")
+    separators = {os.sep, "/", "\\"}
+    if os.altsep:
+        separators.add(os.altsep)
+    if any(sep and sep in candidate for sep in separators):
+        raise WeeklySceneJsonError("scene_tag cannot contain path separators")
+    return candidate
 
 
 def _build_meta(df: pd.DataFrame, params: WeeklySceneJobParams) -> "SceneMeta":
