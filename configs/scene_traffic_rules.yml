@@ -29,3 +29,14 @@ defaults:
     high_threshold: 0.60
     # change_score 介于 [medium_threshold, high_threshold) 视为“有一定变化”
     medium_threshold: 0.30
+
+  # 搜索量驱动的关键词机会阈值
+  keyword_volume_opportunity:
+    # 搜索量较大的关键词下限，超过该值认为是高需求词
+    high_volume_min: 50000
+    # 判断需求快速增长的环比增速阈值
+    rising_rate_min: 0.30
+    # 我方在该词的曝光占比上限，低于该值视为布局不足
+    self_share_low_max: 0.05
+    # 关键词在场景曝光中的占比下限，过滤极小长尾词
+    scene_share_min: 0.02

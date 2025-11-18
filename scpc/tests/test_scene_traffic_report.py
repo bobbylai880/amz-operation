@@ -145,6 +145,7 @@ def _prepare_keyword_payload() -> dict[str, object]:
                     "scene_kw_share_this": 0.2,
                     "scene_kw_self_share_this": 0.12,
                     "scene_kw_comp_share_this": 0.08,
+                    "search_volume_this": 120000,
                     "rank_this": 1,
                 }
             ],
@@ -154,15 +155,24 @@ def _prepare_keyword_payload() -> dict[str, object]:
                     "scene_kw_share_last": 0.18,
                     "scene_kw_self_share_last": 0.11,
                     "scene_kw_comp_share_last": 0.07,
+                    "search_volume_last": 95000,
                     "rank_last": 1,
                 }
             ],
             "diff": {
                 "keywords_added": [
-                    {"keyword": "camping shower caddy", "scene_kw_share_this": 0.07}
+                    {
+                        "keyword": "camping shower caddy",
+                        "scene_kw_share_this": 0.07,
+                        "search_volume_this": 80000,
+                    }
                 ],
                 "keywords_removed": [
-                    {"keyword": "boho shower caddy", "scene_kw_share_last": 0.05}
+                    {
+                        "keyword": "boho shower caddy",
+                        "scene_kw_share_last": 0.05,
+                        "search_volume_last": 30000,
+                    }
                 ],
                 "keywords_common": [
                     {
@@ -173,6 +183,10 @@ def _prepare_keyword_payload() -> dict[str, object]:
                         "scene_kw_self_share_last": 0.11,
                         "scene_kw_comp_share_this": 0.08,
                         "scene_kw_comp_share_last": 0.08,
+                        "search_volume_this": 120000,
+                        "search_volume_last": 100000,
+                        "search_volume_diff": 20000,
+                        "search_volume_change_rate": 0.2,
                     }
                 ],
             },
@@ -186,10 +200,18 @@ def _prepare_keyword_payload() -> dict[str, object]:
                     "change_score": 0.72,
                     "change_type": "关键词画像变化显著",
                     "head_keywords_this": [
-                        {"keyword": "dorm shower caddy", "share": 0.5}
+                        {
+                            "keyword": "dorm shower caddy",
+                            "share": 0.5,
+                            "search_volume_this": 120000,
+                        }
                     ],
                     "head_keywords_last": [
-                        {"keyword": "travel shower caddy", "share": 0.4}
+                        {
+                            "keyword": "travel shower caddy",
+                            "share": 0.4,
+                            "search_volume_last": 95000,
+                        }
                     ],
                     "keywords_added": ["dorm shower caddy"],
                     "keywords_removed": ["travel shower caddy"],
@@ -203,10 +225,18 @@ def _prepare_keyword_payload() -> dict[str, object]:
                     "change_score": 0.65,
                     "change_type": "关键词画像变化显著",
                     "head_keywords_this": [
-                        {"keyword": "camping shower caddy", "share": 0.3}
+                        {
+                            "keyword": "camping shower caddy",
+                            "share": 0.3,
+                            "search_volume_this": 80000,
+                        }
                     ],
                     "head_keywords_last": [
-                        {"keyword": "bathroom caddy", "share": 0.2}
+                        {
+                            "keyword": "bathroom caddy",
+                            "share": 0.2,
+                            "search_volume_last": 40000,
+                        }
                     ],
                     "keywords_added": ["camping shower caddy"],
                     "keywords_removed": ["bathroom caddy"],
@@ -233,6 +263,30 @@ def _prepare_keyword_payload() -> dict[str, object]:
                     ],
                 }
             ]
+        },
+        "keyword_opportunity_by_volume": {
+            "high_volume_low_self": [
+                {
+                    "keyword": "camping shower caddy",
+                    "search_volume_this": 80000,
+                    "search_volume_last": 60000,
+                    "search_volume_change_rate": 0.33,
+                    "scene_kw_share_this": 0.07,
+                    "scene_kw_self_share_this": 0.01,
+                    "scene_kw_comp_share_this": 0.06,
+                }
+            ],
+            "rising_demand_self_lagging": [
+                {
+                    "keyword": "travel shower caddy",
+                    "search_volume_this": 95000,
+                    "search_volume_last": 60000,
+                    "search_volume_change_rate": 0.58,
+                    "scene_kw_share_this": 0.18,
+                    "scene_kw_self_share_this": 0.03,
+                    "scene_kw_self_share_last": 0.02,
+                }
+            ],
         },
     }
 

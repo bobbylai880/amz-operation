@@ -55,7 +55,8 @@ SELECT asin,
        marketplace_id,
        keyword,
        snapshot_date,
-       `有效曝光流量占比` AS effective_impr_share
+       `有效曝光流量占比` AS effective_impr_share,
+       weekly_search_volume
 FROM bi_sif_keyword_daily
 WHERE marketplace_id = :marketplace_id
   AND snapshot_date IN (:sunday_this, :sunday_last)
@@ -89,6 +90,12 @@ DEFAULT_RULES = {
     "keyword_profile_change": {
         "high_threshold": 0.6,
         "medium_threshold": 0.3,
+    },
+    "keyword_volume_opportunity": {
+        "high_volume_min": 50000.0,
+        "rising_rate_min": 0.3,
+        "self_share_low_max": 0.05,
+        "scene_share_min": 0.02,
     },
 }
 
@@ -737,6 +744,10 @@ def _prepare_keyword_dataframe(
         df["effective_impr_share"] = pd.to_numeric(
             df["effective_impr_share"], errors="coerce"
         )
+        if "weekly_search_volume" in df.columns:
+            df["weekly_search_volume"] = pd.to_numeric(
+                df["weekly_search_volume"], errors="coerce"
+            )
     joined = df.merge(scene_scope, on=["asin", "marketplace_id"], how="inner")
     joined["hyy_asin"] = joined["hyy_asin"].fillna(0).astype(int)
     joined["share_self"] = joined.apply(
@@ -771,8 +782,8 @@ def _build_keyword_payload(
         "diff": _build_scene_keyword_diff(head_this["dict"], head_last["dict"]),
     }
 
-    asin_heads_this = _build_asin_head_keywords(df_this)
-    asin_heads_last = _build_asin_head_keywords(df_last)
+    asin_heads_this = _build_asin_head_keywords(df_this, "this")
+    asin_heads_last = _build_asin_head_keywords(df_last, "last")
     asin_profile_change = _build_keyword_profile_change(
         df_keyword,
         asin_heads_this,
@@ -781,6 +792,11 @@ def _build_keyword_payload(
     )
 
     contributors = _build_keyword_contributors(df_this, head_this["list"])
+    keyword_opportunity = _build_keyword_volume_opportunity(
+        head_this["dict"],
+        head_last["dict"],
+        rules.get("keyword_volume_opportunity", {}),
+    )
 
     payload = {
         "week": params.week,
@@ -793,6 +809,7 @@ def _build_keyword_payload(
         "scene_head_keywords": scene_head_keywords,
         "asin_keyword_profile_change": asin_profile_change,
         "keyword_asin_contributors": {"this_week": contributors},
+        "keyword_opportunity_by_volume": keyword_opportunity,
     }
     if df_keyword.empty:
         LOGGER.warning(
@@ -809,20 +826,22 @@ def _build_keyword_payload(
 def _build_scene_head_keywords(df: pd.DataFrame, prefix: str) -> dict[str, Any]:
     if df.empty:
         return {"list": [], "dict": {}}
+    agg_map: dict[str, str] = {
+        "effective_impr_share": "sum",
+        "share_self": "sum",
+        "share_comp": "sum",
+    }
+    if "weekly_search_volume" in df.columns:
+        agg_map["weekly_search_volume"] = "max"
     grouped = (
         df.groupby("keyword", as_index=False)
-        .agg(
-            {
-                "effective_impr_share": "sum",
-                "share_self": "sum",
-                "share_comp": "sum",
-            }
-        )
+        .agg(agg_map)
         .rename(
             columns={
                 "effective_impr_share": f"scene_kw_share_{prefix}",
                 "share_self": f"scene_kw_self_share_{prefix}",
                 "share_comp": f"scene_kw_comp_share_{prefix}",
+                "weekly_search_volume": f"search_volume_{prefix}",
             }
         )
     )
@@ -830,6 +849,9 @@ def _build_scene_head_keywords(df: pd.DataFrame, prefix: str) -> dict[str, Any]:
         KEYWORD_SCENE_TOP_K
     )
     grouped["rank"] = range(1, len(grouped) + 1)
+    volume_col = f"search_volume_{prefix}"
+    if volume_col not in grouped.columns:
+        grouped[volume_col] = math.nan
     payload_list = []
     keyword_dict = {}
     for _, row in grouped.iterrows():
@@ -839,6 +861,7 @@ def _build_scene_head_keywords(df: pd.DataFrame, prefix: str) -> dict[str, Any]:
             f"scene_kw_self_share_{prefix}": _safe_float(row.get(f"scene_kw_self_share_{prefix}")),
             f"scene_kw_comp_share_{prefix}": _safe_float(row.get(f"scene_kw_comp_share_{prefix}")),
             f"rank_{prefix}": int(row["rank"]),
+            volume_col: _safe_float(row.get(volume_col)),
         }
         payload_list.append(entry)
         keyword_dict[row["keyword"]] = entry
@@ -860,6 +883,7 @@ def _build_scene_keyword_diff(
                 "scene_kw_share_this": entry.get("scene_kw_share_this"),
                 "scene_kw_self_share_this": entry.get("scene_kw_self_share_this"),
                 "scene_kw_comp_share_this": entry.get("scene_kw_comp_share_this"),
+                "search_volume_this": entry.get("search_volume_this"),
             }
         )
     removed = []
@@ -871,6 +895,7 @@ def _build_scene_keyword_diff(
                 "scene_kw_share_last": entry.get("scene_kw_share_last"),
                 "scene_kw_self_share_last": entry.get("scene_kw_self_share_last"),
                 "scene_kw_comp_share_last": entry.get("scene_kw_comp_share_last"),
+                "search_volume_last": entry.get("search_volume_last"),
             }
         )
     common = []
@@ -882,6 +907,15 @@ def _build_scene_keyword_diff(
             "scene_kw_share_last"
         ) is not None:
             diff = entry_this["scene_kw_share_this"] - entry_last["scene_kw_share_last"]
+        search_volume_this = _safe_float(entry_this.get("search_volume_this"))
+        search_volume_last = _safe_float(entry_last.get("search_volume_last"))
+        search_volume_diff = None
+        search_volume_change_rate = None
+        if search_volume_this is not None and search_volume_last is not None:
+            search_volume_diff = search_volume_this - search_volume_last
+            search_volume_change_rate = _compute_change_rate(
+                search_volume_this, search_volume_last
+            )
         common.append(
             {
                 "keyword": keyword,
@@ -892,6 +926,10 @@ def _build_scene_keyword_diff(
                 "scene_kw_self_share_last": entry_last.get("scene_kw_self_share_last"),
                 "scene_kw_comp_share_this": entry_this.get("scene_kw_comp_share_this"),
                 "scene_kw_comp_share_last": entry_last.get("scene_kw_comp_share_last"),
+                "search_volume_this": search_volume_this,
+                "search_volume_last": search_volume_last,
+                "search_volume_diff": search_volume_diff,
+                "search_volume_change_rate": search_volume_change_rate,
             }
         )
     return {
@@ -901,7 +939,9 @@ def _build_scene_keyword_diff(
     }
 
 
-def _build_asin_head_keywords(df: pd.DataFrame) -> dict[tuple[str, str], list[dict[str, Any]]]:
+def _build_asin_head_keywords(
+    df: pd.DataFrame, prefix: str
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
     if df.empty:
         return {}
     df_sorted = df.sort_values(
@@ -911,13 +951,17 @@ def _build_asin_head_keywords(df: pd.DataFrame) -> dict[tuple[str, str], list[di
     head = df_sorted[df_sorted["rank"] < KEYWORD_ASIN_HEAD_TOP_K]
     result: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for (asin, marketplace), group in head.groupby(["asin", "marketplace_id"]):
-        result[(asin, marketplace)] = [
-            {
+        keyword_list: list[dict[str, Any]] = []
+        for _, row in group.iterrows():
+            entry = {
                 "keyword": row["keyword"],
                 "share": _safe_float(row["effective_impr_share"]),
             }
-            for _, row in group.iterrows()
-        ]
+            volume = _safe_float(row.get("weekly_search_volume"))
+            if volume is not None:
+                entry[f"search_volume_{prefix}"] = volume
+            keyword_list.append(entry)
+        result[(asin, marketplace)] = keyword_list
     return result
 
 
@@ -1024,6 +1068,84 @@ def _build_keyword_contributors(
     return contributors
 
 
+def _build_keyword_volume_opportunity(
+    head_this: Mapping[str, Mapping[str, Any]],
+    head_last: Mapping[str, Mapping[str, Any]],
+    thresholds: Mapping[str, float],
+) -> dict[str, list[dict[str, Any]]]:
+    defaults = DEFAULT_RULES["keyword_volume_opportunity"]
+    high_volume_min = thresholds.get("high_volume_min", defaults["high_volume_min"])
+    rising_rate_min = thresholds.get("rising_rate_min", defaults["rising_rate_min"])
+    self_share_low_max = thresholds.get(
+        "self_share_low_max", defaults["self_share_low_max"]
+    )
+    scene_share_min = thresholds.get("scene_share_min", defaults["scene_share_min"])
+
+    result = {"high_volume_low_self": [], "rising_demand_self_lagging": []}
+
+    for keyword, entry in head_this.items():
+        search_volume_this = _safe_float(entry.get("search_volume_this"))
+        if search_volume_this is None or search_volume_this < high_volume_min:
+            continue
+        scene_share = _safe_float(entry.get("scene_kw_share_this"))
+        if scene_share is None or scene_share < scene_share_min:
+            continue
+        self_share = _safe_float(entry.get("scene_kw_self_share_this"))
+        if self_share is None or self_share > self_share_low_max:
+            continue
+        comp_share = _safe_float(entry.get("scene_kw_comp_share_this"))
+        last_entry = head_last.get(keyword, {})
+        search_volume_last = _safe_float(last_entry.get("search_volume_last"))
+        record = {
+            "keyword": keyword,
+            "search_volume_this": search_volume_this,
+            "search_volume_last": search_volume_last,
+            "search_volume_change_rate": _compute_change_rate(
+                search_volume_this, search_volume_last
+            ),
+            "scene_kw_share_this": scene_share,
+            "scene_kw_self_share_this": self_share,
+            "scene_kw_comp_share_this": comp_share,
+        }
+        result["high_volume_low_self"].append(record)
+
+    for keyword in sorted(set(head_this.keys()) & set(head_last.keys())):
+        entry_this = head_this[keyword]
+        entry_last = head_last[keyword]
+        search_volume_this = _safe_float(entry_this.get("search_volume_this"))
+        search_volume_last = _safe_float(entry_last.get("search_volume_last"))
+        change_rate = _compute_change_rate(search_volume_this, search_volume_last)
+        if change_rate is None or change_rate < rising_rate_min:
+            continue
+        self_share_this = _safe_float(entry_this.get("scene_kw_self_share_this"))
+        if self_share_this is None or self_share_this > self_share_low_max:
+            continue
+        scene_share_this = _safe_float(entry_this.get("scene_kw_share_this"))
+        if scene_share_this is None or scene_share_this < scene_share_min:
+            continue
+        record = {
+            "keyword": keyword,
+            "search_volume_this": search_volume_this,
+            "search_volume_last": search_volume_last,
+            "search_volume_change_rate": change_rate,
+            "scene_kw_share_this": scene_share_this,
+            "scene_kw_self_share_this": self_share_this,
+            "scene_kw_self_share_last": _safe_float(
+                entry_last.get("scene_kw_self_share_last")
+            ),
+        }
+        result["rising_demand_self_lagging"].append(record)
+
+    result["high_volume_low_self"].sort(
+        key=lambda entry: entry.get("search_volume_this") or 0, reverse=True
+    )
+    result["rising_demand_self_lagging"].sort(
+        key=lambda entry: entry.get("search_volume_change_rate") or 0,
+        reverse=True,
+    )
+    return result
+
+
 # ----------------------------------------------------------------------
 # Shared helpers
 # ----------------------------------------------------------------------
@@ -1075,6 +1197,14 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _compute_change_rate(current: float | None, previous: float | None) -> float | None:
+    if current is None or previous is None:
+        return None
+    if previous == 0:
+        return None
+    return (current - previous) / previous
 
 
 def _mean_or_none(series: pd.Series | None) -> float | None:

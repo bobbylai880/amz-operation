@@ -29,9 +29,10 @@ FLOW_SYSTEM_PROMPT = (
 
 KEYWORD_SYSTEM_PROMPT = (
     "你是一名资深的亚马逊运营负责人，擅长从关键词数据判断用户需求场景并制定投放策略。"
+    " 你会结合 search_volume_* 与 search_volume_change_rate 字段，对需求规模与趋势进行定性描述，但不会编造新数字。"
     " 你只会基于输入 JSON 内出现的关键词与 ASIN 作出总结，禁止创造额外内容。"
     " 引用 ASIN 时必须包含品牌信息或“品牌未知”，并在数据缺失时明确说明。"
-    " 输出保持中文 Markdown 风格，可直接作为正式周报章节使用。"
+    " 输出保持中文 Markdown 风格，可直接作为正式周报章节使用，并优先围绕 keyword_opportunity_by_volume 中的机会展开。"
 )
 
 
@@ -225,17 +226,32 @@ class SceneTrafficReportGenerator:
         self, metadata: Mapping[str, str], keyword_data: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         scene_keywords = keyword_data.get("scene_head_keywords") or {}
+        this_keywords = scene_keywords.get("this_week") or []
+        last_keywords = scene_keywords.get("last_week") or []
+
+        def _has_volume(entries: Iterable[Mapping[str, Any]], field: str) -> bool:
+            for entry in entries:
+                value = entry.get(field)
+                if value is not None and str(value).strip() != "":
+                    return True
+            return False
+
         flags = {
             "sunday_last_missing": _is_missing_value(keyword_data.get("sunday_last")),
             "last_week_pool_missing": not bool(scene_keywords.get("last_week")),
+            "search_volume_this_missing": not _has_volume(
+                this_keywords, "search_volume_this"
+            ),
+            "search_volume_last_missing": bool(last_keywords)
+            and not _has_volume(last_keywords, "search_volume_last"),
         }
         output_requirements = [
             "一级标题必须为“七、搜索需求与关键词机会”。",
             "包含 7.1~7.4 四个小节，依次对应场景头部需求、自营 vs 竞品布局、画像变化显著 ASIN、重点机会与动作。",
-            "7.1 需要总结头部关键词所代表的场景/人群（只能基于真实 keyword），若上一周词池缺失需声明数据缺失。",
-            "7.2 指出自营 vs 竞品在 keywords_common 里的占位差异，标记“自营缺位”类词。",
-            "7.3 点名关键词画像变化明显的 ASIN，说明新增/流失的词方向。",
-            "7.4 列出 3-4 个优先级最高的关键词机会，并给出页面优化或投放动作建议。",
+            "7.1 需要总结头部关键词所代表的场景/人群及搜索量体量/趋势，若上一周词池或 search_volume 缺失需在文中声明，仅做静态分析。",
+            "7.2 指出自营 vs 竞品在 keywords_common 里的占位差异，并结合搜索量高低标记“自营缺位”的高价值词。",
+            "7.3 点名关键词画像变化明显的 ASIN，说明新增/流失的词方向，以及这些词的搜索量级别是更大还是更小。",
+            "7.4 必须优先解读 keyword_opportunity_by_volume 中列出的高搜索量/高增速机会，针对自营 ASIN 给出页面与投放动作建议。",
             "引用 ASIN 时必须包含品牌，品牌缺失时写“品牌未知（ASIN: xxx）”。",
             "禁止创造输入中不存在的关键词或品牌。",
         ]
@@ -247,6 +263,7 @@ class SceneTrafficReportGenerator:
                 "scene_head_keywords": "scene_head_keywords.this_week/last_week 表示场景层的头部需求池，diff 中包含新增/退出/共通关键词。",
                 "asin_keyword_profile_change": "asin_keyword_profile_change.self/competitor 描述各 ASIN 的关键词画像变化与 change_score。",
                 "keyword_asin_contributors": "keyword_asin_contributors.this_week 呈现每个关键词贡献最高的 ASIN 列表。",
+                "keyword_opportunity_by_volume": "keyword_opportunity_by_volume.high_volume_low_self/rising_demand_self_lagging 聚焦高搜索量、需求快速上涨但我方 share 偏低的关键词。",
             },
             "data_quality_flags": flags,
             "output_requirements": output_requirements,
