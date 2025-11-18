@@ -31,7 +31,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--storage",
-        default="output/weekly_report",
+        default="storage/weekly_report",
         help="Directory where JSON modules are written",
     )
     return parser.parse_args(argv)

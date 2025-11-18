@@ -272,16 +272,32 @@ def _fetch_brand_scope(engine: Engine, params: WeeklySceneJobParams) -> pd.DataF
                     "table": "bi_amz_asin_product_snapshot_v2",
                 },
             )
-            brand_df = fetch_dataframe(engine, SNAPSHOT_BRAND_FALLBACK_SQL, query_params)
-            LOGGER.info(
-                "weekly_scene_json_brand_table_fallback",
-                extra={
-                    "scene_tag": params.scene_tag,
-                    "marketplace": params.marketplace_id,
-                    "week": params.week,
-                    "table": "bi_amz_asin_product_snapshot",
-                },
-            )
+            try:
+                brand_df = fetch_dataframe(engine, SNAPSHOT_BRAND_FALLBACK_SQL, query_params)
+            except OperationalError as fallback_exc:
+                if _is_unknown_table_error(fallback_exc):
+                    LOGGER.warning(
+                        "weekly_scene_json_brand_table_fallback_missing",
+                        extra={
+                            "scene_tag": params.scene_tag,
+                            "marketplace": params.marketplace_id,
+                            "week": params.week,
+                            "table": "bi_amz_asin_product_snapshot",
+                        },
+                    )
+                    brand_df = pd.DataFrame(columns=["asin", "marketplace_id", "brand"])
+                else:
+                    raise
+            else:
+                LOGGER.info(
+                    "weekly_scene_json_brand_table_fallback",
+                    extra={
+                        "scene_tag": params.scene_tag,
+                        "marketplace": params.marketplace_id,
+                        "week": params.week,
+                        "table": "bi_amz_asin_product_snapshot",
+                    },
+                )
         else:
             raise
     return _aggregate_brands(brand_df)
@@ -577,6 +593,18 @@ TOP_LIST_COLUMNS = [
 ]
 
 
+def _columns_present(df: pd.DataFrame, columns: Iterable[str]) -> list[str]:
+    """Return ordered, de-duplicated columns that exist on the dataframe."""
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for column in columns:
+        if column in df.columns and column not in seen:
+            ordered.append(column)
+            seen.add(column)
+    return ordered
+
+
 def _build_top_lists(df: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
     lists = {
         "rank_up_top": _records_from_dataframe(_top_rank_movers(df, direction="up")),
@@ -638,7 +666,7 @@ def _select_risk_rows(df: pd.DataFrame, rules: Mapping[str, Any]) -> pd.DataFram
         "new_reviews",
         "has_badge_change",
     ]
-    existing = [col for col in columns if col in selected.columns]
+    existing = _columns_present(selected, columns)
     return selected.loc[:, existing].head(TOP_N)
 
 
@@ -651,7 +679,7 @@ def _select_opportunity_rows(df: pd.DataFrame, rules: Mapping[str, Any]) -> pd.D
     mask = rank_up & (badge_added | friendly_price)
     selected = df.loc[mask].copy()
     columns = TOP_LIST_COLUMNS + ["price_action", "coupon_pct_this", "coupon_description_this"]
-    existing = [col for col in columns if col in selected.columns]
+    existing = _columns_present(selected, columns)
     return selected.loc[:, existing].head(TOP_N)
 
 
@@ -667,7 +695,7 @@ def _select_price_rank_moves(df: pd.DataFrame) -> pd.DataFrame:
         {"大幅降价", "小幅降价", "小幅涨价", "大幅涨价"}
     )
     columns = TOP_LIST_COLUMNS + ["price_current_diff", "coupon_pct_this", "coupon_description_this"]
-    existing = [col for col in columns if col in df.columns]
+    existing = _columns_present(df, columns)
     return df.loc[mask, existing].sort_values("rank_leaf_diff", ascending=False).head(TOP_N)
 
 
@@ -678,7 +706,7 @@ def _select_promo_rank_moves(df: pd.DataFrame) -> pd.DataFrame:
         {"新增优惠", "优惠内容变化"}
     )
     columns = TOP_LIST_COLUMNS + ["promo_action", "has_coupon_this", "coupon_description_this"]
-    existing = [col for col in columns if col in df.columns]
+    existing = _columns_present(df, columns)
     return df.loc[mask, existing].sort_values("rank_leaf_diff", ascending=False).head(TOP_N)
 
 
@@ -697,7 +725,7 @@ def _select_content_badge_moves(df: pd.DataFrame) -> pd.DataFrame:
         "aplus_flag_this",
         "has_badge_change",
     ]
-    existing = [col for col in columns if col in df.columns]
+    existing = _columns_present(df, columns)
     ordered = df.loc[content_mask, existing].sort_values("rank_leaf_diff", ascending=False)
     return ordered.head(TOP_N)
 
