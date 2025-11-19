@@ -17,8 +17,8 @@ rank_trend:
   new_asin_label: "新ASIN"
   unknown_label: "未知"
   thresholds:
-    big_up: 50
-    big_down: -50
+    big_up: 20
+    big_down: -20
   labels:
     big_up: "排名明显上升"
     big_down: "排名明显下降"
