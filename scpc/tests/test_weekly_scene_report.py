@@ -100,6 +100,8 @@ def test_generator_produces_markdown_files(tmp_path: Path) -> None:
         "competitor_analysis": report_dir / "03_competitor_analysis.md",
         "self_risk_opportunity": report_dir / "04_self_risk_opportunity.md",
         "competitor_actions": report_dir / "05_competitor_actions.md",
+        "traffic_flow": report_dir / "06_traffic_flow.md",
+        "keyword_opportunity": report_dir / "07_keyword_opportunity.md",
         "full_report": report_dir / "00_full_report.md",
     }
     assert outputs == expected_files
@@ -108,6 +110,17 @@ def test_generator_produces_markdown_files(tmp_path: Path) -> None:
         assert path.read_text(encoding="utf-8").startswith("# ")
     assert client.closed is True
     assert len(client.calls) == 6
+    modules = client.calls[-1]["facts"]["modules"]
+    assert {
+        "overall_summary",
+        "self_analysis",
+        "competitor_analysis",
+        "self_risk_opportunity",
+        "competitor_actions",
+        "traffic_flow",
+        "keyword_opportunity",
+    }.issubset(modules.keys())
+    assert "数据缺失" in modules["traffic_flow"]
 
 
 def test_generator_raises_when_json_missing(tmp_path: Path) -> None:
@@ -141,5 +154,44 @@ def test_generator_supports_slugged_scene_directory(tmp_path: Path) -> None:
 
     report_dir = base / "reports"
     assert outputs["overall_summary"].parent == report_dir
+    assert outputs["traffic_flow"].exists()
+    assert outputs["keyword_opportunity"].exists()
     assert report_dir.exists()
+
+
+def test_generator_reads_optional_markdown_when_present(tmp_path: Path) -> None:
+    base = _prepare_inputs(tmp_path)
+    report_dir = base / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    flow_text = "# 六、场景流量结构与投放策略\n\n现有内容"
+    keyword_text = "# 七、搜索需求与关键词机会\n\n关键词内容"
+    (report_dir / "06_traffic_flow.md").write_text(flow_text, encoding="utf-8")
+    (report_dir / "07_keyword_opportunity.md").write_text(
+        keyword_text, encoding="utf-8"
+    )
+    responses = ["# overall", "# self", "# competitor", "# risk", "# actions", "# full"]
+    client = StubClient(responses)
+    generator = _generator(client)
+
+    generator.run(_params(tmp_path))
+
+    modules = client.calls[-1]["facts"]["modules"]
+    assert modules["traffic_flow"].startswith(flow_text)
+    assert modules["keyword_opportunity"].startswith(keyword_text)
+    assert (report_dir / "06_traffic_flow.md").read_text(encoding="utf-8").startswith("# 六")
+    assert (report_dir / "07_keyword_opportunity.md").read_text(encoding="utf-8").startswith("# 七")
+
+
+def test_generator_raises_when_optional_file_unreadable(tmp_path: Path) -> None:
+    base = _prepare_inputs(tmp_path)
+    report_dir = base / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    flow_path = report_dir / "06_traffic_flow.md"
+    flow_path.write_bytes(b"\xff\xfe")
+    responses = ["# overall", "# self", "# competitor", "# risk", "# actions", "# full"]
+    client = StubClient(responses)
+    generator = _generator(client)
+
+    with pytest.raises(WeeklySceneReportError):
+        generator.run(_params(tmp_path))
 

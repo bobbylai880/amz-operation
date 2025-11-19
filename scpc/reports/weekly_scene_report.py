@@ -109,10 +109,38 @@ MODULE_SPECS: tuple[ModuleSpec, ...] = (
 
 FULL_REPORT_TITLE = "00_full_report.md"
 FULL_REPORT_INSTRUCTION = (
-    "根据 modules 输入汇总，生成完整的《亚马逊周度运营分析报告》。"
-    " 顶部需包含“零、执行摘要”，含一段概述、3 条最重要结论、5 条必须跟进的关键动作。"
-    " 之后保持章节结构：一、市场整体概览；二、自营 ASIN 表现复盘；三、竞品格局与动向；四、自营风险与机会监控；五、竞品关键动作雷达。"
-    " 可以对素材做轻量润色，避免重复，但不得遗漏核心信息。"
+    "你是一名 Amazon.com 资深运营负责人，现需基于 modules 输入（01~07 章 Markdown）生成 {scene_tag} 在 {marketplace_id} 站点"
+    "、周次 {week} 的《00 场景整合周报》。"
+    " 输出必须严格遵循以下结构，并仅引用 modules 中已有事实："
+    " 1）报告范围与数据边界：说明场景/站点/周次、自营&竞品样本覆盖、数据缺口；"
+    " 2）本周总评与关键判断：一句话概括 + 市场&竞品 / 自营健康度 / 流量&搜索三条判断；"
+    " 3）本周优先行动清单：列出 5-10 条“对象+动作+依据+期望方向”的行动，依据需追溯到对应模块；"
+    " 4）市场与竞品格局：拆 6.1 场景整体、6.2 竞品快照、6.3 竞品动作雷达，引用 01/03/05 数据；"
+    " 5）自营经营复盘：总结核心 ASIN 成绩单（02）、规则命中与阈值判断（04）、流量结构与打法（06）；"
+    " 6）流量入口与搜索需求：结合 06/07 描述整体渠道、代表关键词（2-4 个）与 ASIN 曝光格局；"
+    " 7）综合行动方案与风险提示：提炼 1-3 条战略方向，按条线拆解行动，并点出数据局限/监控状态。"
+    " 所有章节需使用简体中文 Markdown，小节编号可沿用 1~7；不得编造新指标或预测未来行为。"
+)
+
+
+@dataclass(frozen=True)
+class MarkdownChapter:
+    key: str
+    filename: str
+    title: str
+
+
+OPTIONAL_MARKDOWN_MODULES: tuple[MarkdownChapter, ...] = (
+    MarkdownChapter(
+        key="traffic_flow",
+        filename="06_traffic_flow.md",
+        title="六、场景流量结构与投放策略",
+    ),
+    MarkdownChapter(
+        key="keyword_opportunity",
+        filename="07_keyword_opportunity.md",
+        title="七、搜索需求与关键词机会",
+    ),
 )
 
 
@@ -177,6 +205,10 @@ class WeeklySceneReportGenerator:
                     },
                 )
 
+            optional_modules = self._load_optional_markdown_modules(report_dir)
+            module_texts.update({key: text for key, (text, _) in optional_modules.items()})
+            for key, (_, path) in optional_modules.items():
+                outputs[key] = path
             full_report = self._render_full_report(metadata, module_texts)
             full_report_path = report_dir / FULL_REPORT_TITLE
             full_report_path.write_text(full_report, encoding="utf-8")
@@ -294,6 +326,46 @@ class WeeklySceneReportGenerator:
             )
         except DeepSeekError as exc:
             raise WeeklySceneReportError("DeepSeek request failed") from exc
+
+    def _load_optional_markdown_modules(
+        self, report_dir: Path
+    ) -> dict[str, tuple[str, Path]]:
+        modules: dict[str, tuple[str, Path]] = {}
+        for chapter in OPTIONAL_MARKDOWN_MODULES:
+            path = report_dir / chapter.filename
+            if path.exists():
+                try:
+                    content = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:  # pragma: no cover
+                    LOGGER.error(
+                        "weekly_scene_report_optional_read_failed",
+                        extra={"module_key": chapter.key, "path": str(path)},
+                    )
+                    raise WeeklySceneReportError(
+                        f"Unable to read optional module {chapter.filename}"
+                    ) from exc
+                modules[chapter.key] = (content, path)
+            else:
+                placeholder = (
+                    f"# {chapter.title}\n\n> 数据缺失：未在 {path.name} 找到对应章节，"
+                    "本周整合报告需在相关段落说明只能引用现有章节的素材。\n"
+                )
+                try:
+                    path.write_text(placeholder, encoding="utf-8")
+                except OSError as exc:  # pragma: no cover - unlikely but logged
+                    LOGGER.error(
+                        "weekly_scene_report_optional_write_failed",
+                        extra={"module_key": chapter.key, "path": str(path)},
+                    )
+                    raise WeeklySceneReportError(
+                        f"Unable to create placeholder for {chapter.filename}"
+                    ) from exc
+                LOGGER.warning(
+                    "weekly_scene_report_optional_missing",
+                    extra={"module_key": chapter.key, "path": str(path)},
+                )
+                modules[chapter.key] = (placeholder, path)
+        return modules
 
 
 def _scene_dir_candidates(scene_tag: str) -> Iterable[str]:
