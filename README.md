@@ -175,12 +175,12 @@ python -m scpc.jobs.generate_scene_traffic_report \
 - **输出路径**：`{storage}/{week}/{scene_tag}/reports/06_traffic_flow.md` 与 `reports/07_keyword_opportunity.md`，文件命名与既有五章一致，方便 Report 汇总 Job 直接拼接。
 - **提示**：Job 会沿用统一的 DeepSeek Client/日志框架，可在 `storage/logs` 查看两次 LLM 调用的耗时与 token 信息；若上一周的流量或关键词数据缺失，生成的 Markdown 会显式提示“只基于本周静态分析”。
 
-任务会在启动阶段读取 `.env` 中的数据库与 DeepSeek 配置，日志记录（脱敏）后的运行环境，随后按流水线依次执行特征计算、LLM 裁决、预算分配与报告生成。场景与竞品特征结果会缓存在进程内的 `FeatureCache` 中，便于在多父体任务中重用。
+任务会在启动阶段读取 `.env` 中的数据库与 DeepSeek 配置，日志记录（脱敏）后的运行环境，随后按流水线依次执行特征计算、LLM 裁决、预算分配与报告生成。场景特征结果会缓存在进程内的 `FeatureCache` 中，便于在多父体任务中重用。
 
 ## 特征工程亮点
 - `scpc/features/parent.py`：实现 LMDI 漏斗分解与引流款库存健康度 `lead_stock_ok`，同时给出证据结构。
 - `scpc/features/child.py`：计算多渠道有效覆盖 `effective_woc`、GMROI/PPAD、库存风险等级，并兼容缺失毛利场景。
-- `scpc/features/scene.py`、`scpc/features/competition.py`：覆盖大盘趋势、竞品对比与父体加权指标。
+- `scpc/features/scene.py`：覆盖大盘趋势与父体加权指标。
 
 ## LLM 编排
 - `scpc/llm/deepseek_client.py` 提供 `create_client_from_env()`，通过 `.env` 生成 DeepSeek 客户端；
