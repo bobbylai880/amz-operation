@@ -31,8 +31,10 @@ KEYWORD_SYSTEM_PROMPT = (
     "你是一名资深的亚马逊运营负责人，擅长从关键词数据判断用户需求场景并制定投放策略。"
     " 你会结合 search_volume_* 与 search_volume_change_rate 字段，对需求规模与趋势进行定性描述，但不会编造新数字。"
     " 你只会基于输入 JSON 内出现的关键词与 ASIN 作出总结，禁止创造额外内容。"
-    " 引用 ASIN 时必须包含品牌信息或“品牌未知”，并在数据缺失时明确说明。"
-    " 输出保持中文 Markdown 风格，可直接作为正式周报章节使用，并优先围绕 keyword_opportunity_by_volume 中的机会展开。"
+    " 你会重点阅读 self_best_organic_rank_*/self_best_ad_rank_* 以及 *_status 字段，准确描述自营与竞品在自然位和广告位的格局，并引用 keyword_asin_contributors/asin_keyword_profile_change 提供的 ASIN 粒度指标。"
+    " 遇到 rank/status = null 或 missing 时，必须在正文中说明“自然/广告排位数据缺失”，不得虚构。"
+    " 引用 ASIN 时必须包含品牌信息或“品牌未知”，并在数据缺失时明确说明，描述中要同时覆盖该关键词的搜索量、该 ASIN 的 kw_impr_share 以及自然/广告排名表现和运营建议。"
+    " 输出保持中文 Markdown 风格，可直接作为正式周报章节使用，并优先围绕 keyword_opportunity_by_volume 及其中的 opportunity_type 打法建议展开，并在每个代表关键词下给出 3~5 个典型 ASIN 的深度分析。"
 )
 
 
@@ -247,13 +249,13 @@ class SceneTrafficReportGenerator:
         }
         output_requirements = [
             "一级标题必须为“七、搜索需求与关键词机会”。",
-            "包含 7.1~7.4 四个小节，依次对应场景头部需求、自营 vs 竞品布局、画像变化显著 ASIN、重点机会与动作。",
-            "7.1 需要总结头部关键词所代表的场景/人群及搜索量体量/趋势，若上一周词池或 search_volume 缺失需在文中声明，仅做静态分析。",
-            "7.2 指出自营 vs 竞品在 keywords_common 里的占位差异，并结合搜索量高低标记“自营缺位”的高价值词。",
-            "7.3 点名关键词画像变化明显的 ASIN，说明新增/流失的词方向，以及这些词的搜索量级别是更大还是更小。",
-            "7.4 必须优先解读 keyword_opportunity_by_volume 中列出的高搜索量/高增速机会，针对自营 ASIN 给出页面与投放动作建议。",
-            "引用 ASIN 时必须包含品牌，品牌缺失时写“品牌未知（ASIN: xxx）”。",
-            "禁止创造输入中不存在的关键词或品牌。",
+            "全文需组织为 7.1~7.4 四个小节：7.1 场景搜索需求概览，7.2 关键词机会分类（按 opportunity_type 归类），7.3 关键词 × ASIN 深度解剖，7.4 归纳行动建议。",
+            "7.1 需要总结头部关键词所代表的场景/人群、搜索量体量/趋势以及自营 vs 竞品在自然/广告位的总体格局；若上一周词池或 search_volume 缺失需在文中声明，仅做静态分析。",
+            "7.2 必须按照 keyword_opportunity_by_volume.*.opportunity_type 进行分组，描述不同类型关键词的搜索量级别、趋势和自营/竞品 share 以及 rank status 差异，并引用代表性关键词。",
+            "7.3 对每个在 7.2 中点名的代表性关键词，下挂 3~5 个典型 ASIN（自营优先，其次竞品），每个 ASIN 的段落必须覆盖：该关键词搜索量及趋势、该 ASIN 在该词下的 kw_impr_share 或流量贡献、自身自然/广告排位（若缺失需明示）以及针对性的诊断与操作建议。",
+            "引用 ASIN 时须写成“品牌（ASIN: XXXXX）”，品牌缺失时写“品牌未知（ASIN: XXXXX）”，并标注自营或竞品身份。",
+            "禁止创造输入中不存在的关键词或品牌，若 rank/status/kw_impr_share 缺失需用“数据缺失”表述。",
+            "7.4 需基于前述分析总结不同 opportunity_type 的优先动作，明确对应的 keyword+ASIN 组合与下一步资源投入方向。",
         ]
         return {
             "chapter": KEYWORD_TITLE,
@@ -263,13 +265,13 @@ class SceneTrafficReportGenerator:
                 "scene_head_keywords": "scene_head_keywords.this_week/last_week 表示场景层的头部需求池，diff 中包含新增/退出/共通关键词。",
                 "asin_keyword_profile_change": "asin_keyword_profile_change.self/competitor 描述各 ASIN 的关键词画像变化与 change_score。",
                 "keyword_asin_contributors": "keyword_asin_contributors.this_week 呈现每个关键词贡献最高的 ASIN 列表。",
-                "keyword_opportunity_by_volume": "keyword_opportunity_by_volume.high_volume_low_self/rising_demand_self_lagging 聚焦高搜索量、需求快速上涨但我方 share 偏低的关键词。",
+                "keyword_opportunity_by_volume": "keyword_opportunity_by_volume.* 中的每条记录都带有自然/广告 rank/status 以及 opportunity_type，便于按打法归类。",
             },
             "data_quality_flags": flags,
             "output_requirements": output_requirements,
             "style_notes": {
-                "tone": "以数据支撑的场景归纳，适度引用关键词示例，避免罗列。",
-                "length": "建议 400-800 字。",
+                "tone": "以数据支撑的场景归纳，并延伸到 ASIN 级别的诊断与建议，逻辑清晰、分点展开。",
+                "length": "建议 600-1200 字，可视数据量适度延长。",
             },
         }
 
