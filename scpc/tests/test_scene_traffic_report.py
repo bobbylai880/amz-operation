@@ -294,8 +294,10 @@ def _prepare_keyword_payload() -> dict[str, object]:
 def test_generator_writes_both_chapters(tmp_path: Path) -> None:
     params = _params(tmp_path)
     base_dir = tmp_path / params.week / params.scene_tag / "traffic"
-    _write_json(base_dir / "flow_change.json", _prepare_flow_payload())
-    _write_json(base_dir / "keyword_change.json", _prepare_keyword_payload())
+    flow_payload = _prepare_flow_payload()
+    keyword_payload = _prepare_keyword_payload()
+    _write_json(base_dir / "flow_change.json", flow_payload)
+    _write_json(base_dir / "keyword_change.json", keyword_payload)
 
     responses = [
         "# 六、场景流量结构与投放策略\n\n本周流量结构描述。",
@@ -317,6 +319,27 @@ def test_generator_writes_both_chapters(tmp_path: Path) -> None:
     assert client.calls[1]["prompt"] == report_module.KEYWORD_SYSTEM_PROMPT
     assert client.calls[0]["facts"]["chapter"] == report_module.FLOW_TITLE
     assert client.calls[1]["facts"]["chapter"] == report_module.KEYWORD_TITLE
+    keyword_facts = client.calls[1]["facts"]
+    assert keyword_facts["scene_head_keywords"] == keyword_payload["scene_head_keywords"]
+    assert (
+        keyword_facts["keyword_opportunity_by_volume"]
+        == keyword_payload["keyword_opportunity_by_volume"]
+    )
+    assert (
+        keyword_facts["keyword_asin_contributors"]
+        == keyword_payload["keyword_asin_contributors"]
+    )
+    assert (
+        keyword_facts["asin_keyword_profile_change"]
+        == keyword_payload["asin_keyword_profile_change"]
+    )
+    flags = keyword_facts["data_quality_flags"]
+    assert flags["rank_metrics_missing"] is True
+    assert flags["keyword_opportunity_missing"] is False
+    assert flags["asin_contributor_missing"] is False
+    assert flags["search_volume_last_missing"] is False
+    assert "keyword_change_json" not in keyword_facts
+    assert keyword_facts["style_notes"].get("no_code_block") is True
 
 
 def test_generator_handles_missing_flow_json(tmp_path: Path) -> None:

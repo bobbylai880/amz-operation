@@ -28,11 +28,17 @@ FLOW_SYSTEM_PROMPT = (
 )
 
 KEYWORD_SYSTEM_PROMPT = (
-    "你是一名资深的亚马逊运营负责人，擅长从关键词数据判断用户需求场景并制定投放策略。"
-    " 你会结合 search_volume_* 与 search_volume_change_rate 字段，对需求规模与趋势进行定性描述，但不会编造新数字。"
-    " 你只会基于输入 JSON 内出现的关键词与 ASIN 作出总结，禁止创造额外内容。"
-    " 引用 ASIN 时必须包含品牌信息或“品牌未知”，并在数据缺失时明确说明。"
-    " 输出保持中文 Markdown 风格，可直接作为正式周报章节使用，并优先围绕 keyword_opportunity_by_volume 中的机会展开。"
+    "你是一名资深的亚马逊运营负责人，接收的 JSON facts 已拆分为 context、scene_head_keywords、keyword_opportunity_by_volume、keyword_asin_contributors、asin_keyword_profile_change、data_quality_flags、output_requirements、style_notes。"
+    " 你必须严格依赖这些字段写出第七章《搜索需求与关键词机会》，禁止臆造任何关键词、ASIN、品牌或数值。"
+    " 【结构要求】输出以“# 七、搜索需求与关键词机会”开头，并按照 7.1~7.4 固定顺序书写；任一小节若缺数据，必须写“数据缺失，仅能做静态观察”。"
+    " 【数据使用】search_volume_change_rate 判定需求趋势：≥ +0.3=明显上升，+0.1~+0.3=略有上升，-0.1~+0.1=基本稳定，≤ -0.1=需求走弱；scene_kw_self_share/scene_kw_comp_share 与上一周差值 ≥ ±0.03 必须描述份额流入或流失。"
+    " 排名变化只能依据 *_best_organic_rank_*/ *_best_ad_rank_* 及 organic_rank_trend/ad_rank_trend/organic_rank_diff/ad_rank_diff（如 new/lost/up/down/stable），不得自行推算；若某字段为 null 或 status=missing，必须在文中说明“数据缺失”。"
+    " 【7.1】引用 scene_head_keywords.this_week / last_week / diff 中的搜索量、share、rank_this/last 与 *_status，结合 data_quality_flags 标注上一周缺失场景时写“仅能做静态观察”。"
+    " 【7.2】按照 keyword_opportunity_by_volume.*.opportunity_type 分组（如 high_volume_low_self、rising_demand_self_lagging、organic_good_ad_gap、ad_heavy_but_not_dominant），逐组回答“搜索需求→曝光结构→排名格局”，并引用自营/竞品 share 与 rank/status；若某分组列表为空需声明“该类机会暂无数据”。"
+    " 【7.3】为 7.2 中的每个重点关键词列出 ≥3 个 ASIN，必须来自 keyword_asin_contributors.this_week.top_asin，按曝光贡献（effective_impr_share_this，可称 kw_impr_share）排序，自营优先；引用格式固定为“自营/竞品 品牌（ASIN: XXXXX）”，品牌缺失写“品牌未知（ASIN: XXXXX）”。"
+    " 当 ASIN 排名字段 organic_rank_this/ad_rank_this 缺失时写“该词下自然/广告排位数据缺失，仅能根据曝光 share 评估”；若 organic_rank_trend/ad_rank_trend=up/down/new/lost/stable，要翻译成通俗语言说明排名上升/下滑/新增/跌出；若 ASIN 也在 asin_keyword_profile_change 中出现，需要补充其 head_keywords_this/last 或 keywords_added 透露的画像迁移。"
+    " 【7.4】按 opportunity_type 总结可执行动作，点名 keyword+ASIN 组合，并说明需要的资源（Listing 优化/广告/新品）；若前序数据缺失导致无法给出策略，要明确说明原因。"
+    " 【其他】必须参考 data_quality_flags 提示的数据空缺，Markdown 内禁止代码块；引用 ASIN/关键词均需来自输入 JSON；语气保持专业、分点展开。"
 )
 
 
@@ -228,6 +234,9 @@ class SceneTrafficReportGenerator:
         scene_keywords = keyword_data.get("scene_head_keywords") or {}
         this_keywords = scene_keywords.get("this_week") or []
         last_keywords = scene_keywords.get("last_week") or []
+        opportunity = keyword_data.get("keyword_opportunity_by_volume") or {}
+        contributors = keyword_data.get("keyword_asin_contributors") or {}
+        asin_profile_change = keyword_data.get("asin_keyword_profile_change") or {}
 
         def _has_volume(entries: Iterable[Mapping[str, Any]], field: str) -> bool:
             for entry in entries:
@@ -236,6 +245,29 @@ class SceneTrafficReportGenerator:
                     return True
             return False
 
+        def _has_fields(entries: Iterable[Mapping[str, Any]], fields: list[str]) -> bool:
+            for entry in entries:
+                for field in fields:
+                    value = entry.get(field)
+                    if value is not None and str(value).strip() != "":
+                        return True
+            return False
+
+        def _has_entries(node: Any) -> bool:
+            if isinstance(node, Mapping):
+                return any(_has_entries(value) for value in node.values())
+            if isinstance(node, list):
+                return any(node)
+            return bool(node)
+
+        def _has_top_asin(entries: Iterable[Mapping[str, Any]]) -> bool:
+            for entry in entries:
+                top_asin = entry.get("top_asin") or []
+                if top_asin:
+                    return True
+            return False
+
+        top_asin_block = contributors.get("this_week") or []
         flags = {
             "sunday_last_missing": _is_missing_value(keyword_data.get("sunday_last")),
             "last_week_pool_missing": not bool(scene_keywords.get("last_week")),
@@ -244,35 +276,52 @@ class SceneTrafficReportGenerator:
             ),
             "search_volume_last_missing": bool(last_keywords)
             and not _has_volume(last_keywords, "search_volume_last"),
+            "rank_metrics_missing": not _has_fields(
+                this_keywords,
+                [
+                    "self_best_organic_rank_this",
+                    "self_best_ad_rank_this",
+                    "comp_best_organic_rank_this",
+                    "comp_best_ad_rank_this",
+                ],
+            ),
+            "keyword_opportunity_missing": not _has_entries(opportunity),
+            "asin_contributor_missing": not _has_top_asin(top_asin_block),
+            "asin_profile_change_missing": not _has_entries(asin_profile_change),
         }
         output_requirements = [
             "一级标题必须为“七、搜索需求与关键词机会”。",
-            "包含 7.1~7.4 四个小节，依次对应场景头部需求、自营 vs 竞品布局、画像变化显著 ASIN、重点机会与动作。",
-            "7.1 需要总结头部关键词所代表的场景/人群及搜索量体量/趋势，若上一周词池或 search_volume 缺失需在文中声明，仅做静态分析。",
-            "7.2 指出自营 vs 竞品在 keywords_common 里的占位差异，并结合搜索量高低标记“自营缺位”的高价值词。",
-            "7.3 点名关键词画像变化明显的 ASIN，说明新增/流失的词方向，以及这些词的搜索量级别是更大还是更小。",
-            "7.4 必须优先解读 keyword_opportunity_by_volume 中列出的高搜索量/高增速机会，针对自营 ASIN 给出页面与投放动作建议。",
-            "引用 ASIN 时必须包含品牌，品牌缺失时写“品牌未知（ASIN: xxx）”。",
-            "禁止创造输入中不存在的关键词或品牌。",
+            "全文固定包含 7.1~7.4 小节，即便缺数据也要写“数据缺失，仅能做静态观察”。",
+            "所有趋势判断必须直接引用 search_volume_change_rate、scene_kw_share/scene_kw_self_share/scene_kw_comp_share 的 this/last/diff 以及 organic_rank_trend/ad_rank_trend/organic_rank_diff/ad_rank_diff，禁止自行推算。",
+            "若 data_quality_flags 提示上一周缺失、搜索量缺失或 rank 数据缺失，需在对应段落中明确告知并仅做静态描述。",
+            "7.1 需结合 scene_head_keywords.this_week/last_week/diff 说明搜索需求层级、场景份额、自营 vs 竞品 share 与自然/广告位状态。",
+            "7.2 必须按照 keyword_opportunity_by_volume.*.opportunity_type 分组，若某组为空需写“该类机会暂无数据”，每组内部按“搜索需求→曝光结构→自然/广告排位”阐述。",
+            "7.3 针对 7.2 的每个重点关键词列出至少 3 个 ASIN，均来自 keyword_asin_contributors.this_week.top_asin，描述曝光贡献（effective_impr_share_this）、自营/竞品身份、自然/广告排名及 trend（缺失需写“数据缺失”），并补充 asin_keyword_profile_change.* 中的画像迁移（如适用）。",
+            "引用 ASIN 时必须写“自营/竞品 品牌（ASIN: XXXXX）”，品牌缺失写“品牌未知（ASIN: XXXXX）”，并说明若缺 rank/status 只能依据曝光 share。",
+            "7.4 需按 opportunity_type 汇总下一步动作，点名 keyword+ASIN 组合及需要的资源（Listing 优化/广告/上新等），引用前文数据作为证据。",
+            "Markdown 文本禁止使用代码块，禁止编造 JSON 中不存在的关键词、ASIN 或品牌。",
         ]
         return {
             "chapter": KEYWORD_TITLE,
             "context": metadata,
-            "keyword_change_json": keyword_data,
-            "json_notes": {
-                "scene_head_keywords": "scene_head_keywords.this_week/last_week 表示场景层的头部需求池，diff 中包含新增/退出/共通关键词。",
-                "asin_keyword_profile_change": "asin_keyword_profile_change.self/competitor 描述各 ASIN 的关键词画像变化与 change_score。",
-                "keyword_asin_contributors": "keyword_asin_contributors.this_week 呈现每个关键词贡献最高的 ASIN 列表。",
-                "keyword_opportunity_by_volume": "keyword_opportunity_by_volume.high_volume_low_self/rising_demand_self_lagging 聚焦高搜索量、需求快速上涨但我方 share 偏低的关键词。",
-            },
+            "scene_head_keywords": scene_keywords,
+            "keyword_opportunity_by_volume": opportunity,
+            "keyword_asin_contributors": contributors,
+            "asin_keyword_profile_change": asin_profile_change,
             "data_quality_flags": flags,
+            "json_notes": {
+                "scene_head_keywords": "scene_head_keywords.this_week/last_week/diff 覆盖头部需求池、排名与份额变化。",
+                "keyword_opportunity_by_volume": "keyword_opportunity_by_volume.* 携带 search_volume、share、rank/status 与 opportunity_type。",
+                "keyword_asin_contributors": "keyword_asin_contributors.this_week.top_asin 提供每个关键词的主要 ASIN 及曝光贡献与排名。",
+                "asin_keyword_profile_change": "asin_keyword_profile_change.self/competitor 描述 ASIN 的关键词画像迁移。",
+            },
             "output_requirements": output_requirements,
             "style_notes": {
-                "tone": "以数据支撑的场景归纳，适度引用关键词示例，避免罗列。",
-                "length": "建议 400-800 字。",
+                "tone": "以数据驱动的诊断与建议，逐步收敛到关键词×ASIN 行动。",
+                "length": "建议 600-1200 字，可视数据量适度延长。",
+                "no_code_block": True,
             },
         }
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

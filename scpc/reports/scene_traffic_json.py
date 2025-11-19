@@ -56,7 +56,9 @@ SELECT asin,
        keyword,
        snapshot_date,
        `有效曝光流量占比` AS effective_impr_share,
-       weekly_search_volume
+       weekly_search_volume,
+       last_rank,
+       ad_last_rank
 FROM bi_sif_keyword_daily
 WHERE marketplace_id = :marketplace_id
   AND snapshot_date IN (:sunday_this, :sunday_last)
@@ -97,6 +99,16 @@ DEFAULT_RULES = {
         "self_share_low_max": 0.05,
         "scene_share_min": 0.02,
     },
+    "keyword_position": {
+        "organic": {"strong_max": 16.0, "medium_max": 64.0},
+        "ad": {"strong_max": 4.0, "medium_max": 10.0},
+    },
+    "keyword_opportunity_rules": {
+        "high_volume_min": 10000.0,
+        "self_share_low_max": 0.05,
+        "rising_rate_min": 0.3,
+    },
+    "asin_rank_trend": {"stable_threshold": 2.0},
 }
 
 AD_CHANGE_BUCKETS = [
@@ -300,36 +312,54 @@ def _load_rules_config(config_path: Path) -> dict[str, Any]:
     defaults = raw.get("defaults", {}) if isinstance(raw, Mapping) else {}
     merged = {}
     for key, fallback in DEFAULT_RULES.items():
-        current = fallback.copy()
         section = defaults.get(key) if isinstance(defaults, Mapping) else None
+        merged[key] = _merge_rule_section(fallback, section, [key])
+    return merged
+
+
+def _merge_rule_section(
+    fallback: Any, section: Any, path: list[str]
+) -> Any:  # pragma: no cover - exercised via _load_rules_config
+    section_label = ".".join(path)
+    if isinstance(fallback, Mapping):
+        merged: dict[str, Any] = {}
         if section is None:
             LOGGER.warning(
                 "scene_traffic_json_config_section_missing",
-                extra={"section": key},
+                extra={"section": section_label},
             )
+            section_map: Mapping[str, Any] = {}
         elif isinstance(section, Mapping):
-            for field in fallback:
-                if field in section:
-                    value = section[field]
-                    if _is_number(value):
-                        current[field] = float(value)
-                    else:
-                        LOGGER.warning(
-                            "scene_traffic_json_config_invalid_value",
-                            extra={"section": key, "field": field, "value": value},
-                        )
-                else:
-                    LOGGER.warning(
-                        "scene_traffic_json_config_missing_key",
-                        extra={"section": key, "missing": field},
-                    )
+            section_map = section
         else:
             LOGGER.warning(
                 "scene_traffic_json_config_section_invalid",
-                extra={"section": key},
+                extra={"section": section_label},
             )
-        merged[key] = current
-    return merged
+            section_map = {}
+        for field, default_value in fallback.items():
+            next_path = path + [field]
+            merged[field] = _merge_rule_section(
+                default_value, section_map.get(field), next_path
+            )
+        return merged
+
+    if section is None:
+        parent = ".".join(path[:-1]) or path[-1]
+        LOGGER.warning(
+            "scene_traffic_json_config_missing_key",
+            extra={"section": parent, "missing": path[-1]},
+        )
+        return fallback
+
+    if _is_number(section):
+        return float(section)
+
+    LOGGER.warning(
+        "scene_traffic_json_config_invalid_value",
+        extra={"section": ".".join(path[:-1]) or path[-1], "field": path[-1], "value": section},
+    )
+    return fallback
 
 
 def _aggregate_scene_tags(scene_df: pd.DataFrame) -> pd.DataFrame:
@@ -748,6 +778,10 @@ def _prepare_keyword_dataframe(
             df["weekly_search_volume"] = pd.to_numeric(
                 df["weekly_search_volume"], errors="coerce"
             )
+        if "last_rank" in df.columns:
+            df["last_rank"] = pd.to_numeric(df["last_rank"], errors="coerce")
+        if "ad_last_rank" in df.columns:
+            df["ad_last_rank"] = pd.to_numeric(df["ad_last_rank"], errors="coerce")
     joined = df.merge(scene_scope, on=["asin", "marketplace_id"], how="inner")
     joined["hyy_asin"] = joined["hyy_asin"].fillna(0).astype(int)
     joined["share_self"] = joined.apply(
@@ -773,8 +807,9 @@ def _build_keyword_payload(
     df_this = df_keyword[df_keyword["snapshot_date"] == sunday_this]
     df_last = df_keyword[df_keyword["snapshot_date"] == sunday_last]
 
-    head_this = _build_scene_head_keywords(df_this, "this")
-    head_last = _build_scene_head_keywords(df_last, "last")
+    position_rules = rules.get("keyword_position", DEFAULT_RULES["keyword_position"])
+    head_this = _build_scene_head_keywords(df_this, "this", position_rules)
+    head_last = _build_scene_head_keywords(df_last, "last", position_rules)
 
     scene_head_keywords = {
         "this_week": head_this["list"],
@@ -791,11 +826,15 @@ def _build_keyword_payload(
         rules.get("keyword_profile_change", {}),
     )
 
-    contributors = _build_keyword_contributors(df_this, head_this["list"])
+    asin_rank_rules = rules.get("asin_rank_trend", DEFAULT_RULES["asin_rank_trend"])
+    contributors = _build_keyword_contributors(
+        df_this, df_last, head_this["list"], asin_rank_rules
+    )
     keyword_opportunity = _build_keyword_volume_opportunity(
         head_this["dict"],
         head_last["dict"],
         rules.get("keyword_volume_opportunity", {}),
+        rules.get("keyword_opportunity_rules", {}),
     )
 
     payload = {
@@ -823,7 +862,9 @@ def _build_keyword_payload(
     return payload
 
 
-def _build_scene_head_keywords(df: pd.DataFrame, prefix: str) -> dict[str, Any]:
+def _build_scene_head_keywords(
+    df: pd.DataFrame, prefix: str, position_rules: Mapping[str, Any]
+) -> dict[str, Any]:
     if df.empty:
         return {"list": [], "dict": {}}
     agg_map: dict[str, str] = {
@@ -852,6 +893,40 @@ def _build_scene_head_keywords(df: pd.DataFrame, prefix: str) -> dict[str, Any]:
     volume_col = f"search_volume_{prefix}"
     if volume_col not in grouped.columns:
         grouped[volume_col] = math.nan
+
+    rank_series_map = {
+        f"self_best_organic_rank_{prefix}": _best_rank_series(df, "last_rank", True),
+        f"comp_best_organic_rank_{prefix}": _best_rank_series(df, "last_rank", False),
+        f"self_best_ad_rank_{prefix}": _best_rank_series(df, "ad_last_rank", True),
+        f"comp_best_ad_rank_{prefix}": _best_rank_series(df, "ad_last_rank", False),
+    }
+    rank_frames = [
+        series.rename(column)
+        for column, series in rank_series_map.items()
+        if not series.empty
+    ]
+    if rank_frames:
+        metrics = pd.concat(rank_frames, axis=1).reset_index()
+        grouped = grouped.merge(metrics, on="keyword", how="left")
+    for column in rank_series_map:
+        if column not in grouped.columns:
+            grouped[column] = math.nan
+
+    organic_thresholds = _resolve_position_thresholds(position_rules, "organic")
+    ad_thresholds = _resolve_position_thresholds(position_rules, "ad")
+    grouped[f"self_organic_status_{prefix}"] = grouped[
+        f"self_best_organic_rank_{prefix}"
+    ].apply(lambda value: _rank_status(value, organic_thresholds))
+    grouped[f"comp_organic_status_{prefix}"] = grouped[
+        f"comp_best_organic_rank_{prefix}"
+    ].apply(lambda value: _rank_status(value, organic_thresholds))
+    grouped[f"self_ad_status_{prefix}"] = grouped[f"self_best_ad_rank_{prefix}"].apply(
+        lambda value: _rank_status(value, ad_thresholds)
+    )
+    grouped[f"comp_ad_status_{prefix}"] = grouped[f"comp_best_ad_rank_{prefix}"].apply(
+        lambda value: _rank_status(value, ad_thresholds)
+    )
+
     payload_list = []
     keyword_dict = {}
     for _, row in grouped.iterrows():
@@ -862,6 +937,26 @@ def _build_scene_head_keywords(df: pd.DataFrame, prefix: str) -> dict[str, Any]:
             f"scene_kw_comp_share_{prefix}": _safe_float(row.get(f"scene_kw_comp_share_{prefix}")),
             f"rank_{prefix}": int(row["rank"]),
             volume_col: _safe_float(row.get(volume_col)),
+            f"self_best_organic_rank_{prefix}": _safe_float(
+                row.get(f"self_best_organic_rank_{prefix}")
+            ),
+            f"comp_best_organic_rank_{prefix}": _safe_float(
+                row.get(f"comp_best_organic_rank_{prefix}")
+            ),
+            f"self_best_ad_rank_{prefix}": _safe_float(
+                row.get(f"self_best_ad_rank_{prefix}")
+            ),
+            f"comp_best_ad_rank_{prefix}": _safe_float(
+                row.get(f"comp_best_ad_rank_{prefix}")
+            ),
+            f"self_organic_status_{prefix}": row.get(
+                f"self_organic_status_{prefix}"
+            ),
+            f"comp_organic_status_{prefix}": row.get(
+                f"comp_organic_status_{prefix}"
+            ),
+            f"self_ad_status_{prefix}": row.get(f"self_ad_status_{prefix}"),
+            f"comp_ad_status_{prefix}": row.get(f"comp_ad_status_{prefix}"),
         }
         payload_list.append(entry)
         keyword_dict[row["keyword"]] = entry
@@ -884,6 +979,14 @@ def _build_scene_keyword_diff(
                 "scene_kw_self_share_this": entry.get("scene_kw_self_share_this"),
                 "scene_kw_comp_share_this": entry.get("scene_kw_comp_share_this"),
                 "search_volume_this": entry.get("search_volume_this"),
+                "self_best_organic_rank_this": entry.get("self_best_organic_rank_this"),
+                "comp_best_organic_rank_this": entry.get("comp_best_organic_rank_this"),
+                "self_best_ad_rank_this": entry.get("self_best_ad_rank_this"),
+                "comp_best_ad_rank_this": entry.get("comp_best_ad_rank_this"),
+                "self_organic_status_this": entry.get("self_organic_status_this"),
+                "comp_organic_status_this": entry.get("comp_organic_status_this"),
+                "self_ad_status_this": entry.get("self_ad_status_this"),
+                "comp_ad_status_this": entry.get("comp_ad_status_this"),
             }
         )
     removed = []
@@ -896,6 +999,14 @@ def _build_scene_keyword_diff(
                 "scene_kw_self_share_last": entry.get("scene_kw_self_share_last"),
                 "scene_kw_comp_share_last": entry.get("scene_kw_comp_share_last"),
                 "search_volume_last": entry.get("search_volume_last"),
+                "self_best_organic_rank_last": entry.get("self_best_organic_rank_last"),
+                "comp_best_organic_rank_last": entry.get("comp_best_organic_rank_last"),
+                "self_best_ad_rank_last": entry.get("self_best_ad_rank_last"),
+                "comp_best_ad_rank_last": entry.get("comp_best_ad_rank_last"),
+                "self_organic_status_last": entry.get("self_organic_status_last"),
+                "comp_organic_status_last": entry.get("comp_organic_status_last"),
+                "self_ad_status_last": entry.get("self_ad_status_last"),
+                "comp_ad_status_last": entry.get("comp_ad_status_last"),
             }
         )
     common = []
@@ -930,6 +1041,30 @@ def _build_scene_keyword_diff(
                 "search_volume_last": search_volume_last,
                 "search_volume_diff": search_volume_diff,
                 "search_volume_change_rate": search_volume_change_rate,
+                "self_best_organic_rank_this": entry_this.get(
+                    "self_best_organic_rank_this"
+                ),
+                "self_best_organic_rank_last": entry_last.get(
+                    "self_best_organic_rank_last"
+                ),
+                "comp_best_organic_rank_this": entry_this.get(
+                    "comp_best_organic_rank_this"
+                ),
+                "comp_best_organic_rank_last": entry_last.get(
+                    "comp_best_organic_rank_last"
+                ),
+                "self_best_ad_rank_this": entry_this.get("self_best_ad_rank_this"),
+                "self_best_ad_rank_last": entry_last.get("self_best_ad_rank_last"),
+                "comp_best_ad_rank_this": entry_this.get("comp_best_ad_rank_this"),
+                "comp_best_ad_rank_last": entry_last.get("comp_best_ad_rank_last"),
+                "self_organic_status_this": entry_this.get("self_organic_status_this"),
+                "self_organic_status_last": entry_last.get("self_organic_status_last"),
+                "comp_organic_status_this": entry_this.get("comp_organic_status_this"),
+                "comp_organic_status_last": entry_last.get("comp_organic_status_last"),
+                "self_ad_status_this": entry_this.get("self_ad_status_this"),
+                "self_ad_status_last": entry_last.get("self_ad_status_last"),
+                "comp_ad_status_this": entry_this.get("comp_ad_status_this"),
+                "comp_ad_status_last": entry_last.get("comp_ad_status_last"),
             }
         )
     return {
@@ -1037,12 +1172,19 @@ def _build_keyword_profile_change(
 
 
 def _build_keyword_contributors(
-    df_this: pd.DataFrame, head_keywords: list[Mapping[str, Any]]
+    df_this: pd.DataFrame,
+    df_last: pd.DataFrame,
+    head_keywords: list[Mapping[str, Any]],
+    rank_trend_rules: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
     if df_this.empty or not head_keywords:
         return []
     contributors = []
     keyword_order = [entry["keyword"] for entry in head_keywords]
+    stable_threshold = _safe_float(
+        (rank_trend_rules or {}).get("stable_threshold")
+    ) or DEFAULT_RULES["asin_rank_trend"]["stable_threshold"]
+    last_lookup = _asin_rank_lookup(df_last)
     for keyword in keyword_order:
         subset = df_this[df_this["keyword"] == keyword]
         if subset.empty:
@@ -1052,6 +1194,17 @@ def _build_keyword_contributors(
             KEYWORD_CONTRIBUTOR_TOP_N
         )
         for _, row in ranked.iterrows():
+            organic_rank_this = _safe_float(row.get("last_rank"))
+            ad_rank_this = _safe_float(row.get("ad_last_rank"))
+            last_organic, last_ad = last_lookup.get(
+                (keyword, row["asin"]), (None, None)
+            )
+            organic_diff, organic_trend = _rank_diff_and_trend(
+                organic_rank_this, last_organic, stable_threshold
+            )
+            ad_diff, ad_trend = _rank_diff_and_trend(
+                ad_rank_this, last_ad, stable_threshold
+            )
             top_asin.append(
                 {
                     "asin": row["asin"],
@@ -1062,16 +1215,69 @@ def _build_keyword_contributors(
                     "effective_impr_share_this": _safe_float(
                         row.get("effective_impr_share")
                     ),
+                    "organic_rank_this": organic_rank_this,
+                    "organic_rank_last": last_organic,
+                    "organic_rank_diff": organic_diff,
+                    "organic_rank_trend": organic_trend,
+                    "ad_rank_this": ad_rank_this,
+                    "ad_rank_last": last_ad,
+                    "ad_rank_diff": ad_diff,
+                    "ad_rank_trend": ad_trend,
                 }
             )
         contributors.append({"keyword": keyword, "top_asin": top_asin})
     return contributors
 
 
+def _asin_rank_lookup(
+    df: pd.DataFrame,
+) -> dict[tuple[str, str], tuple[float | None, float | None]]:
+    lookup: dict[tuple[str, str], tuple[float | None, float | None]] = {}
+    if df is None or df.empty:
+        return lookup
+    for _, row in df.iterrows():
+        keyword = row.get("keyword")
+        asin = row.get("asin")
+        if keyword is None or asin is None:
+            continue
+        if pd.isna(keyword) or pd.isna(asin):
+            continue
+        key = (keyword, asin)
+        if key in lookup:
+            continue
+        lookup[key] = (
+            _safe_float(row.get("last_rank")),
+            _safe_float(row.get("ad_last_rank")),
+        )
+    return lookup
+
+
+def _rank_diff_and_trend(
+    rank_this: float | None,
+    rank_last: float | None,
+    stable_threshold: float,
+) -> tuple[float | None, str]:
+    if rank_this is None and rank_last is None:
+        return None, "missing"
+    if rank_this is not None and rank_last is None:
+        return None, "new"
+    if rank_this is None and rank_last is not None:
+        return None, "lost"
+    diff = rank_last - rank_this
+    if abs(diff) <= stable_threshold:
+        trend = "stable"
+    elif diff > 0:
+        trend = "up"
+    else:
+        trend = "down"
+    return diff, trend
+
+
 def _build_keyword_volume_opportunity(
     head_this: Mapping[str, Mapping[str, Any]],
     head_last: Mapping[str, Mapping[str, Any]],
     thresholds: Mapping[str, float],
+    opportunity_rules: Mapping[str, float],
 ) -> dict[str, list[dict[str, Any]]]:
     defaults = DEFAULT_RULES["keyword_volume_opportunity"]
     high_volume_min = thresholds.get("high_volume_min", defaults["high_volume_min"])
@@ -1107,6 +1313,13 @@ def _build_keyword_volume_opportunity(
             "scene_kw_self_share_this": self_share,
             "scene_kw_comp_share_this": comp_share,
         }
+        _attach_rank_snapshot(record, entry, suffix="_this")
+        record["opportunity_type"] = _classify_opportunity_types(
+            entry,
+            record["search_volume_change_rate"],
+            opportunity_rules,
+            bucket="high_volume_low_self",
+        )
         result["high_volume_low_self"].append(record)
 
     for keyword in sorted(set(head_this.keys()) & set(head_last.keys())):
@@ -1133,7 +1346,17 @@ def _build_keyword_volume_opportunity(
             "scene_kw_self_share_last": _safe_float(
                 entry_last.get("scene_kw_self_share_last")
             ),
+            "scene_kw_comp_share_this": _safe_float(
+                entry_this.get("scene_kw_comp_share_this")
+            ),
         }
+        _attach_rank_snapshot(record, entry_this, suffix="_this")
+        record["opportunity_type"] = _classify_opportunity_types(
+            entry_this,
+            change_rate,
+            opportunity_rules,
+            bucket="rising_demand_self_lagging",
+        )
         result["rising_demand_self_lagging"].append(record)
 
     result["high_volume_low_self"].sort(
@@ -1144,6 +1367,130 @@ def _build_keyword_volume_opportunity(
         reverse=True,
     )
     return result
+
+
+def _best_rank_series(df: pd.DataFrame, column: str, is_self: bool) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(dtype=float)
+    subset = df[df[column].notna()].copy()
+    if subset.empty:
+        return pd.Series(dtype=float)
+    mask = subset["hyy_asin"] == 1 if is_self else subset["hyy_asin"] != 1
+    subset = subset[mask]
+    if subset.empty:
+        return pd.Series(dtype=float)
+    grouped = subset.groupby("keyword")[column].min()
+    return grouped.astype(float)
+
+
+def _resolve_position_thresholds(
+    position_rules: Mapping[str, Any], channel: str
+) -> dict[str, float]:
+    defaults = DEFAULT_RULES["keyword_position"].get(channel, {})
+    section = position_rules.get(channel) if isinstance(position_rules, Mapping) else None
+    if not isinstance(section, Mapping):
+        section = {}
+    strong = section.get("strong_max", defaults.get("strong_max"))
+    medium = section.get("medium_max", defaults.get("medium_max"))
+    strong_value = strong if _is_number(strong) else defaults.get("strong_max")
+    medium_value = medium if _is_number(medium) else defaults.get("medium_max")
+    return {
+        "strong_max": float(strong_value) if strong_value is not None else math.inf,
+        "medium_max": float(medium_value) if medium_value is not None else math.inf,
+    }
+
+
+def _rank_status(value: Any, thresholds: Mapping[str, float]) -> str:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "missing"
+    try:
+        rank_value = float(value)
+    except (TypeError, ValueError):
+        return "missing"
+    strong_max = thresholds.get("strong_max", math.inf)
+    medium_max = thresholds.get("medium_max", math.inf)
+    if rank_value <= strong_max:
+        return "strong"
+    if rank_value <= medium_max:
+        return "medium"
+    return "weak"
+
+
+def _attach_rank_snapshot(record: dict[str, Any], entry: Mapping[str, Any], suffix: str) -> None:
+    fields = [
+        "self_best_organic_rank",
+        "comp_best_organic_rank",
+        "self_best_ad_rank",
+        "comp_best_ad_rank",
+        "self_organic_status",
+        "comp_organic_status",
+        "self_ad_status",
+        "comp_ad_status",
+    ]
+    for field in fields:
+        key = f"{field}{suffix}"
+        record[key] = entry.get(key)
+
+
+def _classify_opportunity_types(
+    entry: Mapping[str, Any],
+    change_rate: float | None,
+    rules: Mapping[str, float],
+    *,
+    bucket: str,
+) -> list[str]:
+    defaults = DEFAULT_RULES["keyword_opportunity_rules"]
+    rising_rate_min = _resolve_rule_value(
+        rules, "rising_rate_min", defaults["rising_rate_min"]
+    )
+    classifications: list[str] = []
+    self_org_status = entry.get("self_organic_status_this")
+    comp_org_status = entry.get("comp_organic_status_this")
+    self_ad_status = entry.get("self_ad_status_this")
+    comp_ad_status = entry.get("comp_ad_status_this")
+    has_self_ad = entry.get("self_best_ad_rank_this") is not None
+
+    if bucket == "high_volume_low_self":
+        if comp_org_status == "strong" and self_org_status in {"weak", "missing"}:
+            classifications.append("high_volume_organic_gap")
+        if (
+            self_org_status in {"weak", "missing"}
+            and self_ad_status in {"medium", "weak"}
+            and has_self_ad
+        ):
+            classifications.append("ad_heavy_but_not_dominant")
+        if (
+            self_org_status == "strong"
+            and self_ad_status in {"missing", "weak"}
+            and comp_ad_status == "strong"
+        ):
+            classifications.append("organic_good_ad_gap")
+    elif bucket == "rising_demand_self_lagging":
+        if (
+            change_rate is not None
+            and change_rate >= rising_rate_min
+            and entry.get("self_organic_status_this") in {"weak", "missing"}
+            and entry.get("self_ad_status_this") in {"weak", "missing"}
+        ):
+            classifications.append("rising_demand_full_gap")
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in classifications:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
+def _resolve_rule_value(
+    rules: Mapping[str, float], key: str, fallback: float
+) -> float:
+    if isinstance(rules, Mapping):
+        value = rules.get(key)
+        if _is_number(value):
+            return float(value)
+    return fallback
 
 
 # ----------------------------------------------------------------------

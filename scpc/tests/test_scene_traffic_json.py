@@ -43,6 +43,8 @@ def _keyword_source_df(sunday_this: date, sunday_last: date) -> pd.DataFrame:
                 "snapshot_date": sunday_this,
                 "effective_impr_share": 0.02,
                 "weekly_search_volume": 120000,
+                "last_rank": 28,
+                "ad_last_rank": 3,
             },
             {
                 "asin": "COMP1",
@@ -51,6 +53,8 @@ def _keyword_source_df(sunday_this: date, sunday_last: date) -> pd.DataFrame:
                 "snapshot_date": sunday_this,
                 "effective_impr_share": 0.18,
                 "weekly_search_volume": 120000,
+                "last_rank": 5,
+                "ad_last_rank": None,
             },
             {
                 "asin": "SELF1",
@@ -59,6 +63,8 @@ def _keyword_source_df(sunday_this: date, sunday_last: date) -> pd.DataFrame:
                 "snapshot_date": sunday_this,
                 "effective_impr_share": 0.01,
                 "weekly_search_volume": 80000,
+                "last_rank": 12,
+                "ad_last_rank": None,
             },
             {
                 "asin": "COMP1",
@@ -67,6 +73,28 @@ def _keyword_source_df(sunday_this: date, sunday_last: date) -> pd.DataFrame:
                 "snapshot_date": sunday_this,
                 "effective_impr_share": 0.14,
                 "weekly_search_volume": 80000,
+                "last_rank": 4,
+                "ad_last_rank": 2,
+            },
+            {
+                "asin": "SELF1",
+                "marketplace_id": "US",
+                "keyword": "camping shower caddy",
+                "snapshot_date": sunday_last,
+                "effective_impr_share": 0.02,
+                "weekly_search_volume": 100000,
+                "last_rank": 40,
+                "ad_last_rank": 7,
+            },
+            {
+                "asin": "COMP1",
+                "marketplace_id": "US",
+                "keyword": "camping shower caddy",
+                "snapshot_date": sunday_last,
+                "effective_impr_share": 0.12,
+                "weekly_search_volume": 100000,
+                "last_rank": 3,
+                "ad_last_rank": 2,
             },
             {
                 "asin": "SELF1",
@@ -75,6 +103,8 @@ def _keyword_source_df(sunday_this: date, sunday_last: date) -> pd.DataFrame:
                 "snapshot_date": sunday_last,
                 "effective_impr_share": 0.01,
                 "weekly_search_volume": 40000,
+                "last_rank": 10,
+                "ad_last_rank": None,
             },
             {
                 "asin": "COMP1",
@@ -83,6 +113,8 @@ def _keyword_source_df(sunday_this: date, sunday_last: date) -> pd.DataFrame:
                 "snapshot_date": sunday_last,
                 "effective_impr_share": 0.04,
                 "weekly_search_volume": 40000,
+                "last_rank": 5,
+                "ad_last_rank": 1,
             },
         ]
     )
@@ -125,8 +157,10 @@ def test_keyword_payload_includes_search_volume_and_opportunities() -> None:
     assert this_week_keywords[0]["search_volume_this"] == 120000
 
     diff_common = payload["scene_head_keywords"]["diff"]["keywords_common"]
-    assert diff_common[0]["search_volume_diff"] == 40000
-    assert diff_common[0]["search_volume_change_rate"] == 1.0
+    diff_map = {entry["keyword"]: entry for entry in diff_common}
+    travel = diff_map["travel shower caddy"]
+    assert travel["search_volume_diff"] == 40000
+    assert travel["search_volume_change_rate"] == 1.0
 
     opportunities = payload["keyword_opportunity_by_volume"]
     assert opportunities["high_volume_low_self"][0]["keyword"] == "camping shower caddy"
@@ -134,3 +168,47 @@ def test_keyword_payload_includes_search_volume_and_opportunities() -> None:
 
     asin_profile = payload["asin_keyword_profile_change"]["self"][0]
     assert asin_profile["head_keywords_this"][0]["search_volume_this"] == 120000
+
+
+def test_keyword_contributors_include_rank_trends() -> None:
+    params = module.SceneTrafficJobParams(
+        week="2025-W45",
+        scene_tag="浴室袋",
+        marketplace_id="US",
+        storage_dir=Path("/tmp"),
+    )
+    sunday_this = date(2025, 11, 9)
+    sunday_last = date(2025, 11, 2)
+    df_keyword = module._prepare_keyword_dataframe(
+        _scene_scope_df(), _keyword_source_df(sunday_this, sunday_last)
+    )
+
+    payload = module._build_keyword_payload(
+        params,
+        base_scene="base",
+        morphology="std",
+        sunday_this=sunday_this,
+        sunday_last=sunday_last,
+        df_keyword=df_keyword,
+        rules={},
+    )
+
+    contributors = payload["keyword_asin_contributors"]["this_week"]
+    camping_entry = next(
+        entry for entry in contributors if entry["keyword"] == "camping shower caddy"
+    )
+    asin_map = {asin["asin"]: asin for asin in camping_entry["top_asin"]}
+
+    self_asin = asin_map["SELF1"]
+    assert self_asin["organic_rank_this"] == 28
+    assert self_asin["organic_rank_last"] == 40
+    assert self_asin["organic_rank_diff"] == 12
+    assert self_asin["organic_rank_trend"] == "up"
+    assert self_asin["ad_rank_trend"] == "up"
+    assert self_asin["ad_rank_diff"] == 4
+
+    comp_asin = asin_map["COMP1"]
+    assert comp_asin["organic_rank_trend"] == "stable"
+    assert comp_asin["organic_rank_diff"] == -2
+    assert comp_asin["ad_rank_trend"] == "lost"
+    assert comp_asin["ad_rank_diff"] is None
