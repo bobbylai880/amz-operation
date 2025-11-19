@@ -33,7 +33,7 @@ defaults:
   # 搜索量驱动的关键词机会阈值
   keyword_volume_opportunity:
     # 搜索量较大的关键词下限，超过该值认为是高需求词
-    high_volume_min: 50000
+    high_volume_min: 3000
     # 判断需求快速增长的环比增速阈值
     rising_rate_min: 0.30
     # 我方在该词的曝光占比上限，低于该值视为布局不足
