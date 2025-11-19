@@ -195,3 +195,22 @@ def test_generator_raises_when_optional_file_unreadable(tmp_path: Path) -> None:
     with pytest.raises(WeeklySceneReportError):
         generator.run(_params(tmp_path))
 
+
+def test_full_report_can_use_override_model(tmp_path: Path) -> None:
+    _prepare_inputs(tmp_path)
+    responses = ["# overall", "# self", "# competitor", "# risk", "# actions", "# full"]
+    client = StubClient(responses)
+    settings = DeepSeekSettings(
+        base_url="https://example.com",
+        model="deepseek-stub",
+        api_key="sk-test",
+        timeout=30.0,
+        weekly_report_full_model="deepseek-full",
+    )
+    generator = WeeklySceneReportGenerator(client=client, settings=settings)
+
+    generator.run(_params(tmp_path))
+
+    assert [call["model"] for call in client.calls[:-1]] == ["deepseek-stub"] * 5
+    assert client.calls[-1]["model"] == "deepseek-full"
+

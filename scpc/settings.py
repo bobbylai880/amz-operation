@@ -42,6 +42,7 @@ class DeepSeekSettings:
     model: str
     api_key: str
     timeout: float
+    weekly_report_full_model: str | None = None
 
 
 def get_deepseek_settings(*, env_paths: Iterable[str | os.PathLike[str]] = (".env",)) -> DeepSeekSettings:
@@ -53,6 +54,7 @@ def get_deepseek_settings(*, env_paths: Iterable[str | os.PathLike[str]] = (".en
     model = os.getenv("DEEPSEEK_MODEL")
     api_key = os.getenv("DEEPSEEK_API_KEY")
     timeout_raw = os.getenv("DEEPSEEK_TIMEOUT", "30")
+    weekly_full_report_model = os.getenv("DEEPSEEK_MODEL_WEEKLY_REPORT_FULL")
     if not model:
         raise RuntimeError("Environment variable DEEPSEEK_MODEL must be configured")
     if not api_key:
@@ -61,7 +63,13 @@ def get_deepseek_settings(*, env_paths: Iterable[str | os.PathLike[str]] = (".en
         timeout = float(timeout_raw)
     except ValueError as exc:  # pragma: no cover - defensive branch
         raise RuntimeError("DEEPSEEK_TIMEOUT must be a numeric value") from exc
-    return DeepSeekSettings(base_url=base_url, model=model, api_key=api_key, timeout=timeout)
+    return DeepSeekSettings(
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        timeout=timeout,
+        weekly_report_full_model=weekly_full_report_model,
+    )
 
 
 @dataclass(slots=True)
