@@ -149,7 +149,8 @@ SCPC_LOG_DIR=storage/logs
 - 场景周报 JSON：`python -m scpc.jobs.generate_weekly_scene_json --week 2025-W45 --scene_tag 浴室袋 --marketplace US`
   - 默认输出目录为 `storage/weekly_report/{week}/{scene_tag}`，可通过 `--storage` 重写。
 - 场景 Markdown 周报：`python -m scpc.jobs.generate_weekly_scene_report --week 2025-W45 --scene_tag 浴室袋 --marketplace US --storage output/weekly_report`
-  - 要求 `overall_summary.json` 等五个模块 JSON 已存在于 `{storage}/{week}/{scene_tag}`，命令会在 `reports/` 目录生成 5 个模块 Markdown 与汇总报告；`--storage` 可省略使用默认 `storage/weekly_report`。
+  - 要求 `overall_summary.json` 等五个模块 JSON 已存在于 `{storage}/{week}/{scene_tag}`，命令会在 `reports/` 目录生成 01~05 章 Markdown，并确保 06/07 章与 00 汇总报告一并落地；`--storage` 可省略使用默认 `storage/weekly_report`。
+  - 若 `06_traffic_flow.md`、`07_keyword_opportunity.md` 事先已由流量 Job 生成，则会直接复用；如缺失，命令会写入“数据缺失”占位 Markdown，方便运营在目录中一次性拿到 7 个模块与《00 场景整合周报》。
 
 ### 流量模块（flow_change/keyword_change）
 `python -m scpc.jobs.generate_scene_traffic_json --week 2025-W45 --scene_tag 浴室袋 --marketplace US --storage output/weekly_report`
