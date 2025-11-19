@@ -108,6 +108,7 @@ DEFAULT_RULES = {
         "self_share_low_max": 0.05,
         "rising_rate_min": 0.3,
     },
+    "asin_rank_trend": {"stable_threshold": 2.0},
 }
 
 AD_CHANGE_BUCKETS = [
@@ -825,7 +826,10 @@ def _build_keyword_payload(
         rules.get("keyword_profile_change", {}),
     )
 
-    contributors = _build_keyword_contributors(df_this, head_this["list"])
+    asin_rank_rules = rules.get("asin_rank_trend", DEFAULT_RULES["asin_rank_trend"])
+    contributors = _build_keyword_contributors(
+        df_this, df_last, head_this["list"], asin_rank_rules
+    )
     keyword_opportunity = _build_keyword_volume_opportunity(
         head_this["dict"],
         head_last["dict"],
@@ -1168,12 +1172,19 @@ def _build_keyword_profile_change(
 
 
 def _build_keyword_contributors(
-    df_this: pd.DataFrame, head_keywords: list[Mapping[str, Any]]
+    df_this: pd.DataFrame,
+    df_last: pd.DataFrame,
+    head_keywords: list[Mapping[str, Any]],
+    rank_trend_rules: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
     if df_this.empty or not head_keywords:
         return []
     contributors = []
     keyword_order = [entry["keyword"] for entry in head_keywords]
+    stable_threshold = _safe_float(
+        (rank_trend_rules or {}).get("stable_threshold")
+    ) or DEFAULT_RULES["asin_rank_trend"]["stable_threshold"]
+    last_lookup = _asin_rank_lookup(df_last)
     for keyword in keyword_order:
         subset = df_this[df_this["keyword"] == keyword]
         if subset.empty:
@@ -1183,6 +1194,17 @@ def _build_keyword_contributors(
             KEYWORD_CONTRIBUTOR_TOP_N
         )
         for _, row in ranked.iterrows():
+            organic_rank_this = _safe_float(row.get("last_rank"))
+            ad_rank_this = _safe_float(row.get("ad_last_rank"))
+            last_organic, last_ad = last_lookup.get(
+                (keyword, row["asin"]), (None, None)
+            )
+            organic_diff, organic_trend = _rank_diff_and_trend(
+                organic_rank_this, last_organic, stable_threshold
+            )
+            ad_diff, ad_trend = _rank_diff_and_trend(
+                ad_rank_this, last_ad, stable_threshold
+            )
             top_asin.append(
                 {
                     "asin": row["asin"],
@@ -1193,10 +1215,62 @@ def _build_keyword_contributors(
                     "effective_impr_share_this": _safe_float(
                         row.get("effective_impr_share")
                     ),
+                    "organic_rank_this": organic_rank_this,
+                    "organic_rank_last": last_organic,
+                    "organic_rank_diff": organic_diff,
+                    "organic_rank_trend": organic_trend,
+                    "ad_rank_this": ad_rank_this,
+                    "ad_rank_last": last_ad,
+                    "ad_rank_diff": ad_diff,
+                    "ad_rank_trend": ad_trend,
                 }
             )
         contributors.append({"keyword": keyword, "top_asin": top_asin})
     return contributors
+
+
+def _asin_rank_lookup(
+    df: pd.DataFrame,
+) -> dict[tuple[str, str], tuple[float | None, float | None]]:
+    lookup: dict[tuple[str, str], tuple[float | None, float | None]] = {}
+    if df is None or df.empty:
+        return lookup
+    for _, row in df.iterrows():
+        keyword = row.get("keyword")
+        asin = row.get("asin")
+        if keyword is None or asin is None:
+            continue
+        if pd.isna(keyword) or pd.isna(asin):
+            continue
+        key = (keyword, asin)
+        if key in lookup:
+            continue
+        lookup[key] = (
+            _safe_float(row.get("last_rank")),
+            _safe_float(row.get("ad_last_rank")),
+        )
+    return lookup
+
+
+def _rank_diff_and_trend(
+    rank_this: float | None,
+    rank_last: float | None,
+    stable_threshold: float,
+) -> tuple[float | None, str]:
+    if rank_this is None and rank_last is None:
+        return None, "missing"
+    if rank_this is not None and rank_last is None:
+        return None, "new"
+    if rank_this is None and rank_last is not None:
+        return None, "lost"
+    diff = rank_last - rank_this
+    if abs(diff) <= stable_threshold:
+        trend = "stable"
+    elif diff > 0:
+        trend = "up"
+    else:
+        trend = "down"
+    return diff, trend
 
 
 def _build_keyword_volume_opportunity(

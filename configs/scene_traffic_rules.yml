@@ -62,3 +62,8 @@ defaults:
     self_share_low_max: 0.05
     # 需求快速上升的环比阈值，用于 rising_demand_full_gap
     rising_rate_min: 0.30
+
+  # ASIN 在关键词下的排名趋势判定阈值
+  asin_rank_trend:
+    # |Δrank| <= stable_threshold 视为“排名基本稳定”
+    stable_threshold: 2
