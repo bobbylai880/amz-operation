@@ -117,6 +117,8 @@ scpc/
 ```
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-chat
+# 可选：为 00 场景整合周报指定更强模型
+DEEPSEEK_MODEL_WEEKLY_REPORT_FULL=deepseek-chat-pro
 DEEPSEEK_API_KEY=your-deepseek-key
 DEEPSEEK_TIMEOUT=30
 # Doris 2.x 连接配置（会自动拼接连接串）
@@ -128,7 +130,7 @@ DORIS_DATABASE=bi_amz
 # 可选：指定 CLI 运行日志输出目录（默认 storage/logs）
 SCPC_LOG_DIR=storage/logs
 ```
-可以复制 `.env.example` 并替换为真实值；`.env` 已加入 `.gitignore`，避免凭证泄露。`scpc.db.engine` 会在运行时查找 `.env` 并根据以上字段拼接连接串，也支持直接使用环境变量提供完整 `DB_URI` 覆盖。
+可以复制 `.env.example` 并替换为真实值；`.env` 已加入 `.gitignore`，避免凭证泄露。`DEEPSEEK_MODEL_WEEKLY_REPORT_FULL` 会在生成《00 场景整合周报》时覆盖默认模型，其余模块沿用 `DEEPSEEK_MODEL`。`scpc.db.engine` 会在运行时查找 `.env` 并根据以上字段拼接连接串，也支持直接使用环境变量提供完整 `DB_URI` 覆盖。
 
 ## 配置文件
 - `configs/prod.yaml`：定义时区、Cron 调度、特征参数（如 `theta_days`、`alpha_effective_woc`）、预算闸门以及本地 `storage/` 输出目录前缀；

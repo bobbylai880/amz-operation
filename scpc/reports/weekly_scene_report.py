@@ -209,7 +209,11 @@ class WeeklySceneReportGenerator:
             module_texts.update({key: text for key, (text, _) in optional_modules.items()})
             for key, (_, path) in optional_modules.items():
                 outputs[key] = path
-            full_report = self._render_full_report(metadata, module_texts)
+            full_report = self._render_full_report(
+                metadata,
+                module_texts,
+                model_override=self._settings.weekly_report_full_model,
+            )
             full_report_path = report_dir / FULL_REPORT_TITLE
             full_report_path.write_text(full_report, encoding="utf-8")
             outputs["full_report"] = full_report_path
@@ -302,6 +306,8 @@ class WeeklySceneReportGenerator:
         self,
         metadata: Mapping[str, str],
         module_texts: Mapping[str, str],
+        *,
+        model_override: str | None = None,
     ) -> str:
         facts = {
             "task": FULL_REPORT_INSTRUCTION.format(**metadata),
@@ -309,18 +315,21 @@ class WeeklySceneReportGenerator:
             "metadata": metadata,
             "modules": module_texts,
         }
-        response = self._invoke_llm(facts)
+        response = self._invoke_llm(facts, model_override=model_override)
         content = response.content.strip()
         if not content:
             raise WeeklySceneReportError("Full report generation returned empty content")
         return content if content.endswith("\n") else content + "\n"
 
-    def _invoke_llm(self, facts: Mapping[str, Any]) -> DeepSeekResponse:
+    def _invoke_llm(
+        self, facts: Mapping[str, Any], *, model_override: str | None = None
+    ) -> DeepSeekResponse:
+        model = model_override or self._settings.model
         try:
             return self._client.generate(
                 prompt=SYSTEM_PROMPT,
                 facts=facts,
-                model=self._settings.model,
+                model=model,
                 temperature=self._temperature,
                 response_format="text",
             )
