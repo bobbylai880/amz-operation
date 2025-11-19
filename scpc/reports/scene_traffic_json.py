@@ -58,7 +58,7 @@ SELECT asin,
        `有效曝光流量占比` AS effective_impr_share,
        weekly_search_volume,
        last_rank,
-       ad_last_rand AS ad_last_rank
+       ad_last_rank
 FROM bi_sif_keyword_daily
 WHERE marketplace_id = :marketplace_id
   AND snapshot_date IN (:sunday_this, :sunday_last)
