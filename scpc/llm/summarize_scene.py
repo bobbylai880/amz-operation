@@ -1117,7 +1117,14 @@ def _load_schema(*, max_top_keywords: int | None = None) -> Mapping[str, Any]:
     return schema
 
 
-def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> Mapping[str, Any]:
+def summarize_scene(
+    *,
+    engine: Engine,
+    scene: str,
+    mk: str,
+    topn: int = 10,
+    end_yearweek: int | None = None,
+) -> Mapping[str, Any]:
     """Fetch latest scene features/drivers and produce a schema-compliant summary."""
 
     if topn <= 0:
@@ -1155,6 +1162,17 @@ def summarize_scene(*, engine: Engine, scene: str, mk: str, topn: int = 10) -> M
         features = pd.read_sql_query(FEATURES_SQL, conn, params={"scene": scene, "mk": mk})
         if features.empty:
             raise SceneSummarizationError("No scene_features rows available for summarisation")
+
+        if end_yearweek is not None:
+            mask = (
+                features["year"].astype(int) * 100 + features["week_num"].astype(int)
+            ) <= end_yearweek
+            features = features.loc[mask].reset_index(drop=True)
+            if features.empty:
+                raise SceneSummarizationError(
+                    f"No scene_features rows available up to {end_yearweek}"
+                )
+
         features["start_date"] = pd.to_datetime(features["start_date"]).dt.date
         features["VOL"] = pd.to_numeric(features["VOL"], errors="coerce")
         latest_row = features.sort_values("start_date").iloc[-1]

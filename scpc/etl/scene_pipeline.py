@@ -653,6 +653,7 @@ def run_scene_pipeline(
             scene,
             marketplace_id,
             min_yrwk,
+            max_yrwk,
             extra={
                 "scene": scene,
                 "mk": marketplace_id,
@@ -1037,6 +1038,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         scene=args.scene,
                         mk=args.mk,
                         topn=topn,
+                        end_yearweek=_yearweek_from_label(args.end_week) if args.end_week else None,
                     )
                     summary_json_text = _serialize_summary_payload(
                         summary_payload,
