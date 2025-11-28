@@ -46,11 +46,13 @@ COMMON_STYLE_GUIDE = (
     "请严格基于 module_data JSON 输出中文 Markdown，保持资深亚马逊运营负责人的口吻。"
     " 必须引用输入中的事实，禁止编造 ASIN、品牌或数值；若列表为空需明确说明未识别到符合条件的对象。"
     " 输出结构需包含标题、小节与要点列表，并附上可执行建议。"
+    " 【重要】直接输出 Markdown 格式内容，不要使用 ```markdown 或 ``` 等代码块标记包裹输出。"
 )
 
 SYSTEM_PROMPT = (
     "你是一名资深的亚马逊运营负责人，熟悉搜索排序、价格策略、优惠机制、A+ 内容和竞品分析。"
     " 你的分析必须以输入 JSON 为依据，不得捏造额外数据。若信息不足，应在文中解释假设，并保持中文输出。"
+    " 你的输出格式为纯 Markdown 文本，直接输出内容即可，不要用代码块（```）包裹。"
 )
 
 MODULE_SPECS: tuple[ModuleSpec, ...] = (
@@ -294,6 +296,7 @@ class WeeklySceneReportGenerator:
         }
         response = self._invoke_llm(facts)
         content = response.content.strip()
+        content = self._strip_markdown_fence(content)
         if not content:
             raise WeeklySceneReportError(
                 f"Module {spec.key} returned empty content from LLM"
@@ -317,6 +320,7 @@ class WeeklySceneReportGenerator:
         }
         response = self._invoke_llm(facts, model_override=model_override)
         content = response.content.strip()
+        content = self._strip_markdown_fence(content)
         if not content:
             raise WeeklySceneReportError("Full report generation returned empty content")
         return content if content.endswith("\n") else content + "\n"
@@ -335,6 +339,25 @@ class WeeklySceneReportGenerator:
             )
         except DeepSeekError as exc:
             raise WeeklySceneReportError("DeepSeek request failed") from exc
+
+    @staticmethod
+    def _strip_markdown_fence(content: str) -> str:
+        """Remove markdown code fence wrapping if present.
+
+        Some LLMs wrap markdown output in ```markdown...``` blocks.
+        This helper strips those fences while preserving the actual content.
+        """
+        lines = content.split("\n")
+
+        # Check if starts with code fence
+        if lines and lines[0].strip() in ("```markdown", "```"):
+            lines = lines[1:]
+
+        # Check if ends with code fence
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        return "\n".join(lines).strip()
 
     def _load_optional_markdown_modules(
         self, report_dir: Path
